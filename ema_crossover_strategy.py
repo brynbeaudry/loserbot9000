@@ -16,7 +16,14 @@ SLOW_EMA = 8  # Period for regular EMA
 RISK_PERCENTAGE = 0.01  # 1% risk per trade
 MAGIC_NUMBER = 234000
 DEVIATION = 20  # Price deviation allowed for market orders
-MIN_CROSSOVER_POINTS = 1  # Minimum points required for valid crossover
+
+# Signal Filter Parameters
+MIN_CROSSOVER_POINTS = 1  # Minimum points required for initial crossover
+MIN_SEPARATION_POINTS = 2  # Minimum separation after crossover
+SLOPE_PERIODS = 3  # Periods to calculate slope over
+MIN_SLOPE_THRESHOLD = 0.000001  # Minimum slope for trend direction
+MAX_OPPOSITE_SLOPE = -0.000002  # Maximum allowed opposite slope
+PRICE_CONFIRM_PERIODS = 2  # Periods to wait for price confirmation
 
 def initialize_mt5():
     """Initialize connection to MetaTrader 5 platform
@@ -117,6 +124,24 @@ def calculate_stop_distance(price, risk_percentage, symbol_info):
     # Use whichever is larger
     return max(base_distance, min_stop_distance)
 
+def calculate_slope(series, periods=SLOPE_PERIODS):
+    """Calculate the slope of a series over the specified periods
+    
+    Args:
+        series: Price or indicator series
+        periods: Number of periods to calculate slope over
+        
+    Returns:
+        float: Slope value
+    """
+    if len(series) < periods:
+        return 0
+    
+    y = series[-periods:].values
+    x = np.arange(len(y))
+    slope, _ = np.polyfit(x, y, 1)
+    return slope
+
 def get_historical_data(symbol):
     """Get historical price data for EMA calculation
     
@@ -126,7 +151,8 @@ def get_historical_data(symbol):
     Returns:
         DataFrame or None: Historical price data with calculated EMAs
     """
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100)
+    # Get more data points for slope calculation
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100 + SLOPE_PERIODS)
     if rates is None:
         print("❌ Failed to get historical data")
         return None
@@ -150,8 +176,74 @@ def get_historical_data(symbol):
     
     return df
 
+def check_slope_conditions(df, direction="BUY"):
+    """Check if slope conditions are met for the given direction
+    
+    Args:
+        df: DataFrame with EMA data
+        direction: "BUY" or "SELL"
+        
+    Returns:
+        bool: True if slope conditions are met
+    """
+    fast_slope = calculate_slope(df['fast_ema'])
+    slow_slope = calculate_slope(df['slow_ema'])
+    
+    if direction == "BUY":
+        slope_ok = fast_slope > MIN_SLOPE_THRESHOLD and slow_slope > MAX_OPPOSITE_SLOPE
+        print(f"Slope Check (BUY) - Fast: {fast_slope:.8f}, Slow: {slow_slope:.8f} - {'✅' if slope_ok else '❌'}")
+        return slope_ok
+    else:  # SELL
+        slope_ok = fast_slope < -MIN_SLOPE_THRESHOLD and slow_slope < -MAX_OPPOSITE_SLOPE
+        print(f"Slope Check (SELL) - Fast: {fast_slope:.8f}, Slow: {slow_slope:.8f} - {'✅' if slope_ok else '❌'}")
+        return slope_ok
+
+def check_separation(df, symbol_info, direction="BUY"):
+    """Check if EMAs have sufficient separation after crossover
+    
+    Args:
+        df: DataFrame with EMA data
+        symbol_info: Symbol information from MT5
+        direction: "BUY" or "SELL"
+        
+    Returns:
+        bool: True if separation is sufficient
+    """
+    diff = df['fast_ema'].iloc[-1] - df['slow_ema'].iloc[-1]
+    diff_points = abs(diff / symbol_info.point)
+    
+    if direction == "BUY":
+        sep_ok = diff > 0 and diff_points >= MIN_SEPARATION_POINTS
+    else:  # SELL
+        sep_ok = diff < 0 and diff_points >= MIN_SEPARATION_POINTS
+        
+    print(f"Separation Check ({direction}) - {diff_points:.1f} points - {'✅' if sep_ok else '❌'}")
+    return sep_ok
+
+def check_price_confirmation(df, direction="BUY"):
+    """Check if price confirms the signal direction
+    
+    Args:
+        df: DataFrame with EMA data
+        direction: "BUY" or "SELL"
+        
+    Returns:
+        bool: True if price confirms the direction
+    """
+    last_close = df['close'].iloc[-1]
+    fast_ema = df['fast_ema'].iloc[-1]
+    slow_ema = df['slow_ema'].iloc[-1]
+    
+    if direction == "BUY":
+        price_ok = last_close > fast_ema and last_close > slow_ema
+    else:  # SELL
+        price_ok = last_close < fast_ema and last_close < slow_ema
+        
+    print(f"Price Confirmation ({direction}) - {'✅' if price_ok else '❌'}")
+    return price_ok
+
 def get_ema_signals(symbol, prev_signal=None):
-    """Get trading signals based on EMA crossover
+    """Get trading signals based on EMA crossover with additional filters
     
     Args:
         symbol: Trading symbol
@@ -170,7 +262,7 @@ def get_ema_signals(symbol, prev_signal=None):
     prev_fast = df['fast_ema'].iloc[-2]
     prev_slow = df['slow_ema'].iloc[-2]
     
-    # Calculate difference in points
+    # Get symbol info for point calculations
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
         return None
@@ -178,21 +270,43 @@ def get_ema_signals(symbol, prev_signal=None):
     diff = current_fast - current_slow
     diff_points = abs(diff / symbol_info.point)
     
-    # Only generate signals if difference exceeds minimum threshold
+    # Only proceed if minimum crossover threshold is met
     if diff_points < MIN_CROSSOVER_POINTS:
         return prev_signal
     
-    # Check for crossover - only return signal on actual cross and if different from previous signal
+    # Check for crossover
+    potential_signal = None
     if prev_fast <= prev_slow and current_fast > current_slow:
-        if prev_signal != "BUY":  # Only signal if it's a new crossover
-            print(f"\n🟢 BUY Signal - Fast EMA crossed above Slow EMA by {diff_points:.1f} points at price: {df['close'].iloc[-1]:.2f}")
-            return "BUY"
+        if prev_signal != "BUY":
+            potential_signal = "BUY"
     elif prev_fast >= prev_slow and current_fast < current_slow:
-        if prev_signal != "SELL":  # Only signal if it's a new crossover
-            print(f"\n🔴 SELL Signal - Fast EMA crossed below Slow EMA by {diff_points:.1f} points at price: {df['close'].iloc[-1]:.2f}")
-            return "SELL"
+        if prev_signal != "SELL":
+            potential_signal = "SELL"
+            
+    if potential_signal:
+        print(f"\nAnalyzing {potential_signal} Signal:")
+        print(f"Initial Crossover: {diff_points:.1f} points")
+        
+        # Apply additional filters
+        if not check_slope_conditions(df, potential_signal):
+            print("❌ Rejected: Slope conditions not met")
+            return prev_signal
+            
+        if not check_separation(df, symbol_info, potential_signal):
+            print("❌ Rejected: Insufficient EMA separation")
+            return prev_signal
+            
+        if not check_price_confirmation(df, potential_signal):
+            print("❌ Rejected: Price action not confirming")
+            return prev_signal
+            
+        # All filters passed
+        print(f"\n✅ Valid {potential_signal} Signal - All conditions met")
+        print(f"Price: {df['close'].iloc[-1]:.2f}")
+        print(f"Fast EMA: {current_fast:.2f}")
+        print(f"Slow EMA: {current_slow:.2f}")
+        return potential_signal
     
-    # No new crossover
     return prev_signal
 
 def get_current_signal(symbol):
