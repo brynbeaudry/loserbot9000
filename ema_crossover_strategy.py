@@ -189,13 +189,22 @@ def check_slope_conditions(df, direction="BUY"):
     fast_slope = calculate_slope(df['fast_ema'])
     slow_slope = calculate_slope(df['slow_ema'])
     
+    # Check if EMAs are relatively flat
+    is_flat = abs(fast_slope) < MIN_SLOPE_THRESHOLD/2 and abs(slow_slope) < MIN_SLOPE_THRESHOLD/2
+    
     if direction == "BUY":
-        slope_ok = fast_slope > MIN_SLOPE_THRESHOLD and slow_slope > MAX_OPPOSITE_SLOPE
-        print(f"Slope Check (BUY) - Fast: {fast_slope:.8f}, Slow: {slow_slope:.8f} - {'✅' if slope_ok else '❌'}")
+        if is_flat:
+            # For flat trends, require stronger confirmation
+            slope_ok = fast_slope > MIN_SLOPE_THRESHOLD*2 and slow_slope > MAX_OPPOSITE_SLOPE*2
+        else:
+            slope_ok = fast_slope > MIN_SLOPE_THRESHOLD and slow_slope > MAX_OPPOSITE_SLOPE
         return slope_ok
     else:  # SELL
-        slope_ok = fast_slope < -MIN_SLOPE_THRESHOLD and slow_slope < -MAX_OPPOSITE_SLOPE
-        print(f"Slope Check (SELL) - Fast: {fast_slope:.8f}, Slow: {slow_slope:.8f} - {'✅' if slope_ok else '❌'}")
+        if is_flat:
+            # For flat trends, require stronger confirmation
+            slope_ok = fast_slope < -MIN_SLOPE_THRESHOLD*2 and slow_slope < -MAX_OPPOSITE_SLOPE*2
+        else:
+            slope_ok = fast_slope < -MIN_SLOPE_THRESHOLD and slow_slope < -MAX_OPPOSITE_SLOPE
         return slope_ok
 
 def check_separation(df, symbol_info, direction="BUY"):
@@ -262,6 +271,10 @@ def get_ema_signals(symbol, prev_signal=None):
     prev_fast = df['fast_ema'].iloc[-2]
     prev_slow = df['slow_ema'].iloc[-2]
     
+    # Calculate slopes over last few periods
+    fast_slope = calculate_slope(df['fast_ema'])
+    slow_slope = calculate_slope(df['slow_ema'])
+    
     # Get symbol info for point calculations
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
@@ -270,43 +283,52 @@ def get_ema_signals(symbol, prev_signal=None):
     diff = current_fast - current_slow
     diff_points = abs(diff / symbol_info.point)
     
+    # Check for trend correction first - when both EMAs are trending against current position
+    if prev_signal:
+        if prev_signal == "BUY" and fast_slope < -MIN_SLOPE_THRESHOLD*2 and slow_slope < -MIN_SLOPE_THRESHOLD*2:
+            # Both EMAs trending down strongly while we're in a buy
+            return "SELL"
+        elif prev_signal == "SELL" and fast_slope > MIN_SLOPE_THRESHOLD*2 and slow_slope > MIN_SLOPE_THRESHOLD*2:
+            # Both EMAs trending up strongly while we're in a sell
+            return "BUY"
+    
     # Only proceed if minimum crossover threshold is met
     if diff_points < MIN_CROSSOVER_POINTS:
         return prev_signal
     
     # Check for crossover
     potential_signal = None
+    crossover_detected = False
+
     if prev_fast <= prev_slow and current_fast > current_slow:
+        crossover_detected = True
         if prev_signal != "BUY":
             potential_signal = "BUY"
     elif prev_fast >= prev_slow and current_fast < current_slow:
+        crossover_detected = True
         if prev_signal != "SELL":
             potential_signal = "SELL"
             
-    if potential_signal:
-        print(f"\nAnalyzing {potential_signal} Signal:")
+    # If we detect a crossover, analyze it
+    if crossover_detected and potential_signal:  # Only analyze if we have a potential new signal
+        print(f"\nAnalyzing potential {potential_signal} Signal:")
         print(f"Initial Crossover: {diff_points:.1f} points")
+        print(f"Fast EMA: {current_fast:.5f}")
+        print(f"Slow EMA: {current_slow:.5f}")
         
-        # Apply additional filters
-        if not check_slope_conditions(df, potential_signal):
-            print("❌ Rejected: Slope conditions not met")
-            return prev_signal
-            
-        if not check_separation(df, symbol_info, potential_signal):
-            print("❌ Rejected: Insufficient EMA separation")
-            return prev_signal
-            
-        if not check_price_confirmation(df, potential_signal):
-            print("❌ Rejected: Price action not confirming")
-            return prev_signal
-            
-        # All filters passed
-        print(f"\n✅ Valid {potential_signal} Signal - All conditions met")
-        print(f"Price: {df['close'].iloc[-1]:.2f}")
-        print(f"Fast EMA: {current_fast:.2f}")
-        print(f"Slow EMA: {current_slow:.2f}")
-        return potential_signal
-    
+        slope_ok = check_slope_conditions(df, potential_signal)
+        separation_ok = check_separation(df, symbol_info, potential_signal)
+        price_ok = check_price_confirmation(df, potential_signal)
+        
+        # If all conditions are met, return the new signal
+        if slope_ok and separation_ok and price_ok:
+            print(f"\n✅ Valid {potential_signal} Signal - All conditions met")
+            print(f"Price: {df['close'].iloc[-1]:.2f}")
+            print(f"Fast EMA: {current_fast:.2f}")
+            print(f"Slow EMA: {current_slow:.2f}")
+            return potential_signal
+
+    # If no valid signal was generated, maintain previous signal
     return prev_signal
 
 def get_current_signal(symbol):
@@ -573,9 +595,20 @@ def main():
     # Check current EMA positions if trading on start is enabled
     if args.trade_on_start:
         print("\nChecking current EMA positions...")
-        signal = get_current_signal(args.symbol)  # Use get_current_signal for startup
-        if signal:
-            print(f"\nValid {signal} signal found at startup - EMAs are currently positioned for a {signal}")
+        df = get_historical_data(args.symbol)
+        if df is not None:
+            current_fast = df['fast_ema'].iloc[-1]
+            current_slow = df['slow_ema'].iloc[-1]
+            
+            print(f"Fast EMA: {current_fast:.5f}")
+            print(f"Slow EMA: {current_slow:.5f}")
+            
+            if current_fast > current_slow:
+                signal = "BUY"
+            else:
+                signal = "SELL"
+                
+            print(f"\nInitializing {signal} position based on current EMA positions")
             action = signal.lower()
             find_and_close_positions(args.symbol, signal)
             if execute_trade(args.symbol, action, risk):
@@ -584,7 +617,7 @@ def main():
                 in_position = True
                 current_position_type = action
         else:
-            print("No clear EMA position advantage at startup - waiting for crossover")
+            print("Failed to get historical data - waiting for crossover")
     
     print("\nBot running... Press Ctrl+C to stop")
     
