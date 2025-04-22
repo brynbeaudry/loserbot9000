@@ -12,10 +12,11 @@ SERVER = "PUPrime-Demo"
 
 # Trading Parameters
 FAST_EMA = 2  # Period for TEMA calculation
-SLOW_EMA = 8
+SLOW_EMA = 8  # Period for regular EMA
 RISK_PERCENTAGE = 0.01  # 1% risk per trade
 MAGIC_NUMBER = 234000
 DEVIATION = 20  # Price deviation allowed for market orders
+MIN_CROSSOVER_POINTS = 1  # Minimum points required for valid crossover
 
 def initialize_mt5():
     """Initialize connection to MetaTrader 5 platform
@@ -133,7 +134,7 @@ def get_historical_data(symbol):
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     
-    # Calculate TEMA (Triple Exponential Moving Average)
+    # Calculate TEMA (Triple Exponential Moving Average) for fast EMA
     # First EMA
     df['ema1'] = df['close'].ewm(span=FAST_EMA, adjust=False).mean()
     # EMA of EMA1
@@ -169,53 +170,42 @@ def get_ema_signals(symbol, prev_signal=None):
     prev_fast = df['fast_ema'].iloc[-2]
     prev_slow = df['slow_ema'].iloc[-2]
     
+    # Calculate difference in points
+    symbol_info = mt5.symbol_info(symbol)
+    if symbol_info is None:
+        return None
+        
+    diff = current_fast - current_slow
+    diff_points = abs(diff / symbol_info.point)
+    
+    # Only generate signals if difference exceeds minimum threshold
+    if diff_points < MIN_CROSSOVER_POINTS:
+        return prev_signal
+    
     # Check for crossover - only return signal on actual cross and if different from previous signal
     if prev_fast <= prev_slow and current_fast > current_slow:
         if prev_signal != "BUY":  # Only signal if it's a new crossover
-            print(f"\n🟢 BUY Signal - Fast EMA crossed above Slow EMA at price: {df['close'].iloc[-1]:.2f}")
+            print(f"\n🟢 BUY Signal - Fast EMA crossed above Slow EMA by {diff_points:.1f} points at price: {df['close'].iloc[-1]:.2f}")
             return "BUY"
     elif prev_fast >= prev_slow and current_fast < current_slow:
         if prev_signal != "SELL":  # Only signal if it's a new crossover
-            print(f"\n🔴 SELL Signal - Fast EMA crossed below Slow EMA at price: {df['close'].iloc[-1]:.2f}")
+            print(f"\n🔴 SELL Signal - Fast EMA crossed below Slow EMA by {diff_points:.1f} points at price: {df['close'].iloc[-1]:.2f}")
             return "SELL"
     
     # No new crossover
     return prev_signal
 
 def get_current_signal(symbol):
-    """Get current trading signal based on EMA positions without waiting for crossover
+    """Get current trading signal based on EMA crossover check
     
     Args:
         symbol: Trading symbol
         
     Returns:
-        str or None: "BUY" if fast above slow, "SELL" if fast below slow
+        str or None: "BUY", "SELL", or None if no clear signal
     """
-    df = get_historical_data(symbol)
-    if df is None:
-        return None
-    
-    # Get current values
-    current_fast = df['fast_ema'].iloc[-1]
-    current_slow = df['slow_ema'].iloc[-1]
-    
-    # Calculate the difference
-    diff = current_fast - current_slow
-    diff_points = abs(diff / mt5.symbol_info(symbol).point)
-    
-    print(f"\nCurrent EMA Positions:")
-    print(f"TEMA ({FAST_EMA}): {current_fast:.5f}")
-    print(f"Slow EMA ({SLOW_EMA}): {current_slow:.5f}")
-    print(f"Difference: {diff:.5f} ({diff_points:.1f} points)")
-    
-    # Check current position
-    if current_fast > current_slow:
-        print("TEMA is above Slow EMA - Bullish position")
-        return "BUY"
-    elif current_fast < current_slow:
-        print("TEMA is below Slow EMA - Bearish position")
-        return "SELL"
-    return None
+    # Use the same crossover logic as get_ema_signals
+    return get_ema_signals(symbol, None)
 
 def is_trade_successful(result):
     """Check if a trade was successful based on MT5's result
