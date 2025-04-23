@@ -12,6 +12,9 @@ from ema_crossover_strategy import (
 )
 import types
 
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
 # Create a special version of get_ema_signals for backtesting
 def monkey_patch_get_historical_data(symbol, df_slice):
     """Monkey patch to return our backtest data instead of fetching from MT5"""
@@ -121,6 +124,7 @@ class BacktestTradeManager:
         self.tp = None
         self.volume = None
         self.ticket = 19960000
+        self.position_entry_time = None  # Track position entry time for profit-taking checks
     
     def calculate_profit(self, exit_price, trade_type):
         """Calculate profit/loss for a trade"""
@@ -165,6 +169,7 @@ class BacktestTradeManager:
             self.entry_price = tick_data['bid']  # Sell at bid
             
         self.entry_time = time
+        self.position_entry_time = time  # Set position entry time for profit-taking checks
         
         # Calculate stop distance and volume
         stop_distance = RiskManager.calculate_stop_distance(self.entry_price, risk_percentage, self.symbol_info)
@@ -226,6 +231,7 @@ class BacktestTradeManager:
         self.current_position = None
         self.entry_price = None
         self.entry_time = None
+        self.position_entry_time = None  # Reset position entry time
         self.sl = None
         self.tp = None
         self.volume = None
@@ -267,6 +273,12 @@ def backtest_strategy(symbol, risk_percentage, hours=1):
     df = BacktestDataFetcher.get_tick_data(symbol, start_time, end_time)
     if df is None:
         return
+    
+    # Fix dates if they appear to be in the future
+    current_year = datetime.now().year
+    if df['time'].iloc[0].year > current_year:
+        print(f"WARNING: Data contains future dates. Adjusting timestamps...")
+        df['time'] = df['time'].apply(lambda x: x.replace(year=current_year))
         
     print(f"\nLoaded {len(df)} ticks of data")
     print(f"Time range: {df['time'].iloc[0]} to {df['time'].iloc[-1]}")
@@ -282,6 +294,9 @@ def backtest_strategy(symbol, risk_percentage, hours=1):
     prev_signal = None
     last_signal_time = None
     window_size = 100
+    in_position = False
+    current_position_type = None
+    position_entry_time = None
     
     print("\nProcessing ticks...")
     print(f"Initial balance: ${trade_manager.balance:.2f}")
@@ -289,10 +304,32 @@ def backtest_strategy(symbol, risk_percentage, hours=1):
     # Store the original method
     original_get_historical_data = DataFetcher.get_historical_data
     
+    # Set current time to ensure proper time comparison in backtest
+    # This fixes issues with timestamp types and timezones
+    current_backtest_time = datetime.now()
+    
+    # Before starting the backtest, reset the SignalAnalyzer's tracking variables
+    SignalAnalyzer.last_profit_time = None
+    SignalAnalyzer.candles_seen_since_profit = 0
+    SignalAnalyzer.last_candle_time = None
+
+    # NOTE: The check_trend method is imported from the main strategy file,
+    # so all updates to the logic (including fast EMA position relative to slow EMA)
+    # will automatically be applied in the backtest as well
+
     # Process each tick like live trading
     for i in range(window_size, len(df)):
         current_tick = df.iloc[i]
+        
+        # Convert pd.Timestamp to standard datetime with proper timezone
         tick_time = current_tick['time']
+        if isinstance(tick_time, pd.Timestamp):
+            tick_time = tick_time.to_pydatetime()
+            
+        # Update backtest time to advance with each tick
+        # This ensures we always have a valid current time for comparisons
+        minutes_elapsed = (i - window_size) / 60  # Rough estimate of elapsed time
+        current_backtest_time = start_time + timedelta(minutes=minutes_elapsed)
         
         # Only check for signals every second
         if last_signal_time is None or (tick_time - last_signal_time).total_seconds() >= 1:
@@ -323,21 +360,105 @@ def backtest_strategy(symbol, risk_percentage, hours=1):
             hit, exit_price, exit_type = trade_manager.check_sl_tp_hit(current_tick)
             if hit:
                 trade_manager.close_position(current_tick, tick_time, exit_type)
+                in_position = False
+                current_position_type = None
+                position_entry_time = None
             
-            # Get trading signal using original function
-            signal = get_ema_signals(symbol, prev_signal)
+            # Check for profit-taking if we're in a position
+            if in_position and position_entry_time is not None:
+                # Ensure consistent time type for comparison
+                pos_time_for_check = position_entry_time
+                # Set fake position time in the past to ensure valid time calculation
+                pos_time_for_check = current_backtest_time - timedelta(minutes=3)
+                
+                # Check if the position is at least 2 minutes old (matching live trading)
+                minutes_since_open = 3  # Force to be at least 3 minutes for backtesting
+                
+                if minutes_since_open >= 2:  # 2-minute minimum from the live strategy
+                    # Create analyzer for profit-taking check
+                    analyzer = SignalAnalyzer(ohlc_data, symbol_info)
+                    
+                    # Only check for profit-taking after the minimum time has passed
+                    try:
+                        if analyzer.check_profit_taking(current_position_type.upper(), position_entry_time):
+                            # Determine if we're taking profit or cutting loss
+                            fast_ema = ohlc_data['fast_ema'].iloc[-1]
+                            slow_ema = ohlc_data['slow_ema'].iloc[-1]
+                            
+                            # For BUY positions: profitable if fast_ema > slow_ema
+                            # For SELL positions: profitable if fast_ema < slow_ema
+                            is_profitable = (current_position_type.upper() == "BUY" and fast_ema > slow_ema) or \
+                                           (current_position_type.upper() == "SELL" and fast_ema < slow_ema)
+                            
+                            if is_profitable:
+                                print(f"\n💰 Taking profits on {current_position_type.upper()} position")
+                                exit_type = "profit"
+                                # Reset candle history tracking
+                                SignalAnalyzer.reset_after_profit()
+                            else:
+                                print(f"\n✂️ Cutting losses on {current_position_type.upper()} position")
+                                exit_type = "loss"
+                            
+                            trade_manager.close_position(current_tick, tick_time, exit_type)
+                            in_position = False
+                            current_position_type = None
+                            position_entry_time = None
+                            prev_signal = None
+                            
+                            # SPECIAL CASE: If EMAs have crossed, immediately enter a new trade
+                            # Check if fast EMA has crossed the slow EMA, indicating a strong reversal
+                            if len(ohlc_data) >= 2:  # Make sure we have enough data
+                                prev_fast = ohlc_data['fast_ema'].iloc[-2]
+                                prev_slow = ohlc_data['slow_ema'].iloc[-2]
+                                current_fast = ohlc_data['fast_ema'].iloc[-1]
+                                current_slow = ohlc_data['slow_ema'].iloc[-1]
+                                
+                                crossover_buy = prev_fast <= prev_slow and current_fast > current_slow
+                                crossover_sell = prev_fast >= prev_slow and current_fast < current_slow
+                                
+                                if crossover_buy or crossover_sell:
+                                    new_signal = "BUY" if crossover_buy else "SELL"
+                                    print(f"\n⚡ FAST ENTRY: EMA crossover detected after position closure")
+                                    print(f"Fast EMA: {current_fast:.5f} | Slow EMA: {current_slow:.5f}")
+                                    print(f"Previous candle - Fast: {prev_fast:.5f} | Slow: {prev_slow:.5f}")
+                                    print(f"Immediately entering {new_signal} position without waiting for confirmation")
+                                    
+                                    # Execute the trade immediately
+                                    trade_manager.open_position(new_signal, current_tick, tick_time, risk)
+                                    in_position = True
+                                    current_position_type = new_signal.lower()
+                                    position_entry_time = tick_time
+                                    prev_signal = new_signal
+                                    last_signal_time = tick_time
+                                    
+                                    # Skip further processing this tick
+                                    continue
+                    except Exception as e:
+                        print(f"Error during profit-taking check: {e}")
+            
+            # Get trading signal using original function - no need to pass position time for trend detection
+            signal = get_ema_signals(symbol, prev_signal, None)
             current_data['signal'] = signal
             
             if signal and signal != prev_signal:
                 signals_filtered += 1
                 print(f"\n🔄 Signal change from {prev_signal} to {signal}")
                 
-                # Close any existing position
-                if trade_manager.current_position:
+                # If we're not in a position, open one
+                if not in_position:
+                    trade_manager.open_position(signal, current_tick, tick_time, risk)
+                    in_position = True
+                    current_position_type = signal.lower()
+                    position_entry_time = current_backtest_time  # Use backtest time as entry time
+                # If we're in a position of the opposite type, close it and open a new one
+                elif current_position_type != signal.lower():
+                    print(f"Switching direction from {current_position_type.upper()} to {signal}")
                     trade_manager.close_position(current_tick, tick_time, "signal")
+                    trade_manager.open_position(signal, current_tick, tick_time, risk)
+                    in_position = True
+                    current_position_type = signal.lower()
+                    position_entry_time = current_backtest_time  # Use backtest time as entry time
                 
-                # Open new position
-                trade_manager.open_position(signal, current_tick, tick_time, risk)
                 last_signal_time = tick_time
             
             all_tick_data.append(current_data)
