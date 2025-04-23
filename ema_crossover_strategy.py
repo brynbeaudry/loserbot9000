@@ -196,6 +196,11 @@ class SignalAnalyzer:
         fast_ema_values = [self.df['fast_ema'].iloc[-i] for i in range(1, last_candles+1)]
         slow_ema_values = [self.df['slow_ema'].iloc[-i] for i in range(1, last_candles+1)]
         
+        # Check the current EMA positions
+        current_fast_ema = fast_ema_values[0]
+        current_slow_ema = slow_ema_values[0]
+        fast_above_slow = current_fast_ema > current_slow_ema
+        
         # Calculate slopes directly from the values
         fast_ema_slopes = []
         slow_ema_slopes = []
@@ -215,6 +220,8 @@ class SignalAnalyzer:
         print(f"Slow EMA values (newest to oldest): {', '.join([f'{v:.8f}' for v in slow_ema_values])}")
         print(f"Fast EMA slopes: {', '.join([f'{s:.8f}' for s in fast_ema_slopes])}")
         print(f"Slow EMA slopes: {', '.join([f'{s:.8f}' for s in slow_ema_slopes])}")
+        print(f"Current Fast EMA: {current_fast_ema:.8f}, Slow EMA: {current_slow_ema:.8f}")
+        print(f"Fast EMA is {'ABOVE' if fast_above_slow else 'BELOW'} Slow EMA")
         
         # Count how many candles show uptrend/downtrend for both EMAs
         uptrend_count = sum(1 for i in range(len(fast_ema_slopes)) 
@@ -241,13 +248,23 @@ class SignalAnalyzer:
         print(f"Current candle downtrend: {current_downtrend}")
         print(f"Threshold: ±{trend_threshold:.8f}")
         
-        if uptrend_count >= min_required_trend_candles:
+        # Check for BUY signal - need uptrend AND fast EMA above slow EMA
+        if uptrend_count >= min_required_trend_candles and fast_above_slow:
             print(f"\n⬆️ TREND ANALYSIS: Both EMAs trending UP consistently for {uptrend_count} candles")
+            print(f"Fast EMA ({current_fast_ema:.8f}) is ABOVE Slow EMA ({current_slow_ema:.8f})")
             return "BUY"
             
-        elif downtrend_count >= min_required_trend_candles:
+        # Check for SELL signal - need downtrend AND fast EMA below slow EMA
+        elif downtrend_count >= min_required_trend_candles and not fast_above_slow:
             print(f"\n⬇️ TREND ANALYSIS: Both EMAs trending DOWN consistently for {downtrend_count} candles")
+            print(f"Fast EMA ({current_fast_ema:.8f}) is BELOW Slow EMA ({current_slow_ema:.8f})")
             return "SELL"
+            
+        # If conditions aren't fully met, explain why
+        if uptrend_count >= min_required_trend_candles and not fast_above_slow:
+            print(f"⚠️ Uptrend detected but Fast EMA is below Slow EMA - no BUY signal")
+        elif downtrend_count >= min_required_trend_candles and fast_above_slow:
+            print(f"⚠️ Downtrend detected but Fast EMA is above Slow EMA - no SELL signal")
             
         return None
 
