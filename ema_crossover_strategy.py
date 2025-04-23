@@ -68,10 +68,47 @@ class EMACalculator:
 class SignalAnalyzer:
     """Analyzes price action for trading signals"""
     
+    # Configuration: Static variables for strategy settings
+    # Candle management after profit-taking
+    required_new_candles = 3    # Number of new candles required after profit-taking
+    
+    # Position management settings
+    min_position_age_minutes = 2    # Minimum position age for profit-taking/loss-cutting
+    min_against_candles = 2         # Minimum candles showing reversal for taking profit/cutting loss
+    
+    # Tracking variables (state)
+    last_profit_time = None         # When we last took profits
+    candles_seen_since_profit = 0   # Number of candles seen since profit
+    last_candle_time = None         # Last candle timestamp seen
+    
     def __init__(self, df, symbol_info):
         self.df = df
         self.symbol_info = symbol_info
         
+        # Process new candle counting if in post-profit mode
+        if SignalAnalyzer.last_profit_time is not None:
+            current_candle_time = self.df['time'].iloc[-1]
+            
+            # Only count new candles (if the timestamp is different from last seen)
+            if SignalAnalyzer.last_candle_time is None or current_candle_time != SignalAnalyzer.last_candle_time:
+                SignalAnalyzer.candles_seen_since_profit += 1
+                SignalAnalyzer.last_candle_time = current_candle_time
+                print(f"🕒 Candles since profit: {SignalAnalyzer.candles_seen_since_profit}/{SignalAnalyzer.required_new_candles}")
+                
+                # If we've seen enough new candles, exit post-profit mode
+                if SignalAnalyzer.candles_seen_since_profit >= SignalAnalyzer.required_new_candles:
+                    print(f"✅ Collected {SignalAnalyzer.candles_seen_since_profit} new candles after profit - Ready for new trend signals")
+                    SignalAnalyzer.last_profit_time = None
+                    SignalAnalyzer.candles_seen_since_profit = 0
+
+    @staticmethod
+    def reset_after_profit():
+        """Reset candle history tracking after taking profit"""
+        SignalAnalyzer.last_profit_time = datetime.now()
+        SignalAnalyzer.candles_seen_since_profit = 0
+        SignalAnalyzer.last_candle_time = None
+        print(f"🔄 Reset candle history after profit-taking. Waiting for {SignalAnalyzer.required_new_candles} new candles.")
+
     def check_slope_conditions(self, direction="BUY"):
         """Check if slope conditions are met for the given direction"""
         fast_slope = EMACalculator.calculate_slope(self.df['fast_ema'])
@@ -136,13 +173,24 @@ class SignalAnalyzer:
         Returns:
             str or None: "BUY" for uptrend, "SELL" for downtrend, None if no clear trend
         """
+        # Configuration settings for trend detection
+        min_required_trend_candles = 3  # Minimum candles required showing the same trend
+        history_length = 4              # Number of candles to analyze
+        trend_threshold = self.symbol_info.point * 0.5  # Threshold for significant movement (half a point)
+        
+        # If we're in post-profit waiting period, don't generate trend signals
+        if SignalAnalyzer.last_profit_time is not None:
+            print(f"📊 Skipping trend analysis during post-profit waiting period")
+            print(f"Waiting for {SignalAnalyzer.required_new_candles - SignalAnalyzer.candles_seen_since_profit} more candles")
+            return None
+
         # Check if we have enough data
-        if len(self.df) < 4:  # Need at least 4 candles for meaningful trend detection
-            print("Not enough candles for trend analysis")
+        if len(self.df) < history_length:
+            print(f"Not enough candles for trend analysis - need at least {history_length}")
             return None
             
-        # Get the last 4 candles for trend analysis
-        last_candles = min(4, len(self.df))
+        # Get candles for trend analysis (newest to oldest)
+        last_candles = min(history_length, len(self.df))
         
         # Get EMA values for the last few candles (newest to oldest)
         fast_ema_values = [self.df['fast_ema'].iloc[-i] for i in range(1, last_candles+1)]
@@ -162,13 +210,11 @@ class SignalAnalyzer:
         
         # Print detailed slope analysis
         print(f"\n📊 EMA Trend Analysis:")
+        print(f"Using {last_candles} candles, requiring {min_required_trend_candles} for trend detection")
         print(f"Fast EMA values (newest to oldest): {', '.join([f'{v:.8f}' for v in fast_ema_values])}")
         print(f"Slow EMA values (newest to oldest): {', '.join([f'{v:.8f}' for v in slow_ema_values])}")
         print(f"Fast EMA slopes: {', '.join([f'{s:.8f}' for s in fast_ema_slopes])}")
         print(f"Slow EMA slopes: {', '.join([f'{s:.8f}' for s in slow_ema_slopes])}")
-        
-        # Define thresholds for trend detection
-        trend_threshold = self.symbol_info.point * 0.5  # Half a point movement is significant
         
         # Count how many candles show uptrend/downtrend for both EMAs
         uptrend_count = sum(1 for i in range(len(fast_ema_slopes)) 
@@ -195,10 +241,6 @@ class SignalAnalyzer:
         print(f"Current candle downtrend: {current_downtrend}")
         print(f"Threshold: ±{trend_threshold:.8f}")
         
-        # Determine trend direction based on consecutive candles
-        # Require at least 3 candles out of 4 showing the same trend
-        min_required_trend_candles = 3
-        
         if uptrend_count >= min_required_trend_candles:
             print(f"\n⬆️ TREND ANALYSIS: Both EMAs trending UP consistently for {uptrend_count} candles")
             return "BUY"
@@ -224,7 +266,12 @@ class SignalAnalyzer:
         Returns:
             bool: True if we should close the position, False otherwise
         """
-        if not position_type or len(self.df) < 5:  # Need more history for analysis
+        # Configuration settings for profit-taking
+        min_history_candles = 5     # Minimum candles needed for analysis
+        min_against_candles = self.min_against_candles  # Candles showing reversal needed
+        min_position_age = self.min_position_age_minutes  # Minimum position age in minutes
+        
+        if not position_type or len(self.df) < min_history_candles:  # Need enough history for analysis
             return False
             
         # DETAILED DEBUG: Print DataFrame information
@@ -234,7 +281,7 @@ class SignalAnalyzer:
         print(f"DataFrame index: {type(self.df.index)}")
         
         # Show the most recent few candles with timestamps
-        num_candles_to_show = min(5, len(self.df))
+        num_candles_to_show = min(min_history_candles, len(self.df))
         print(f"\n🕒 Last {num_candles_to_show} candles:")
         for i in range(num_candles_to_show):
             candle = self.df.iloc[-(i+1)]
@@ -273,26 +320,23 @@ class SignalAnalyzer:
                 print(f"position_time = {position_time} ({type(position_time)})")
                 minutes_since_open = 0  # Default to 0 if there's an error
             
-            # Require at least 1 minute to pass before considering profit-taking or loss-cutting
-            # This prevents immediate closing after trade-on-start
-            MIN_POSITION_AGE_MINUTES = 1  # Reduced from 2 to 1 minute to be more responsive
-            
+            # Require minimum time before considering profit-taking or loss-cutting
             print(f"Minutes since position opened: {minutes_since_open:.1f}")
-            print(f"Minimum required: {MIN_POSITION_AGE_MINUTES} minutes")
+            print(f"Minimum required: {min_position_age} minutes")
             
-            if minutes_since_open < MIN_POSITION_AGE_MINUTES:
-                print(f"\n⏱️ Position too new profit-taking/loss-cutting ({minutes_since_open:.1f} minutes old)")
-                print(f"Will check for profit-taking/loss-cutting after {MIN_POSITION_AGE_MINUTES} minutes")
+            if minutes_since_open < min_position_age:
+                print(f"\n⏱️ Position too new for profit-taking/loss-cutting ({minutes_since_open:.1f} minutes old)")
+                print(f"Will check for profit-taking/loss-cutting after {min_position_age} minutes")
                 return False
             else:
-                print(f"\n⏱️ Position age: {minutes_since_open:.1f} minutes (minimum {MIN_POSITION_AGE_MINUTES} minutes required)")
+                print(f"\n⏱️ Position age: {minutes_since_open:.1f} minutes (minimum {min_position_age} minutes required)")
         else:
             print("WARNING: No position_time provided, skipping age check!")
             # If no position time was provided, we can't check the age, so default to safe behavior
             return False
         
-        # Look at a longer history of candles (last 5 candles)
-        candle_history_length = min(5, len(self.df))
+        # Look at a longer history of candles
+        candle_history_length = min(min_history_candles, len(self.df))
         candle_history = [self.df.iloc[-i] for i in range(1, candle_history_length+1)]
         
         # Get EMA values for all candles in our history
@@ -334,10 +378,11 @@ class SignalAnalyzer:
             print(f"Current EMA Delta: {current_ema_delta:.7f} ({'DOWN' if current_ema_delta < 0 else 'UP'})")
             print(f"Candles showing EMA against position: {against_count}/{len(ema_deltas)}")
             print(f"Fast EMA vs Slow EMA: {fast_ema_current:.5f} vs {slow_ema_current:.5f} (Profitable: {profitable})")
+            print(f"Required against candles for profit/loss: {min_against_candles}")
             
-            # PROFIT TAKING: Take profit if the most recent fast EMA movement is against our position
+            # PROFIT TAKING: Take profit if multiple candles show fast EMA movement against our position
             # and we're still profitable
-            if profitable and ema_against_position:
+            if profitable and ema_against_position and against_count >= min_against_candles:
                 print(f"\n💰 PROFIT TAKING SIGNAL: Fast EMA trending down in BUY position")
                 print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show downward movement")
                 print(f"Still profitable (Fast EMA > Slow EMA): {fast_ema_current:.5f} > {slow_ema_current:.5f}")
@@ -345,7 +390,7 @@ class SignalAnalyzer:
                 
             # LOSS CUTTING: Cut losses if both EMAs are clearly trending down for multiple candles
             # or if the fast EMA has crossed below the slow EMA
-            elif not profitable and against_count >= 2:
+            elif not profitable and against_count >= min_against_candles:
                 print(f"\n✂️ LOSS CUTTING SIGNAL: Fast EMA below Slow EMA in BUY position")
                 print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show downward movement")
                 print(f"Position not profitable (Fast EMA < Slow EMA): {fast_ema_current:.5f} < {slow_ema_current:.5f}")
@@ -369,10 +414,11 @@ class SignalAnalyzer:
             print(f"Current EMA Delta: {current_ema_delta:.7f} ({'UP' if current_ema_delta > 0 else 'DOWN'})")
             print(f"Candles showing EMA against position: {against_count}/{len(ema_deltas)}")
             print(f"Fast EMA vs Slow EMA: {fast_ema_current:.5f} vs {slow_ema_current:.5f} (Profitable: {profitable})")
+            print(f"Required against candles for profit/loss: {min_against_candles}")
             
-            # PROFIT TAKING: Take profit if the most recent fast EMA movement is against our position
+            # PROFIT TAKING: Take profit if multiple candles show fast EMA movement against our position
             # and we're still profitable
-            if profitable and ema_against_position:
+            if profitable and ema_against_position and against_count >= min_against_candles:
                 print(f"\n💰 PROFIT TAKING SIGNAL: Fast EMA trending up in SELL position")
                 print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show upward movement")
                 print(f"Still profitable (Fast EMA < Slow EMA): {fast_ema_current:.5f} < {slow_ema_current:.5f}")
@@ -380,7 +426,7 @@ class SignalAnalyzer:
                 
             # LOSS CUTTING: Cut losses if both EMAs are clearly trending up for multiple candles
             # or if the fast EMA has crossed above the slow EMA
-            elif not profitable and against_count >= 2:
+            elif not profitable and against_count >= min_against_candles:
                 print(f"\n✂️ LOSS CUTTING SIGNAL: Fast EMA above Slow EMA in SELL position")
                 print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show upward movement")
                 print(f"Position not profitable (Fast EMA > Slow EMA): {fast_ema_current:.5f} > {slow_ema_current:.5f}")
@@ -931,10 +977,46 @@ def main():
                                 current_position_type = None
                                 last_signal = None
                                 last_signal_time = None
+                                
                                 # Explicitly reset position entry time
                                 prev_entry_time = position_entry_time
                                 position_entry_time = None
                                 print(f"⏱️ DEBUG: Reset position_entry_time from {prev_entry_time} to None")
+                                
+                                # Reset candle history tracking after taking profits
+                                if is_profitable:
+                                    SignalAnalyzer.reset_after_profit()
+                                
+                                # SPECIAL CASE: If EMAs have crossed, immediately enter a new trade
+                                # Check if fast EMA has crossed the slow EMA, indicating a strong reversal
+                                prev_fast = df['fast_ema'].iloc[-2]
+                                prev_slow = df['slow_ema'].iloc[-2]
+                                current_fast = df['fast_ema'].iloc[-1]
+                                current_slow = df['slow_ema'].iloc[-1]
+                                
+                                crossover_buy = prev_fast <= prev_slow and current_fast > current_slow
+                                crossover_sell = prev_fast >= prev_slow and current_fast < current_slow
+                                
+                                if crossover_buy or crossover_sell:
+                                    new_signal = "BUY" if crossover_buy else "SELL"
+                                    print(f"\n⚡ FAST ENTRY: EMA crossover detected after position closure")
+                                    print(f"Fast EMA: {current_fast:.5f} | Slow EMA: {current_slow:.5f}")
+                                    print(f"Previous candle - Fast: {prev_fast:.5f} | Slow: {prev_slow:.5f}")
+                                    print(f"Immediately entering {new_signal} position without waiting for confirmation")
+                                    
+                                    # Execute the trade immediately
+                                    new_action = new_signal.lower()
+                                    if execute_trade(args.symbol, new_action, risk):
+                                        print(f"Fast entry {new_signal} trade executed successfully")
+                                        last_signal = new_signal
+                                        last_signal_time = current_time
+                                        in_position = True
+                                        current_position_type = new_action
+                                        position_entry_time = datetime.now()
+                                        print(f"⏱️ Position entry time set: {position_entry_time}")
+                                        
+                                        # Skip the rest of this iteration
+                                        continue
                     except Exception as e:
                         print(f"Error during position management check: {e}")
                 
