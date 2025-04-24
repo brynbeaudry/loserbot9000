@@ -43,7 +43,7 @@ SIGNAL_FILTERS = {
 # Position Management Configuration
 POSITION_CONFIG = {
     'REQUIRED_NEW_CANDLES': 3,          # Number of new candles required after profit-taking
-    'MIN_POSITION_AGE_MINUTES': 2,      # Minimum position age for profit-taking/loss-cutting
+    'MIN_POSITION_AGE_MINUTES': 1,      # Minimum position age for profit-taking/loss-cutting
     'PROFIT_HISTORY_CANDLES': 4,        # Number of post-entry candles to analyze for profit-taking
     'REQUIRED_REVERSAL_STRENGTH': 50,   # Percentage (0-100) of candles showing reversal needed for exit
     'REVERSAL_HISTORY_CANDLES': 3,      # Number of recent candles to check for immediate reversal
@@ -357,13 +357,14 @@ class SignalAnalyzer:
             
             # Calculate entry candle boundaries
             entry_time = self.position_time
+            print(f"Entry time: {entry_time}")
             entry_candle_start, entry_candle_end = get_candle_boundaries(entry_time, timeframe)
             
             print(f"Entry time: {entry_time}")
             print(f"Entry candle: {entry_candle_start} to {entry_candle_end}")
             
             # Get enough recent candles to ensure we can find post-entry ones
-            candle_history_length = min(min_history_candles * 3, len(self.df) - start_index)
+            candle_history_length = min(min_history_candles, len(self.df) - start_index)
             all_candles = [self.df.iloc[-(i+start_index)] for i in range(candle_history_length)]
             
             # Filter to only include candles that formed AFTER the entry candle
@@ -1397,28 +1398,53 @@ def get_candle_boundaries(timestamp, timeframe):
     """Calculate the start and end time of the candle containing the timestamp
     
     Args:
-        timestamp: Datetime or timestamp to find the candle for
+        timestamp: datetime
         timeframe: MT5 timeframe constant
         
     Returns:
-        tuple: (candle_start_time, candle_end_time) as datetime objects
+        tuple: (candle_start_time, candle_end_time) as datetime objects with timezone info removed
+              to ensure they can be compared with DataFrame timestamps
     """
-    # Convert datetime to timestamp if needed
-    if isinstance(timestamp, datetime):
-        timestamp = int(timestamp.timestamp())
-    
-    # Get timeframe in minutes and convert to seconds
-    timeframe_minutes = get_timeframe_minutes(timeframe)
-    seconds_per_candle = timeframe_minutes * 60
-    
-    # Calculate candle boundary
-    candle_boundary = (timestamp // seconds_per_candle) * seconds_per_candle
-    
-    # Return start and end times as datetime objects
-    candle_start = datetime.fromtimestamp(candle_boundary)
-    candle_end = datetime.fromtimestamp(candle_boundary + seconds_per_candle)
-    
-    return candle_start, candle_end
+    try:
+        # Handle the case where timestamp might be a string
+        if isinstance(timestamp, str):
+            dt = datetime.fromisoformat(timestamp)
+        else:
+            # Assume it's already a datetime object
+            dt = timestamp
+        
+        # Get timeframe in minutes and convert to seconds
+        timeframe_minutes = get_timeframe_minutes(timeframe)
+        seconds_per_candle = timeframe_minutes * 60
+        
+        # Get timestamp value (seconds since epoch)
+        # this will handle timezone conversion to UTC automatically
+        timestamp_value = int(dt.timestamp())
+        
+        # Calculate candle boundary timestamps
+        candle_boundary = (timestamp_value // seconds_per_candle) * seconds_per_candle
+        candle_end_timestamp = candle_boundary + seconds_per_candle
+        
+        # First create timezone-aware UTC datetimes
+        import pytz
+        utc = pytz.UTC
+        candle_start = datetime.fromtimestamp(candle_boundary, tz=utc)
+        candle_end = datetime.fromtimestamp(candle_end_timestamp, tz=utc)
+        
+        # Format to string and back to strip timezone info completely
+        # This ensures consistent format with pandas DataFrame timestamps
+        candle_start_str = candle_start.strftime('%Y-%m-%d %H:%M:%S')
+        candle_end_str = candle_end.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Convert back to datetime objects (now timezone-naive)
+        candle_start = datetime.strptime(candle_start_str, '%Y-%m-%d %H:%M:%S')
+        candle_end = datetime.strptime(candle_end_str, '%Y-%m-%d %H:%M:%S')
+        
+        return candle_start, candle_end
+        
+    except Exception as e:
+        print(f"Error in get_candle_boundaries: {e}")
+        raise ValueError(f"Invalid timestamp format: {timestamp} ({type(timestamp)})")
 
 def main():
     """Main function to run the EMA crossover trading strategy"""
@@ -1478,6 +1504,8 @@ def main():
                     # ===== STEP 1: FETCH MARKET DATA =====
                     # Always fetch latest data to update our analyzer
                     df = DataFetcher.get_historical_data(args.symbol, timeframe)
+                    # print most recent frame and quit
+                    print(df.iloc[-1])
                     symbol_info = DataFetcher.get_symbol_info(args.symbol)
                     
                     if df is None or symbol_info is None:
