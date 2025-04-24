@@ -34,7 +34,10 @@ SIGNAL_FILTERS = {
     'SLOPE_PERIODS': 3,  # Periods to calculate slope over
     'MIN_SLOPE_THRESHOLD': 0.000001,  # Minimum slope for trend direction
     'MAX_OPPOSITE_SLOPE': -0.000002,  # Maximum allowed opposite slope
-    'PRICE_CONFIRM_PERIODS': 2  # Periods to wait for price confirmation
+    'PRICE_CONFIRM_PERIODS': 2,  # Periods to wait for price confirmation
+    'TREND_MIN_CANDLES': 3,      # Minimum candles required showing the same trend
+    'TREND_HISTORY_LENGTH': 4,   # Number of candles to analyze for trend
+    'TREND_THRESHOLD_MULT': 0.5  # Multiplier for trend threshold (applied to point value)
 }
 
 # Position Management Configuration
@@ -209,10 +212,10 @@ class SignalAnalyzer:
         Returns:
             str or None: "BUY" for uptrend, "SELL" for downtrend, None if no clear trend
         """
-        # Configuration settings for trend detection
-        min_required_trend_candles = 3  # Minimum candles required showing the same trend
-        history_length = 4              # Number of candles to analyze
-        trend_threshold = self.symbol_info.point * 0.5  # Threshold for significant movement (half a point)
+        # Configuration settings for trend detection from SIGNAL_FILTERS
+        min_required_trend_candles = SIGNAL_FILTERS['TREND_MIN_CANDLES']
+        history_length = SIGNAL_FILTERS['TREND_HISTORY_LENGTH']
+        trend_threshold = self.symbol_info.point * SIGNAL_FILTERS['TREND_THRESHOLD_MULT']
         
         # If we're in post-profit waiting period, don't generate trend signals
         if SignalAnalyzer.is_in_waiting_period:
@@ -221,7 +224,7 @@ class SignalAnalyzer:
 
         # Check if we have enough data
         if len(self.df) < history_length:
-            print(f"Not enough candles for trend analysis - need at least {history_length}")
+            print(f"📊 Need {history_length} candles for trend analysis")
             return None
             
         # Get candles for trend analysis (newest to oldest)
@@ -247,11 +250,6 @@ class SignalAnalyzer:
             
             fast_ema_slopes.append(fast_slope)
             slow_ema_slopes.append(slow_slope)
-        
-        # Print detailed slope analysis
-        print(f"\n📊 EMA Trend Analysis for check trend:")
-        print(f"Using {last_candles} candles, requiring {min_required_trend_candles} for trend detection")
-
         
         # Count how many candles show uptrend/downtrend for both EMAs
         uptrend_count = sum(1 for i in range(len(fast_ema_slopes)) 
