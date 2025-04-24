@@ -42,9 +42,12 @@ SIGNAL_FILTERS = {
 
 # Position Management Configuration
 POSITION_CONFIG = {
-    'REQUIRED_NEW_CANDLES': 3,      # Number of new candles required after profit-taking
-    'MIN_POSITION_AGE_MINUTES': 2,  # Minimum position age for profit-taking/loss-cutting
-    'MIN_AGAINST_CANDLES': 2,       # Minimum candles showing reversal for taking profit/cutting loss
+    'REQUIRED_NEW_CANDLES': 3,          # Number of new candles required after profit-taking
+    'MIN_POSITION_AGE_MINUTES': 2,      # Minimum position age for profit-taking/loss-cutting
+    'PROFIT_HISTORY_CANDLES': 4,        # Number of post-entry candles to analyze for profit-taking
+    'REQUIRED_REVERSAL_STRENGTH': 50,   # Percentage (0-100) of candles showing reversal needed for exit
+    'REVERSAL_HISTORY_CANDLES': 3,      # Number of recent candles to check for immediate reversal
+    'INCLUDE_CURRENT_CANDLE': False     # Whether to include the current forming candle in profit-taking /loss-cutting analysis
 }
 
 class EMACalculator:
@@ -117,11 +120,12 @@ class SignalAnalyzer:
     def __init__(self, df, symbol_info):
         self.df = df
         self.symbol_info = symbol_info
+        self.position_time = None   # When the current position was opened
         
         # Process new candle counting if in post-profit mode
         if SignalAnalyzer.is_in_waiting_period:
             current_candle_time = self.df['time'].iloc[-1]
-
+            
             print(f"🕒 Current candle time: {current_candle_time}")
             print(f"🕒 Last candle time: {SignalAnalyzer.last_candle_time}")
             print(f"🕒 Candles since profit: {SignalAnalyzer.candles_seen_since_profit}/{POSITION_CONFIG['REQUIRED_NEW_CANDLES']}")
@@ -142,7 +146,7 @@ class SignalAnalyzer:
     @staticmethod
     def reset_after_profit():
         """Reset candle history tracking after taking profit"""
-        SignalAnalyzer.last_profit_time = datetime.now()
+        SignalAnalyzer.last_profit_time = get_server_time()
         SignalAnalyzer.candles_seen_since_profit = 0
         SignalAnalyzer.last_candle_time = None
         SignalAnalyzer.is_in_waiting_period = True
@@ -290,26 +294,34 @@ class SignalAnalyzer:
             
         return None
 
-    def check_profit_taking(self, position_type, position_time=None):
+    def check_profit_taking(self, position_type, position_time=None, timeframe=mt5.TIMEFRAME_M1):
         """Check if we should take profits or cut losses on the current position
         
-        Analyzes candle history to detect if there's a consistent trend against our position.
+        Analyzes post-entry candle history to detect if there's a consistent trend against our position.
         Takes profits when the fast EMA is moving against us while we're still profitable.
         Also cuts losses when the position is moving significantly against us.
-        Ensures the position has been open long enough before considering any action.
         
         Args:
             position_type: Current position type ("BUY" or "SELL")
             position_time: Datetime when the position was opened
+            timeframe: MT5 timeframe constant (default: M1)
             
         Returns:
             bool: True if we should close the position, False otherwise
         """
         try:
-            # Configuration settings for profit-taking
-            min_history_candles = 5     # Minimum candles needed for analysis
-            min_against_candles = POSITION_CONFIG['MIN_AGAINST_CANDLES']  # Candles showing reversal needed
-            min_position_age = POSITION_CONFIG['MIN_POSITION_AGE_MINUTES']  # Minimum position age in minutes
+            # Store position time for filtering
+            if position_time is not None:
+                self.position_time = position_time
+                print(f"📊 Position entry time: {self.position_time}")
+            
+            # Get configuration parameters
+            min_history_candles = POSITION_CONFIG['PROFIT_HISTORY_CANDLES']  # Total candles to analyze
+            include_current = POSITION_CONFIG['INCLUDE_CURRENT_CANDLE']      # Whether to include current candle
+            
+            # Get timeframe from DataFrame if available, otherwise use provided timeframe
+            df_timeframe = self.df.get('timeframe', [timeframe])[0] if 'timeframe' in self.df.columns else timeframe
+            timeframe = df_timeframe
             
             # Validate position type
             if not position_type:
@@ -320,40 +332,162 @@ class SignalAnalyzer:
                 print(f"❌ Invalid position type for profit-taking analysis: {position_type}")
                 return False
             
-            # Validate we have enough history data
-            if len(self.df) < min_history_candles:
-                print(f"❌ Not enough history for profit-taking analysis: {len(self.df)} candles (need {min_history_candles})")
+            # Validate position time is available
+            if not hasattr(self, 'position_time') or self.position_time is None:
+                print("❌ No position entry time provided - cannot filter post-entry candles")
                 return False
                 
-            # DETAILED DEBUG: Print DataFrame information
-            print("\n🔍 DEBUG: DataFrame Information")
-            print(f"DataFrame shape: {self.df.shape}")
-            print(f"DataFrame columns: {self.df.columns.tolist()}")
-            print(f"DataFrame index: {type(self.df.index)}")
-            
-            # Show the most recent few candles with timestamps
-            num_candles_to_show = min(min_history_candles, len(self.df))
-            print(f"\n🕒 Last {num_candles_to_show} candles:")
-            for i in range(num_candles_to_show):
-                candle = self.df.iloc[-(i+1)]
-                print(f"Candle -{i+1}: Time={candle['time']} | Open={candle['open']:.5f} | High={candle['high']:.5f} | Low={candle['low']:.5f} | Close={candle['close']:.5f} | Fast EMA={candle['fast_ema']:.5f} | Slow EMA={candle['slow_ema']:.5f}")
-            
-            # Debug position time
-            print(f"\n⏱️ DEBUG: Position Time Information")
-            print(f"Position type: {position_type}")
-            print(f"Position time passed to function: {position_time} (Type: {type(position_time)})")
-            print(f"Current system time: {datetime.now()}")
-            
             # Check if the position is old enough to consider profit-taking or loss-cutting
-            if not self._is_position_mature_enough(position_time, min_position_age):
+            if not self._is_position_mature_enough(position_time, POSITION_CONFIG['MIN_POSITION_AGE_MINUTES']):
                 print("⏱️ Position not mature enough for profit-taking analysis")
                 return False
             
-            # Analyze the candle history - this is where the actual decision is made
-            result = self._analyze_position_for_exit(position_type, min_against_candles)
-            print(f"Profit-taking analysis result: {result}")
-            return result
+            # Skip the current candle if configured to do so
+            start_index = 1 if not include_current else 0
+            print(f"{'Including' if include_current else 'Excluding'} current candle in analysis")
             
+            # Get all candles (excluding current if needed)
+            if len(self.df) < start_index + 1:
+                print(f"❌ Not enough candles in data frame")
+                return False
+            
+            # Get timeframe information
+            timeframe_minutes = get_timeframe_minutes(timeframe)
+            print(f"Using {timeframe_minutes}-minute candles for analysis")
+            
+            # Calculate entry candle boundaries
+            entry_time = self.position_time
+            entry_candle_start, entry_candle_end = get_candle_boundaries(entry_time, timeframe)
+            
+            print(f"Entry time: {entry_time}")
+            print(f"Entry candle: {entry_candle_start} to {entry_candle_end}")
+            
+            # Get enough recent candles to ensure we can find post-entry ones
+            candle_history_length = min(min_history_candles * 3, len(self.df) - start_index)
+            all_candles = [self.df.iloc[-(i+start_index)] for i in range(candle_history_length)]
+            
+            # Filter to only include candles that formed AFTER the entry candle
+            post_entry_candles = []
+            for candle in all_candles:
+                candle_time = candle['time']
+                # Candle is post-entry if it started after the entry candle ended
+                if candle_time > entry_candle_end:
+                    post_entry_candles.append(candle)
+                    print(f"✅ Candle at {candle_time} is after entry candle")
+                else:
+                    print(f"❌ Candle at {candle_time} is during or before entry candle")
+            
+            print(f"Found {len(post_entry_candles)} complete post-entry candles")
+            
+            # Check if we have enough post-entry candles for analysis
+            if len(post_entry_candles) < min_history_candles:
+                print(f"❌ Insufficient post-entry candles: have {len(post_entry_candles)}, need {min_history_candles}")
+                return False
+            
+            # Use exactly the required number of candles for analysis
+            candle_history = post_entry_candles[:min_history_candles]
+            print(f"Using {len(candle_history)} post-entry candles for analysis")
+            
+            # Extract values for analysis
+            fast_ema_values = [candle['fast_ema'] for candle in candle_history]
+            slow_ema_values = [candle['slow_ema'] for candle in candle_history]
+            close_values = [candle['close'] for candle in candle_history]
+            
+            # Current values (newest candle in our analysis window)
+            fast_ema_current = fast_ema_values[0]
+            slow_ema_current = slow_ema_values[0]
+            current_close = close_values[0]
+            
+            # Calculate EMA crossing and direction
+            fast_above_slow = fast_ema_current > slow_ema_current
+            
+            # Make sure we have enough values to calculate deltas
+            if len(fast_ema_values) < 2:
+                print("❌ Not enough data points to calculate EMA deltas")
+                return False
+            
+            # Analyze fast EMA direction over multiple candles
+            ema_deltas = [fast_ema_values[i] - fast_ema_values[i+1] for i in range(len(fast_ema_values)-1)]
+            price_deltas = [close_values[i] - close_values[i+1] for i in range(len(close_values)-1)]
+            
+            # Check if the most recent fast EMA movement is against our position
+            current_ema_delta = ema_deltas[0] if ema_deltas else 0
+            
+            # Perform position-specific analysis
+            if position_type == "BUY":
+                # For BUY positions
+                profitable = fast_above_slow  # Fast EMA still above slow EMA
+                ema_against_position = current_ema_delta < 0  # Negative delta = fast EMA going down
+                
+                # Count how many of the last candles show EMA moving against our position
+                against_count = sum(1 for delta in ema_deltas if delta < 0)
+                
+                # Calculate the ratio of candles showing movement against our position
+                total_candles = len(ema_deltas)
+                against_ratio = against_count / total_candles if total_candles > 0 else 0
+                
+                # Calculate the minimum required candles based on percentage
+                min_required_candles = max(1, round(POSITION_CONFIG['REQUIRED_REVERSAL_STRENGTH']/100 * total_candles))
+                print(f"Minimum candles needed: {min_required_candles} of {total_candles}")
+                
+                # PROFIT TAKING: Take profit if multiple candles show fast EMA movement against our position
+                # and we're still profitable
+                if profitable and ema_against_position and (against_count >= min_required_candles) and (against_ratio >= POSITION_CONFIG['REQUIRED_REVERSAL_STRENGTH']/100):
+                    print(f"\n💰 PROFIT TAKING SIGNAL: Fast EMA trending down in BUY position")
+                    print(f"Evidence from candle history: {against_count}/{total_candles} ({against_ratio:.1%}) candles show downward movement")
+                    print(f"Still profitable (Fast EMA > Slow EMA): {fast_ema_current:.5f} > {slow_ema_current:.5f}")
+                    return True
+                    
+                # LOSS CUTTING: Cut losses if both EMAs are clearly trending down for multiple candles
+                # or if the fast EMA has crossed below the slow EMA
+                elif not profitable and (against_count >= min_required_candles) and (against_ratio >= POSITION_CONFIG['REQUIRED_REVERSAL_STRENGTH']/100):
+                    print(f"\n✂️ LOSS CUTTING SIGNAL: Fast EMA below Slow EMA in BUY position")
+                    print(f"Evidence from candle history: {against_count}/{total_candles} ({against_ratio:.1%}) candles show downward movement")
+                    print(f"Position not profitable (Fast EMA < Slow EMA): {fast_ema_current:.5f} < {slow_ema_current:.5f}")
+                    return True
+                
+                print("No position management signal detected for BUY position")
+                return False
+                
+            elif position_type == "SELL":
+                # For SELL positions
+                profitable = not fast_above_slow  # Fast EMA still below slow EMA
+                ema_against_position = current_ema_delta > 0  # Positive delta = fast EMA going up
+                
+                # Count how many of the last candles show EMA moving against our position
+                against_count = sum(1 for delta in ema_deltas if delta > 0)
+                
+                # Calculate the ratio of candles showing movement against our position
+                total_candles = len(ema_deltas)
+                against_ratio = against_count / total_candles if total_candles > 0 else 0
+                
+                # Calculate the minimum required candles based on percentage
+                min_required_candles = max(1, round(POSITION_CONFIG['REQUIRED_REVERSAL_STRENGTH']/100 * total_candles))
+                print(f"Minimum candles needed: {min_required_candles} of {total_candles}")
+                
+                # PROFIT TAKING: Take profit if multiple candles show fast EMA movement against our position
+                # and we're still profitable
+                if profitable and ema_against_position and (against_count >= min_required_candles) and (against_ratio >= POSITION_CONFIG['REQUIRED_REVERSAL_STRENGTH']/100):
+                    print(f"\n💰 PROFIT TAKING SIGNAL: Fast EMA trending up in SELL position")
+                    print(f"Evidence from candle history: {against_count}/{total_candles} ({against_ratio:.1%}) candles show upward movement")
+                    print(f"Still profitable (Fast EMA < Slow EMA): {fast_ema_current:.5f} < {slow_ema_current:.5f}")
+                    return True
+                    
+                # LOSS CUTTING: Cut losses if both EMAs are clearly trending up for multiple candles
+                # or if the fast EMA has crossed above the slow EMA
+                elif not profitable and (against_count >= min_required_candles) and (against_ratio >= POSITION_CONFIG['REQUIRED_REVERSAL_STRENGTH']/100):
+                    print(f"\n✂️ LOSS CUTTING SIGNAL: Fast EMA above Slow EMA in SELL position")
+                    print(f"Evidence from candle history: {against_count}/{total_candles} ({against_ratio:.1%}) candles show upward movement")
+                    print(f"Position not profitable (Fast EMA > Slow EMA): {fast_ema_current:.5f} > {slow_ema_current:.5f}")
+                    return True
+                
+                print("No position management signal detected for SELL position")
+                return False
+            
+            else:
+                print(f"Unknown position type: {position_type}")
+                return False
+                
         except Exception as e:
             print(f"❌ Error in check_profit_taking: {e}")
             import traceback
@@ -381,9 +515,9 @@ class SignalAnalyzer:
             print(f"ERROR: position_time is not a datetime object: {position_time} ({type(position_time)})")
             return False
         
-        # Use the system time for comparing, not the candle time
-        current_time = datetime.now()
-        print(f"Current system time for comparison: {current_time}")
+        # Use the server time for comparing, not the local time
+        current_time = get_server_time()
+        print(f"Current server time for comparison: {current_time}")
         
         # Debug time calculation
         try:
@@ -413,188 +547,6 @@ class SignalAnalyzer:
         else:
             print(f"\n⏱️ Position age: {minutes_since_open:.1f} minutes (minimum {min_position_age} minutes required)")
             return True
-            
-    def _analyze_position_for_exit(self, position_type, min_against_candles):
-        """Analyze candle history to determine if we should exit the position
-        
-        Args:
-            position_type: Current position type ("BUY" or "SELL")
-            min_against_candles: Minimum candles showing reversal needed
-            
-        Returns:
-            bool: True if we should exit the position, False otherwise
-        """
-        try:
-            # Look at a longer history of candles
-            min_history_candles = 5
-            candle_history_length = min(min_history_candles, len(self.df))
-            candle_history = [self.df.iloc[-i] for i in range(1, candle_history_length+1)]
-            
-            # Get EMA values for all candles in our history
-            fast_ema_values = [candle['fast_ema'] for candle in candle_history]
-            slow_ema_values = [candle['slow_ema'] for candle in candle_history]
-            close_values = [candle['close'] for candle in candle_history]
-            
-            # Current values (newest candle)
-            fast_ema_current = fast_ema_values[0]
-            slow_ema_current = slow_ema_values[0]
-            current_close = close_values[0]
-            
-            # Calculate EMA crossing and direction
-            fast_above_slow = fast_ema_current > slow_ema_current
-            
-            # Debug print values before calculating deltas
-            print(f"\n🔍 DEBUG: EMA Values for Analysis")
-            print(f"Fast EMA values: {fast_ema_values}")
-            print(f"Slow EMA values: {slow_ema_values}")
-            print(f"Close values: {close_values}")
-            
-            # Make sure we have enough values to calculate deltas
-            if len(fast_ema_values) < 2:
-                print("❌ Not enough data points to calculate EMA deltas")
-                return False
-            
-            # Analyze fast EMA direction over multiple candles
-            ema_deltas = [fast_ema_values[i] - fast_ema_values[i+1] for i in range(len(fast_ema_values)-1)]
-            price_deltas = [close_values[i] - close_values[i+1] for i in range(len(close_values)-1)]
-            
-            # Check if the most recent fast EMA movement is against our position
-            current_ema_delta = ema_deltas[0] if ema_deltas else 0
-            
-            # Print detailed info about the current values
-            print(f"\n📈 Current EMA Analysis:")
-            print(f"Current Fast EMA: {fast_ema_current:.6f}")
-            print(f"Current Slow EMA: {slow_ema_current:.6f}")
-            print(f"Fast Above Slow: {fast_above_slow}")
-            print(f"Current Fast EMA Delta: {current_ema_delta:.8f}")
-            print(f"EMA Deltas: {ema_deltas}")
-            print(f"Price Deltas: {price_deltas}")
-            
-            # Determine position-specific analysis
-            if position_type == "BUY":
-                return self._analyze_buy_position_for_exit(fast_ema_current, slow_ema_current, ema_deltas, 
-                                                          price_deltas, current_ema_delta, fast_above_slow, 
-                                                          min_against_candles)
-            elif position_type == "SELL":
-                return self._analyze_sell_position_for_exit(fast_ema_current, slow_ema_current, ema_deltas, 
-                                                           price_deltas, current_ema_delta, fast_above_slow, 
-                                                           min_against_candles)
-            else:
-                print(f"Unknown position type: {position_type}")
-                return False
-        except Exception as e:
-            print(f"❌ Error in _analyze_position_for_exit: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-            
-    def _analyze_buy_position_for_exit(self, fast_ema_current, slow_ema_current, ema_deltas, 
-                                      price_deltas, current_ema_delta, fast_above_slow, min_against_candles):
-        """Analyze if a BUY position should be exited
-        
-        Args:
-            fast_ema_current: Current fast EMA value
-            slow_ema_current: Current slow EMA value
-            ema_deltas: List of EMA delta values (newest to oldest)
-            price_deltas: List of price delta values (newest to oldest)
-            current_ema_delta: Most recent EMA delta
-            fast_above_slow: Whether fast EMA is above slow EMA
-            min_against_candles: Minimum candles showing reversal needed
-            
-        Returns:
-            bool: True if we should exit the position, False otherwise
-        """
-        # For BUY positions
-        profitable = fast_above_slow  # Fast EMA still above slow EMA
-        ema_against_position = current_ema_delta < 0  # Negative delta = fast EMA going down
-        
-        # Check if we have any additional evidence of reversal in the candle history
-        # Count how many of the last candles show EMA moving against our position
-        against_count = sum(1 for delta in ema_deltas if delta < 0)
-        
-        # Print detailed analysis of candle history
-        print(f"\n📊 BUY Position Candle History Analysis (newest to oldest):")
-        print(f"Current Fast EMA: {fast_ema_current:.5f}")
-        print(f"Current Slow EMA: {slow_ema_current:.5f}")
-        print(f"Fast EMA deltas: {', '.join([f'{d:.7f}' for d in ema_deltas])}")
-        print(f"Price deltas: {', '.join([f'{d:.7f}' for d in price_deltas])}")
-        print(f"Current EMA Delta: {current_ema_delta:.7f} ({'DOWN' if current_ema_delta < 0 else 'UP'})")
-        print(f"Candles showing EMA against position: {against_count}/{len(ema_deltas)}")
-        print(f"Fast EMA vs Slow EMA: {fast_ema_current:.5f} vs {slow_ema_current:.5f} (Profitable: {profitable})")
-        print(f"Required against candles for profit/loss: {min_against_candles}")
-        
-        # PROFIT TAKING: Take profit if multiple candles show fast EMA movement against our position
-        # and we're still profitable
-        if profitable and ema_against_position and against_count >= min_against_candles:
-            print(f"\n💰 PROFIT TAKING SIGNAL: Fast EMA trending down in BUY position")
-            print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show downward movement")
-            print(f"Still profitable (Fast EMA > Slow EMA): {fast_ema_current:.5f} > {slow_ema_current:.5f}")
-            return True
-            
-        # LOSS CUTTING: Cut losses if both EMAs are clearly trending down for multiple candles
-        # or if the fast EMA has crossed below the slow EMA
-        elif not profitable and against_count >= min_against_candles:
-            print(f"\n✂️ LOSS CUTTING SIGNAL: Fast EMA below Slow EMA in BUY position")
-            print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show downward movement")
-            print(f"Position not profitable (Fast EMA < Slow EMA): {fast_ema_current:.5f} < {slow_ema_current:.5f}")
-            return True
-            
-        print("No position management signal detected for BUY position")
-        return False
-        
-    def _analyze_sell_position_for_exit(self, fast_ema_current, slow_ema_current, ema_deltas, 
-                                       price_deltas, current_ema_delta, fast_above_slow, min_against_candles):
-        """Analyze if a SELL position should be exited
-        
-        Args:
-            fast_ema_current: Current fast EMA value
-            slow_ema_current: Current slow EMA value
-            ema_deltas: List of EMA delta values (newest to oldest)
-            price_deltas: List of price delta values (newest to oldest)
-            current_ema_delta: Most recent EMA delta
-            fast_above_slow: Whether fast EMA is above slow EMA
-            min_against_candles: Minimum candles showing reversal needed
-            
-        Returns:
-            bool: True if we should exit the position, False otherwise
-        """
-        # For SELL positions
-        profitable = not fast_above_slow  # Fast EMA still below slow EMA
-        ema_against_position = current_ema_delta > 0  # Positive delta = fast EMA going up
-        
-        # Check if we have any additional evidence of reversal in the candle history
-        # Count how many of the last candles show EMA moving against our position
-        against_count = sum(1 for delta in ema_deltas if delta > 0)
-        
-        # Print detailed analysis of candle history
-        print(f"\n📊 SELL Position Candle History Analysis (newest to oldest):")
-        print(f"Current Fast EMA: {fast_ema_current:.5f}")
-        print(f"Current Slow EMA: {slow_ema_current:.5f}")
-        print(f"Fast EMA deltas: {', '.join([f'{d:.7f}' for d in ema_deltas])}")
-        print(f"Price deltas: {', '.join([f'{d:.7f}' for d in price_deltas])}")
-        print(f"Current EMA Delta: {current_ema_delta:.7f} ({'UP' if current_ema_delta > 0 else 'DOWN'})")
-        print(f"Candles showing EMA against position: {against_count}/{len(ema_deltas)}")
-        print(f"Fast EMA vs Slow EMA: {fast_ema_current:.5f} vs {slow_ema_current:.5f} (Profitable: {profitable})")
-        print(f"Required against candles for profit/loss: {min_against_candles}")
-        
-        # PROFIT TAKING: Take profit if multiple candles show fast EMA movement against our position
-        # and we're still profitable
-        if profitable and ema_against_position and against_count >= min_against_candles:
-            print(f"\n💰 PROFIT TAKING SIGNAL: Fast EMA trending up in SELL position")
-            print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show upward movement")
-            print(f"Still profitable (Fast EMA < Slow EMA): {fast_ema_current:.5f} < {slow_ema_current:.5f}")
-            return True
-            
-        # LOSS CUTTING: Cut losses if both EMAs are clearly trending up for multiple candles
-        # or if the fast EMA has crossed above the slow EMA
-        elif not profitable and against_count >= min_against_candles:
-            print(f"\n✂️ LOSS CUTTING SIGNAL: Fast EMA above Slow EMA in SELL position")
-            print(f"Evidence from candle history: {against_count}/{len(ema_deltas)} candles show upward movement")
-            print(f"Position not profitable (Fast EMA > Slow EMA): {fast_ema_current:.5f} > {slow_ema_current:.5f}")
-            return True
-        
-        print("No position management signal detected for SELL position")
-        return False
 
 class RiskManager:
     """Handles position sizing and risk calculations"""
@@ -709,6 +661,9 @@ class DataFetcher:
             
         df = pd.DataFrame(rates)
         df['time'] = pd.to_datetime(df['time'], unit='s')
+        
+        # No need to adjust time since we're using server time directly
+        df['timeframe'] = timeframe  # Store the timeframe in the DataFrame for later use
         
         # Calculate EMAs using the EMACalculator
         return EMACalculator.calculate_emas_for_dataframe(df)
@@ -1037,7 +992,7 @@ class TradeExecutor:
         
         if not MT5Helper.is_modification_successful(modify_result):
             print(f"⚠️ Failed to set SL/TP: {mt5.last_error()}")
-        
+    
         return True, position.ticket
 
 class SignalProcessor:
@@ -1148,6 +1103,47 @@ def parse_arguments():
                        help='Execute a trade based on current EMA positions at startup')
     return parser.parse_args()
 
+def get_server_time():
+    """Get the current server time based on broker settings
+    
+    For PU Prime:
+    - Server time is GMT+3 during daylight saving time (April-October)
+    - Server time is GMT+2 during standard time (November-March)
+    
+    Returns:
+        datetime: Current time in the broker's server timezone
+    """
+    # Use UTC time adjusted by the broker's known timezone offset for PU Prime
+    server_info = ACCOUNT_CONFIG.get('SERVER', '')
+    if "PUPrime" in server_info:
+        # For PU Prime: determine the proper UTC offset
+        current_month = datetime.now().month
+        if 4 <= current_month <= 10:  # DST period (April-October)
+            server_offset_hours = 3  # GMT+3
+        else:
+            server_offset_hours = 2  # GMT+2
+    else:
+        # Default to GMT+3 for other brokers or if server info not available
+        server_offset_hours = 3
+    
+    
+    # Calculate server time from UTC (using the non-deprecated method)
+    try:
+        # Try using datetime.UTC (Python 3.11+)
+        if hasattr(datetime, 'UTC'):
+            server_time = datetime.now(datetime.UTC) + timedelta(hours=server_offset_hours)
+        else:
+            # Fallback for older Python versions
+            import pytz
+            utc_time = datetime.now(pytz.UTC)
+            server_time = utc_time + timedelta(hours=server_offset_hours)
+    except Exception as e:
+        # Last resort fallback to deprecated method if all else fails
+        print(f"Warning: Using deprecated datetime.utcnow() due to error: {e}")
+        server_time = datetime.utcnow() + timedelta(hours=server_offset_hours)
+    
+    return server_time
+
 def handle_initial_position(symbol, risk):
     """Handle initial position setup if trading on start
     
@@ -1182,19 +1178,21 @@ def handle_initial_position(symbol, risk):
     
     if success:
         print("Initial trade executed successfully")
-        position_entry_time = datetime.now()  # Record position entry time
+        
+        # Use server time for position entry time
+        position_entry_time = get_server_time()
+        print(f"Using server time for position entry: {position_entry_time}")
         
         # Debug position entry time
         print(f"\n⏱️ DEBUG: Position Entry Time Set")
         print(f"position_entry_time = {position_entry_time} (Type: {type(position_entry_time)})")
-        print(f"Current system time: {datetime.now()}")
         
         return signal, position_entry_time, ticket
     else:
         print("Failed to execute initial trade")
         return None, None, None
 
-def handle_position_management(symbol, current_position_type, position_entry_time, analyzer):
+def handle_position_management(symbol, current_position_type, position_entry_time, analyzer, timeframe=mt5.TIMEFRAME_M1):
     """Handle position management (profit taking, loss cutting)
     
     Args:
@@ -1202,6 +1200,7 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
         current_position_type: Current position type ("buy" or "sell")
         position_entry_time: Datetime when position was opened
         analyzer: SignalAnalyzer instance
+        timeframe: MT5 timeframe constant (default: M1)
         
     Returns:
         tuple: (action_taken, in_position, current_position_type, position_entry_time)
@@ -1219,12 +1218,13 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
         print(f"⚙️ Position check: {current_position_type.upper() if current_position_type else 'None'}")
         
         print(f"\n⚙️ Checking position management for {current_position_type.upper()} position")
+        print(f"📅 Position entry time: {position_entry_time}")
         
         # Make sure we convert the position type to uppercase for the analyzer
         position_type_upper = current_position_type.upper() if current_position_type else None
         
         # Check if we should take profits or cut losses
-        if analyzer.check_profit_taking(position_type_upper, position_entry_time):
+        if analyzer.check_profit_taking(position_type_upper, position_entry_time, timeframe):
             # Determine if we're taking profit or cutting loss based on EMA positions
             fast_ema = analyzer.df['fast_ema'].iloc[-1]
             slow_ema = analyzer.df['slow_ema'].iloc[-1]
@@ -1240,7 +1240,7 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
                 print(f"\n✂️ Cutting losses on {position_type_upper} position")
             
             # Close all positions
-            print(f"‼️ CLOSING POSITION at {datetime.now()}")
+            print(f"‼️ CLOSING POSITION at {get_server_time()}")
             positions_closed = TradeExecutor.find_and_close_positions(symbol, position_type_upper, "ALL")
             
             if positions_closed:
@@ -1257,6 +1257,10 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
 def check_for_immediate_reversal(symbol, risk, analyzer):
     """Check if there's an immediate reversal after closing a position
     
+    Analyzes recent candle history for EMA crossovers that would indicate
+    a strong reversal signal after closing a position. If multiple crossovers
+    are found, follows the dominant direction (majority wins).
+    
     Args:
         symbol: Trading symbol
         risk: Risk percentage (decimal)
@@ -1271,33 +1275,150 @@ def check_for_immediate_reversal(symbol, risk, analyzer):
     
     df = analyzer.df
     
-    # Check if fast EMA has crossed the slow EMA, indicating a strong reversal
-    if len(df) < 2:
-        print("Not enough candles for reversal analysis")
-        return None, None, None
+    # Get the number of candles to check from configuration
+    history_candles = POSITION_CONFIG['REVERSAL_HISTORY_CANDLES']
     
+    # Check if we have enough data
+    if len(df) < history_candles + 1:  # Need at least history_candles + 1 to detect crossover
+        print(f"⚠️ Not enough candles for reversal analysis (need {history_candles + 1})")
+        return None, None, None
+        
+    # Track all crossovers found in the history
+    buy_signals = []
+    sell_signals = []
+    
+    # Examine recent candle history for crossovers
+    for i in range(1, min(history_candles, len(df)-1)):
+        prev_fast = df['fast_ema'].iloc[-(i+1)]
+        prev_slow = df['slow_ema'].iloc[-(i+1)]
+        current_fast = df['fast_ema'].iloc[-i]
+        current_slow = df['slow_ema'].iloc[-i]
+        
+        # Check for crossovers
+        if prev_fast <= prev_slow and current_fast > current_slow:
+            # BUY signal (fast crosses above slow)
+            buy_signals.append((i, df['time'].iloc[-i]))
+        elif prev_fast >= prev_slow and current_fast < current_slow:
+            # SELL signal (fast crosses below slow)
+            sell_signals.append((i, df['time'].iloc[-i]))
+    
+    # Also check the most recent candle
     prev_fast = df['fast_ema'].iloc[-2]
     prev_slow = df['slow_ema'].iloc[-2]
     current_fast = df['fast_ema'].iloc[-1]
     current_slow = df['slow_ema'].iloc[-1]
     
-    crossover_buy = prev_fast <= prev_slow and current_fast > current_slow
-    crossover_sell = prev_fast >= prev_slow and current_fast < current_slow
+    if prev_fast <= prev_slow and current_fast > current_slow:
+        buy_signals.append((1, df['time'].iloc[-1]))
+    elif prev_fast >= prev_slow and current_fast < current_slow:
+        sell_signals.append((1, df['time'].iloc[-1]))
     
-    if crossover_buy or crossover_sell:
-        new_signal = "BUY" if crossover_buy else "SELL"
-        print(f"⚡ REVERSAL: Immediate {new_signal} signal")
+    # Count total signals found
+    buy_count = len(buy_signals)
+    sell_count = len(sell_signals)
+    
+    # Log what we found
+    print(f"\n🔍 Reversal analysis in last {history_candles} candles:")
+    print(f"⬆️ BUY signals: {buy_count} | ⬇️ SELL signals: {sell_count}")
+    
+    if buy_signals:
+        print(f"BUY crossovers at candles: {', '.join([f'-{i}' for i, _ in buy_signals])}")
+    if sell_signals:
+        print(f"SELL crossovers at candles: {', '.join([f'-{i}' for i, _ in sell_signals])}")
+    
+    # If we found any signals, determine the dominant direction
+    if buy_count > 0 or sell_count > 0:
+        # Go with majority direction
+        if buy_count > sell_count:
+            # More BUY signals - get the most recent one
+            new_signal = "BUY"
+            crossover_index, candle_time = buy_signals[0]  # Most recent buy signal
+        elif sell_count > buy_count:
+            # More SELL signals - get the most recent one
+            new_signal = "SELL"
+            crossover_index, candle_time = sell_signals[0]  # Most recent sell signal
+        else:
+            # It's a tie - do nothing
+            print("⚖️ Equal number of BUY and SELL signals - no clear direction")
+            return None, None, None
         
-        # Execute the trade immediately
+        print(f"⚡ REVERSAL: {new_signal} signal dominates with {buy_count if new_signal == 'BUY' else sell_count} signals")
+        print(f"Most recent {new_signal} signal was {crossover_index} candles ago at {candle_time}")
+        
+        # Get the current EMA values
+        current_fast = df['fast_ema'].iloc[-1]
+        current_slow = df['slow_ema'].iloc[-1]
+        print(f"Current Fast EMA: {current_fast:.5f} | Slow EMA: {current_slow:.5f}")
+        
+        # Execute the trade based on the dominant direction
         new_action = new_signal.lower()
         success, ticket = TradeExecutor.execute_trade(symbol, new_action, risk)
         
         if success:
             print(f"✅ {new_signal} position opened (reversal)")
-            position_entry_time = datetime.now()
+            position_entry_time = get_server_time()
             return new_signal, position_entry_time, ticket
     
+    print("No immediate reversal signal detected in recent candles")
     return None, None, None
+
+def get_timeframe_minutes(timeframe):
+    """Convert MT5 timeframe constant to minutes
+    
+    Args:
+        timeframe: MT5 timeframe constant (e.g., mt5.TIMEFRAME_M1)
+        
+    Returns:
+        int: Timeframe in minutes
+    """
+    if timeframe == mt5.TIMEFRAME_M1:
+        return 1
+    elif timeframe == mt5.TIMEFRAME_M5:
+        return 5
+    elif timeframe == mt5.TIMEFRAME_M15:
+        return 15
+    elif timeframe == mt5.TIMEFRAME_M30:
+        return 30
+    elif timeframe == mt5.TIMEFRAME_H1:
+        return 60
+    elif timeframe == mt5.TIMEFRAME_H4:
+        return 240
+    elif timeframe == mt5.TIMEFRAME_D1:
+        return 1440
+    elif timeframe == mt5.TIMEFRAME_W1:
+        return 10080
+    elif timeframe == mt5.TIMEFRAME_MN1:
+        return 43200
+    else:
+        print(f"Unknown timeframe: {timeframe}, using default M1")
+        return 1
+
+def get_candle_boundaries(timestamp, timeframe):
+    """Calculate the start and end time of the candle containing the timestamp
+    
+    Args:
+        timestamp: Datetime or timestamp to find the candle for
+        timeframe: MT5 timeframe constant
+        
+    Returns:
+        tuple: (candle_start_time, candle_end_time) as datetime objects
+    """
+    # Convert datetime to timestamp if needed
+    if isinstance(timestamp, datetime):
+        timestamp = int(timestamp.timestamp())
+    
+    # Get timeframe in minutes and convert to seconds
+    timeframe_minutes = get_timeframe_minutes(timeframe)
+    seconds_per_candle = timeframe_minutes * 60
+    
+    # Calculate candle boundary
+    candle_boundary = (timestamp // seconds_per_candle) * seconds_per_candle
+    
+    # Return start and end times as datetime objects
+    candle_start = datetime.fromtimestamp(candle_boundary)
+    candle_end = datetime.fromtimestamp(candle_boundary + seconds_per_candle)
+    
+    return candle_start, candle_end
 
 def main():
     """Main function to run the EMA crossover trading strategy"""
@@ -1316,9 +1437,12 @@ def main():
     if account is None:
         MT5Helper.shutdown()
         return
-
+    
     print(f"\n🚀 Trading {args.symbol} with {EMA_CONFIG['FAST_EMA']}/{EMA_CONFIG['SLOW_EMA']} EMA")
     print(f"💰 Risk: {args.risk}% | Balance: ${account.balance:.2f}")
+    
+    # Set timeframe - default to M1
+    timeframe = mt5.TIMEFRAME_M1
     
     # Trading state variables
     last_signal_time = None
@@ -1336,7 +1460,7 @@ def main():
     if args.trade_on_start:
         last_signal, position_entry_time, position_ticket = handle_initial_position(args.symbol, risk)
         if last_signal:
-            last_signal_time = datetime.now()
+            last_signal_time = get_server_time()
             in_position = True
             current_position_type = last_signal.lower()
     
@@ -1346,14 +1470,14 @@ def main():
     try:
         while True:
             try:
-                current_time = datetime.now()
+                current_time = get_server_time()
                 
                 # Check for new signals every second
                 if last_signal_time is None or (current_time - last_signal_time).total_seconds() >= 1:
                     
                     # ===== STEP 1: FETCH MARKET DATA =====
                     # Always fetch latest data to update our analyzer
-                    df = DataFetcher.get_historical_data(args.symbol)
+                    df = DataFetcher.get_historical_data(args.symbol, timeframe)
                     symbol_info = DataFetcher.get_symbol_info(args.symbol)
                     
                     if df is None or symbol_info is None:
@@ -1392,7 +1516,7 @@ def main():
                     # Manage any open positions (profit-taking/loss-cutting)
                     if in_position and position_entry_time is not None:
                         position_closed, in_position, current_position_type, position_entry_time = handle_position_management(
-                            args.symbol, current_position_type, position_entry_time, analyzer
+                            args.symbol, current_position_type, position_entry_time, analyzer, timeframe
                         )
                         
                         # If we closed a position, check for immediate reversal opportunity
@@ -1449,7 +1573,7 @@ def main():
                                 last_signal_time = current_time
                                 in_position = True
                                 current_position_type = action
-                                position_entry_time = datetime.now()  # Record position entry time
+                                position_entry_time = get_server_time()  # Record position entry time
                                 position_ticket = ticket
                                 print(f"✅ {action.upper()} position opened")
                 
@@ -1466,3 +1590,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
