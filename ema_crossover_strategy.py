@@ -143,7 +143,7 @@ class SignalAnalyzer:
         SignalAnalyzer.candles_seen_since_profit = 0
         SignalAnalyzer.last_candle_time = None
         SignalAnalyzer.is_in_waiting_period = True
-        print(f"🔄 Reset candle history after profit-taking. Waiting for {POSITION_CONFIG['REQUIRED_NEW_CANDLES']} new candles.")
+        print(f"🔄 Waiting period activated - need {POSITION_CONFIG['REQUIRED_NEW_CANDLES']} new candles")
 
     def check_slope_conditions(self, direction="BUY"):
         """Check if slope conditions are met for the given direction"""
@@ -216,8 +216,7 @@ class SignalAnalyzer:
         
         # If we're in post-profit waiting period, don't generate trend signals
         if SignalAnalyzer.is_in_waiting_period:
-            print(f"📊 Skipping trend analysis during post-profit waiting period")
-            print(f"Waiting for {POSITION_CONFIG['REQUIRED_NEW_CANDLES'] - SignalAnalyzer.candles_seen_since_profit} more candles")
+            print(f"⏳ Waiting period active - skipping trend analysis")
             return None
 
         # Check if we have enough data
@@ -250,14 +249,9 @@ class SignalAnalyzer:
             slow_ema_slopes.append(slow_slope)
         
         # Print detailed slope analysis
-        print(f"\n📊 EMA Trend Analysis:")
+        print(f"\n📊 EMA Trend Analysis for check trend:")
         print(f"Using {last_candles} candles, requiring {min_required_trend_candles} for trend detection")
-        print(f"Fast EMA values (newest to oldest): {', '.join([f'{v:.8f}' for v in fast_ema_values])}")
-        print(f"Slow EMA values (newest to oldest): {', '.join([f'{v:.8f}' for v in slow_ema_values])}")
-        print(f"Fast EMA slopes: {', '.join([f'{s:.8f}' for s in fast_ema_slopes])}")
-        print(f"Slow EMA slopes: {', '.join([f'{s:.8f}' for s in slow_ema_slopes])}")
-        print(f"Current Fast EMA: {current_fast_ema:.8f}, Slow EMA: {current_slow_ema:.8f}")
-        print(f"Fast EMA is {'ABOVE' if fast_above_slow else 'BELOW'} Slow EMA")
+
         
         # Count how many candles show uptrend/downtrend for both EMAs
         uptrend_count = sum(1 for i in range(len(fast_ema_slopes)) 
@@ -277,30 +271,24 @@ class SignalAnalyzer:
                             fast_ema_slopes[0] < -trend_threshold and 
                             slow_ema_slopes[0] < -trend_threshold)
         
-        # Print trend analysis
-        print(f"Uptrend count: {uptrend_count}/{len(fast_ema_slopes)}")
-        print(f"Downtrend count: {downtrend_count}/{len(fast_ema_slopes)}")
-        print(f"Current candle uptrend: {current_uptrend}")
-        print(f"Current candle downtrend: {current_downtrend}")
-        print(f"Threshold: ±{trend_threshold:.8f}")
+        # Print trend analysis - make more concise
+        print(f"📊 Trend: ⬆️ {uptrend_count}/{len(fast_ema_slopes)} ⬇️ {downtrend_count}/{len(fast_ema_slopes)} | Fast {fast_above_slow and '>' or '<'} Slow")
         
         # Check for BUY signal - need uptrend AND fast EMA above slow EMA
         if uptrend_count >= min_required_trend_candles and fast_above_slow:
-            print(f"\n⬆️ TREND ANALYSIS: Both EMAs trending UP consistently for {uptrend_count} candles")
-            print(f"Fast EMA ({current_fast_ema:.8f}) is ABOVE Slow EMA ({current_slow_ema:.8f})")
+            print(f"⬆️ BUY SIGNAL: EMAs trending up for {uptrend_count} candles with Fast > Slow")
             return "BUY"
             
         # Check for SELL signal - need downtrend AND fast EMA below slow EMA
         elif downtrend_count >= min_required_trend_candles and not fast_above_slow:
-            print(f"\n⬇️ TREND ANALYSIS: Both EMAs trending DOWN consistently for {downtrend_count} candles")
-            print(f"Fast EMA ({current_fast_ema:.8f}) is BELOW Slow EMA ({current_slow_ema:.8f})")
+            print(f"⬇️ SELL SIGNAL: EMAs trending down for {downtrend_count} candles with Fast < Slow")
             return "SELL"
             
         # If conditions aren't fully met, explain why
         if uptrend_count >= min_required_trend_candles and not fast_above_slow:
-            print(f"⚠️ Uptrend detected but Fast EMA is below Slow EMA - no BUY signal")
+            print(f"⚠️ Uptrend detected but Fast < Slow - no BUY")
         elif downtrend_count >= min_required_trend_candles and fast_above_slow:
-            print(f"⚠️ Downtrend detected but Fast EMA is above Slow EMA - no SELL signal")
+            print(f"⚠️ Downtrend detected but Fast > Slow - no SELL")
             
         return None
 
@@ -967,25 +955,23 @@ class TradeExecutor:
         # Get the current price
         price = DataFetcher.get_current_price(symbol, "ask" if action == "buy" else "bid")
         if not price:
-            print("Failed to get current price")
+            print("❌ Failed to get current price")
             return False, None
     
         # Get account info for risk calculation
         account = MT5Helper.get_account_info()
         if account is None:
-            print("Failed to get account info")
+            print("❌ Failed to get account info")
             return False, None
     
-        print(f"Executing {action.upper()} at price: {price}")
+        print(f"🔍 {action.upper()} @ {price}")
     
         # Calculate stop distance
         stop_distance = RiskManager.calculate_stop_distance(price, RISK_CONFIG['RISK_PERCENTAGE'], symbol_info)
         
         # Calculate appropriate lot size based on risk
         volume = RiskManager.calculate_lot_size(symbol_info, account.balance, risk_percentage, stop_distance)
-        print(f"Account Balance: ${account.balance:.2f}")
-        print(f"Risk Amount ({risk_percentage*100}%): ${account.balance * risk_percentage:.2f}")
-        print(f"Calculated lot size: {volume}")
+        print(f"💱 Volume: {volume} lots | Risk: ${account.balance * risk_percentage:.2f}")
     
         # Store initial positions to compare later
         initial_positions = MT5Helper.get_open_positions(symbol)
@@ -1009,10 +995,10 @@ class TradeExecutor:
     
         result = mt5.order_send(request)
         if not MT5Helper.is_trade_successful(result):
-            print(f"Failed to execute {action} trade: {mt5.last_error()}")
+            print(f"❌ Failed to execute {action} trade: {mt5.last_error()}")
             return False, None
     
-        print(f"{action.capitalize()} trade executed successfully! Deal #{result.deal}")
+        print(f"✅ {action.upper()} order sent - Deal #{result.deal}")
     
         # Find the new position and set SL/TP
         position = None
@@ -1028,7 +1014,7 @@ class TradeExecutor:
             time.sleep(0.1)
     
         if not position:
-            print("Warning: Could not find position to modify SL/TP")
+            print("⚠️ Could not find position to set SL/TP")
             return True, result.deal  # Trade was still successful
     
         # Calculate SL and TP based on risk percentage
@@ -1038,10 +1024,7 @@ class TradeExecutor:
         sl = round(sl, digits)
         tp = round(tp, digits)
     
-        print(f"\nSetting SL/TP:")
-        print(f"Entry Price: {price}")
-        print(f"Stop Loss: {sl} ({abs(price - sl)} distance)")
-        print(f"Take Profit: {tp} ({abs(price - tp)} distance)")
+        print(f"🛡️ SL: {sl} | 🎯 TP: {tp}")
     
         # Create modify request
         modify_request = {
@@ -1055,50 +1038,47 @@ class TradeExecutor:
         modify_result = mt5.order_send(modify_request)
         
         if not MT5Helper.is_modification_successful(modify_result):
-            print(f"Failed to set SL/TP: {mt5.last_error()}")
-        else:
-            print(f"Successfully set SL to {sl} and TP to {tp}")
-    
+            print(f"⚠️ Failed to set SL/TP: {mt5.last_error()}")
+        
         return True, position.ticket
 
 class SignalProcessor:
     """Handles signal detection and processing"""
     
     @staticmethod
-    def get_current_signal(symbol):
+    def get_current_signal(symbol, analyzer):
         """Get current trading signal based on EMA crossover check
         
         Args:
             symbol: Trading symbol
+            analyzer: SignalAnalyzer instance
             
         Returns:
             str or None: "BUY", "SELL", or None if no clear signal
         """
         # Use the same crossover logic as get_ema_signals
-        return SignalProcessor.get_ema_signals(symbol, None)
+        return SignalProcessor.get_ema_signals(symbol, None, None, analyzer)
     
     @staticmethod
-    def get_ema_signals(symbol, prev_signal=None, position_entry_time=None):
+    def get_ema_signals(symbol, prev_signal=None, position_entry_time=None, analyzer=None):
         """Get trading signals based on EMA crossover with additional filters
         
         Args:
             symbol: Trading symbol
             prev_signal: Previous trading signal (can be None)
             position_entry_time: Not used, kept for backward compatibility
+            analyzer: SignalAnalyzer instance
             
         Returns:
             str or None: Trading signal or None if no clear signal
         """
-        df = DataFetcher.get_historical_data(symbol)
-        if df is None:
-            return None
+        # Ensure analyzer is provided
+        if analyzer is None:
+            raise ValueError("Analyzer must be provided to get_ema_signals")
         
-        # Get symbol info for point calculations
-        symbol_info = DataFetcher.get_symbol_info(symbol)
-        if symbol_info is None:
-            return None
-        
-        analyzer = SignalAnalyzer(df, symbol_info)
+        # Use the analyzer's data
+        df = analyzer.df
+        symbol_info = analyzer.symbol_info
         
         # Check for consistent trend direction based only on recent candle history
         # This doesn't depend on previous signals or position entry time
@@ -1107,6 +1087,10 @@ class SignalProcessor:
             return trend_signal
         
         # Get current and previous values
+        if len(df) < 2:
+            print("Not enough candles for crossover analysis")
+            return prev_signal
+            
         current_fast = df['fast_ema'].iloc[-1]
         current_slow = df['slow_ema'].iloc[-1]
         prev_fast = df['fast_ema'].iloc[-2]
@@ -1212,13 +1196,14 @@ def handle_initial_position(symbol, risk):
         print("Failed to execute initial trade")
         return None, None, None
 
-def handle_position_management(symbol, current_position_type, position_entry_time):
+def handle_position_management(symbol, current_position_type, position_entry_time, analyzer):
     """Handle position management (profit taking, loss cutting)
     
     Args:
         symbol: Trading symbol
         current_position_type: Current position type ("buy" or "sell")
         position_entry_time: Datetime when position was opened
+        analyzer: SignalAnalyzer instance
         
     Returns:
         tuple: (action_taken, in_position, current_position_type, position_entry_time)
@@ -1228,22 +1213,13 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
             position_entry_time: None if position was closed
     """
     try:
-        df = DataFetcher.get_historical_data(symbol)
-        if df is None:
-            print("Failed to get historical data - skipping position management")
-            return False, True, current_position_type, position_entry_time
-        
-        symbol_info = DataFetcher.get_symbol_info(symbol)
-        if symbol_info is None:
-            print("Failed to get symbol info - skipping position management")
-            return False, True, current_position_type, position_entry_time
+        # Ensure analyzer is provided
+        if analyzer is None:
+            raise ValueError("Analyzer must be provided to handle_position_management")
         
         # Print debug info for position type
-        print(f"\n⚙️ Position Management Check - Debug Info:")
-        print(f"Position Type: {current_position_type.upper() if current_position_type else 'None'}")
-        print(f"Position Entry Time: {position_entry_time}")
+        print(f"⚙️ Position check: {current_position_type.upper() if current_position_type else 'None'}")
         
-        analyzer = SignalAnalyzer(df, symbol_info)
         print(f"\n⚙️ Checking position management for {current_position_type.upper()} position")
         
         # Make sure we convert the position type to uppercase for the analyzer
@@ -1252,8 +1228,8 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
         # Check if we should take profits or cut losses
         if analyzer.check_profit_taking(position_type_upper, position_entry_time):
             # Determine if we're taking profit or cutting loss based on EMA positions
-            fast_ema = df['fast_ema'].iloc[-1]
-            slow_ema = df['slow_ema'].iloc[-1]
+            fast_ema = analyzer.df['fast_ema'].iloc[-1]
+            slow_ema = analyzer.df['slow_ema'].iloc[-1]
             
             # For BUY positions: profitable if fast_ema > slow_ema
             # For SELL positions: profitable if fast_ema < slow_ema
@@ -1270,17 +1246,8 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
             positions_closed = TradeExecutor.find_and_close_positions(symbol, position_type_upper, "ALL")
             
             if positions_closed:
-                print(f"✅ Position closed, resetting for new signals")
-                
-                # Explicitly reset position entry time
-                prev_entry_time = position_entry_time
+                print(f"✅ Position closed")
                 position_entry_time = None
-                print(f"⏱️ DEBUG: Reset position_entry_time from {prev_entry_time} to None")
-                
-                # Reset candle history tracking after taking profits
-                if is_profitable:
-                    SignalAnalyzer.reset_after_profit()
-                
                 return True, False, None, None
     except Exception as e:
         print(f"Error during position management check: {e}")
@@ -1289,21 +1256,28 @@ def handle_position_management(symbol, current_position_type, position_entry_tim
     
     return False, True, current_position_type, position_entry_time
 
-def check_for_immediate_reversal(symbol, risk):
+def check_for_immediate_reversal(symbol, risk, analyzer):
     """Check if there's an immediate reversal after closing a position
     
     Args:
         symbol: Trading symbol
         risk: Risk percentage (decimal)
+        analyzer: SignalAnalyzer instance
         
     Returns:
         tuple: (signal, position_entry_time, ticket) or (None, None, None) if no reversal
     """
-    df = DataFetcher.get_historical_data(symbol)
-    if df is None:
-        return None, None, None
-        
+    # Ensure analyzer is provided
+    if analyzer is None:
+        raise ValueError("Analyzer must be provided to check_for_immediate_reversal")
+    
+    df = analyzer.df
+    
     # Check if fast EMA has crossed the slow EMA, indicating a strong reversal
+    if len(df) < 2:
+        print("Not enough candles for reversal analysis")
+        return None, None, None
+    
     prev_fast = df['fast_ema'].iloc[-2]
     prev_slow = df['slow_ema'].iloc[-2]
     current_fast = df['fast_ema'].iloc[-1]
@@ -1314,19 +1288,15 @@ def check_for_immediate_reversal(symbol, risk):
     
     if crossover_buy or crossover_sell:
         new_signal = "BUY" if crossover_buy else "SELL"
-        print(f"\n⚡ FAST ENTRY: EMA crossover detected after position closure")
-        print(f"Fast EMA: {current_fast:.5f} | Slow EMA: {current_slow:.5f}")
-        print(f"Previous candle - Fast: {prev_fast:.5f} | Slow: {prev_slow:.5f}")
-        print(f"Immediately entering {new_signal} position without waiting for confirmation")
+        print(f"⚡ REVERSAL: Immediate {new_signal} signal")
         
         # Execute the trade immediately
         new_action = new_signal.lower()
         success, ticket = TradeExecutor.execute_trade(symbol, new_action, risk)
         
         if success:
-            print(f"Fast entry {new_signal} trade executed successfully")
+            print(f"✅ {new_signal} position opened (reversal)")
             position_entry_time = datetime.now()
-            print(f"⏱️ Position entry time set: {position_entry_time}")
             return new_signal, position_entry_time, ticket
     
     return None, None, None
@@ -1349,9 +1319,8 @@ def main():
         MT5Helper.shutdown()
         return
 
-    print(f"\nTrading {args.symbol} with {EMA_CONFIG['FAST_EMA']}/{EMA_CONFIG['SLOW_EMA']} EMA Crossover")
-    print(f"Risk per trade: {args.risk}%")
-    print(f"Balance: {account.balance:.2f}")
+    print(f"\n🚀 Trading {args.symbol} with {EMA_CONFIG['FAST_EMA']}/{EMA_CONFIG['SLOW_EMA']} EMA")
+    print(f"💰 Risk: {args.risk}% | Balance: ${account.balance:.2f}")
     
     # Trading state variables
     last_signal_time = None
@@ -1361,6 +1330,10 @@ def main():
     position_entry_time = None  # Track when position was opened
     position_ticket = None  # Track position ticket number
     
+    # Create a persistent analyzer that we'll update with new data each iteration
+    # Initialize it with empty data for now - we'll update it in the loop
+    analyzer = None
+    
     # Check current EMA positions if trading on start is enabled
     if args.trade_on_start:
         last_signal, position_entry_time, position_ticket = handle_initial_position(args.symbol, risk)
@@ -1369,7 +1342,7 @@ def main():
             in_position = True
             current_position_type = last_signal.lower()
     
-    print("\nBot running... Press Ctrl+C to stop")
+    print("\n🤖 Bot running... Press Ctrl+C to stop")
 
     # Main trading loop
     try:
@@ -1380,16 +1353,57 @@ def main():
                 # Check for new signals every second
                 if last_signal_time is None or (current_time - last_signal_time).total_seconds() >= 1:
                     
-                    # Handle position management if we have a position
+                    # ===== STEP 1: FETCH MARKET DATA =====
+                    # Always fetch latest data to update our analyzer
+                    df = DataFetcher.get_historical_data(args.symbol)
+                    symbol_info = DataFetcher.get_symbol_info(args.symbol)
+                    
+                    if df is None or symbol_info is None:
+                        print("❌ Failed to get market data")
+                        time.sleep(0.1)
+                        continue
+                    
+                    # ===== STEP 2: UPDATE OR CREATE ANALYZER =====
+                    # If this is the first run or if analyzer needs to be recreated
+                    if analyzer is None:
+                        analyzer = SignalAnalyzer(df, symbol_info)
+                    else:
+                        # Update the existing analyzer with new data
+                        analyzer.df = df
+                        analyzer.symbol_info = symbol_info
+                        
+                        # Call any initialization logic that would normally happen in __init__
+                        # This is critical for candle counting during waiting periods
+                        if SignalAnalyzer.is_in_waiting_period:
+                            current_candle_time = df['time'].iloc[-1]
+                            
+                            # Only count new candles (if the timestamp is different from last seen)
+                            if SignalAnalyzer.last_candle_time is None or current_candle_time != SignalAnalyzer.last_candle_time:
+                                SignalAnalyzer.candles_seen_since_profit += 1
+                                SignalAnalyzer.last_candle_time = current_candle_time
+                                print(f"⏳ Waiting: {SignalAnalyzer.candles_seen_since_profit}/{POSITION_CONFIG['REQUIRED_NEW_CANDLES']} candles")
+                                
+                                # If we've seen enough new candles, exit post-profit mode
+                                if SignalAnalyzer.candles_seen_since_profit >= POSITION_CONFIG['REQUIRED_NEW_CANDLES']:
+                                    print(f"✅ Waiting period complete")
+                                    SignalAnalyzer.last_profit_time = None
+                                    SignalAnalyzer.candles_seen_since_profit = 0
+                                    SignalAnalyzer.is_in_waiting_period = False
+                    
+                    # ===== STEP 3: HANDLE EXISTING POSITIONS =====
+                    # Manage any open positions (profit-taking/loss-cutting)
                     if in_position and position_entry_time is not None:
                         position_closed, in_position, current_position_type, position_entry_time = handle_position_management(
-                            args.symbol, current_position_type, position_entry_time
+                            args.symbol, current_position_type, position_entry_time, analyzer
                         )
                         
                         # If we closed a position, check for immediate reversal opportunity
                         if position_closed:
-                            new_signal, new_entry_time, new_ticket = check_for_immediate_reversal(args.symbol, risk)
+                            # First, check for immediate reversal before deciding on waiting period
+                            new_signal, new_entry_time, new_ticket = check_for_immediate_reversal(args.symbol, risk, analyzer)
+                            
                             if new_signal:
+                                # If there's an immediate reversal signal, enter the new position without waiting
                                 last_signal = new_signal
                                 last_signal_time = current_time
                                 in_position = True
@@ -1397,19 +1411,25 @@ def main():
                                 position_entry_time = new_entry_time
                                 position_ticket = new_ticket
                                 continue
-                            
-                            # Otherwise reset trading state
-                            last_signal = None
-                            last_signal_time = None
+                            else:
+                                # No immediate reversal detected - activate waiting period
+                                print(f"🔍 No reversal - waiting period activated")
+                                SignalAnalyzer.reset_after_profit()
+                                # Reset trading state since we didn't enter a new position
+                                last_signal = None
+                                last_signal_time = None
                     
+                    # ===== STEP 4: CHECK WAITING PERIOD =====
                     # Skip signal checks if we're in post-profit waiting period
                     if SignalAnalyzer.is_in_waiting_period:
                         time.sleep(0.1)
                         continue
                     
-                    # Check for new signals - pass position_entry_time for context
-                    signal = SignalProcessor.get_ema_signals(args.symbol, last_signal, position_entry_time)
+                    # ===== STEP 5: CHECK FOR NEW SIGNALS =====
+                    # Pass our persistent analyzer instance 
+                    signal = SignalProcessor.get_ema_signals(args.symbol, last_signal, position_entry_time, analyzer)
                     
+                    # ===== STEP 6: EXECUTE TRADES IF NEEDED =====
                     if signal and signal != last_signal:
                         action = signal.lower()
                         should_trade = False
@@ -1418,14 +1438,11 @@ def main():
                             should_trade = True
                         elif current_position_type != action:  # Signal is opposite to current position
                             should_trade = True
-                            print(f"‼️ SWITCHING DIRECTION from {current_position_type.upper()} to {action.upper()} at {datetime.now()}")
+                            print(f"🔄 {current_position_type.upper()} ➡️ {action.upper()}")
                             positions_closed = TradeExecutor.find_and_close_positions(args.symbol, signal)
                             
                             if positions_closed:
-                                # Reset position entry time when switching directions
-                                prev_entry_time = position_entry_time
                                 position_entry_time = None
-                                print(f"⏱️ DEBUG: Reset position_entry_time from {prev_entry_time} to None")
                         
                         if should_trade:
                             success, ticket = TradeExecutor.execute_trade(args.symbol, action, risk)
@@ -1436,20 +1453,16 @@ def main():
                                 current_position_type = action
                                 position_entry_time = datetime.now()  # Record position entry time
                                 position_ticket = ticket
-                                
-                                # Debug position entry time
-                                print(f"\n⏱️ DEBUG: Position Entry Time Set")
-                                print(f"position_entry_time = {position_entry_time} (Type: {type(position_entry_time)})")
-                                print(f"Current system time: {datetime.now()}")
+                                print(f"✅ {action.upper()} position opened")
                 
                 time.sleep(0.1)  # Check every 100ms
                 
             except Exception as e:
-                print(f"Error in main loop: {e}")
+                print(f"❌ Error: {e}")
                 time.sleep(0.1)
                 
     except KeyboardInterrupt:
-        print("\nBot stopped")
+        print("\n🛑 Bot stopped")
     finally:
         MT5Helper.shutdown()
 
