@@ -126,9 +126,6 @@ class SignalAnalyzer:
         if SignalAnalyzer.is_in_waiting_period:
             current_candle_time = self.df['time'].iloc[-1]
             
-            print(f"🕒 Current candle time: {current_candle_time}")
-            print(f"🕒 Last candle time: {SignalAnalyzer.last_candle_time}")
-            print(f"🕒 Candles since profit: {SignalAnalyzer.candles_seen_since_profit}/{POSITION_CONFIG['REQUIRED_NEW_CANDLES']}")
             print(f"Is in waiting period: {SignalAnalyzer.is_in_waiting_period}")
             # Only count new candles (if the timestamp is different from last seen)
             if SignalAnalyzer.last_candle_time is None or current_candle_time != SignalAnalyzer.last_candle_time:
@@ -138,7 +135,6 @@ class SignalAnalyzer:
                 
                 # If we've seen enough new candles, exit post-profit mode
                 if SignalAnalyzer.candles_seen_since_profit >= POSITION_CONFIG['REQUIRED_NEW_CANDLES']:
-                    print(f"✅ Collected {SignalAnalyzer.candles_seen_since_profit} new candles after profit - Ready for new trend signals")
                     SignalAnalyzer.last_profit_time = None
                     SignalAnalyzer.candles_seen_since_profit = 0
                     SignalAnalyzer.is_in_waiting_period = False
@@ -357,11 +353,7 @@ class SignalAnalyzer:
             
             # Calculate entry candle boundaries
             entry_time = self.position_time
-            print(f"Entry time: {entry_time}")
             entry_candle_start, entry_candle_end = get_candle_boundaries(entry_time, timeframe)
-            
-            print(f"Entry time: {entry_time}")
-            print(f"Entry candle: {entry_candle_start} to {entry_candle_end}")
             
             # Get enough recent candles to ensure we can find post-entry ones
             candle_history_length = min(min_history_candles, len(self.df) - start_index)
@@ -374,9 +366,10 @@ class SignalAnalyzer:
                 # Candle is post-entry if it started after the entry candle ended
                 if candle_time > entry_candle_end:
                     post_entry_candles.append(candle)
-                    print(f"✅ Candle at {candle_time} is after entry candle")
+                    # print(f"✅ Candle at {candle_time} is after entry candle")
                 else:
-                    print(f"❌ Candle at {candle_time} is during or before entry candle")
+                    # print(f"❌ Candle at {candle_time} is during or before entry candle")
+                    pass
             
             print(f"Found {len(post_entry_candles)} complete post-entry candles")
             
@@ -543,7 +536,6 @@ class SignalAnalyzer:
         
         if minutes_since_open < min_position_age:
             print(f"\n⏱️ Position too new for profit-taking/loss-cutting ({minutes_since_open:.1f} minutes old)")
-            print(f"Will check for profit-taking/loss-cutting after {min_position_age} minutes")
             return False
         else:
             print(f"\n⏱️ Position age: {minutes_since_open:.1f} minutes (minimum {min_position_age} minutes required)")
@@ -1073,9 +1065,6 @@ class SignalProcessor:
         # If we detect a crossover, analyze it
         if crossover_detected and potential_signal:
             print(f"\nAnalyzing potential {potential_signal} Signal:")
-            print(f"Initial Crossover: {diff_points:.1f} points")
-            print(f"Fast EMA: {current_fast:.5f}")
-            print(f"Slow EMA: {current_slow:.5f}")
             
             slope_ok = analyzer.check_slope_conditions(potential_signal)
             separation_ok = analyzer.check_separation(potential_signal)
@@ -1083,9 +1072,6 @@ class SignalProcessor:
             
             if slope_ok and separation_ok and price_ok:
                 print(f"\n✅ Valid {potential_signal} Signal - All conditions met")
-                print(f"Price: {df['close'].iloc[-1]:.2f}")
-                print(f"Fast EMA: {current_fast:.2f}")
-                print(f"Slow EMA: {current_slow:.2f}")
                 return potential_signal
     
         return prev_signal
@@ -1182,11 +1168,6 @@ def handle_initial_position(symbol, risk):
         
         # Use server time for position entry time
         position_entry_time = get_server_time()
-        print(f"Using server time for position entry: {position_entry_time}")
-        
-        # Debug position entry time
-        print(f"\n⏱️ DEBUG: Position Entry Time Set")
-        print(f"position_entry_time = {position_entry_time} (Type: {type(position_entry_time)})")
         
         return signal, position_entry_time, ticket
     else:
@@ -1505,7 +1486,7 @@ def main():
                     # Always fetch latest data to update our analyzer
                     df = DataFetcher.get_historical_data(args.symbol, timeframe)
                     # print most recent frame and quit
-                    print(df.iloc[-1])
+                    # print(df.iloc[-1])
                     symbol_info = DataFetcher.get_symbol_info(args.symbol)
                     
                     if df is None or symbol_info is None:
