@@ -43,7 +43,7 @@ SIGNAL_FILTERS = {
 # Position Management Configuration
 POSITION_CONFIG = {
     'REQUIRED_NEW_CANDLES': 3,          # Number of new candles required after profit-taking
-    'MIN_POSITION_AGE_MINUTES': 1,      # Minimum position age for profit-taking/loss-cutting
+    'MIN_POSITION_AGE_MINUTES': 2,      # Minimum position age for profit-taking/loss-cutting
     'PROFIT_HISTORY_CANDLES': 4,        # Number of post-entry candles to analyze for profit-taking
     'REQUIRED_REVERSAL_STRENGTH': 50,   # Percentage (0-100) of candles showing reversal needed for exit
     'REVERSAL_HISTORY_CANDLES': 3,      # Number of recent candles to check for immediate reversal
