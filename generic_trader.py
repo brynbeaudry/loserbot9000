@@ -12,10 +12,11 @@ import pytz # Added for timezone handling
 
 # Account Configuration (Example - Should be secured)
 ACCOUNT_CONFIG = {
-    'LOGIN': 796068,
-    'PASSWORD': "YOUR_PASSWORD", # Replace with secure handling
+    'LOGIN': 797241,
+    'PASSWORD': "rZ#PWM!5",
     'SERVER': "PUPrime-Demo"
 }
+
 
 # Core Trader Configuration
 CORE_CONFIG = {

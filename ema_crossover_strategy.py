@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 
 # Account Configuration
 ACCOUNT_CONFIG = {
-    'LOGIN': 796068,
-    'PASSWORD': "52N1%!mm",
+    'LOGIN': 797241,
+    'PASSWORD': "rZ#PWM!5",
     'SERVER': "PUPrime-Demo"
 }
 
