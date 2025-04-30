@@ -4,9 +4,9 @@ import numpy as np
 import time
 import argparse
 import importlib
-from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 import pytz # Added for timezone handling
+from strategies.base_strategy import BaseStrategy  # Import BaseStrategy from the strategies package
 
 # ===== Configuration Constants =====
 
@@ -17,6 +17,11 @@ ACCOUNT_CONFIG = {
     'SERVER': "PUPrime-Demo"
 }
 
+# Strategy Mapping - Provides short aliases to strategy implementations
+STRATEGY_MAPPING = {
+    'ec': 'strategies.ema_strategy.EMAStrategy',      # EMA Crossover
+    'ema': 'strategies.ema_strategy.EMAStrategy',     # Alternative alias
+}
 
 # Core Trader Configuration
 CORE_CONFIG = {
@@ -296,6 +301,31 @@ class DataFetcher:
     """Handles data retrieval from MT5 and adds configured indicators."""
 
     @staticmethod
+    def get_symbol_point(symbol_info):
+        """Safely get the point value from a symbol_info object with fallback"""
+        if hasattr(symbol_info, 'point') and symbol_info.point > 0:
+            return symbol_info.point
+        elif hasattr(symbol_info, 'trade_tick_size') and symbol_info.trade_tick_size > 0:
+            return symbol_info.trade_tick_size
+        else:
+            # Try to determine a reasonable value based on symbol type
+            symbol_name = symbol_info.name if hasattr(symbol_info, 'name') else "Unknown"
+            
+            # Only provide defaults if we can identify the symbol type
+            if 'JPY' in symbol_name:
+                print(f"⚠️ Using fallback point value 0.001 for {symbol_name} (JPY pair)")
+                return 0.001  # Typical for JPY pairs
+            elif any(gold in symbol_name for gold in ['XAU', 'GOLD']):
+                print(f"⚠️ Using fallback point value 0.01 for {symbol_name} (Gold)")
+                return 0.01   # Typical for gold
+            elif 'BTC' in symbol_name:
+                print(f"⚠️ Using fallback point value 0.01 for {symbol_name} (Bitcoin)")
+                return 0.01   # Reasonable for Bitcoin
+            
+            # If we can't identify the symbol, raise an error
+            raise ValueError(f"Cannot determine point value for symbol {symbol_name}. Symbol info lacks 'point' attribute.")
+    
+    @staticmethod
     def get_historical_data(symbol, timeframe, count):
         try:
             rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
@@ -386,52 +416,37 @@ class RiskManager:
              return symbol_info.volume_min
 
         risk_amount = account_balance * risk_percentage
-        price_risk_per_contract = abs(entry_price - stop_loss_price) * symbol_info.trade_contract_size
-        tick_value = symbol_info.tick_value
-        tick_size = symbol_info.tick_size
-
-        # Calculate risk in account currency
-        # price_risk_per_contract is in quote currency. We need to convert it to deposit currency.
-        # This depends on the symbol (e.g., EURUSD vs USDJPY)
-        # A simpler (though less precise for non-USD accounts/crosses) approach:
+        price_risk = abs(entry_price - stop_loss_price)
+        
+        # Calculate risk per contract
+        # price_risk is in price units (e.g., USD for BTCUSD)
+        # For futures contracts, we need to multiply by contract size
+        contract_size = getattr(symbol_info, 'trade_contract_size', 1.0)
+        price_risk_per_contract = price_risk * contract_size
+        
+        # For safer position sizing, verify we have all necessary values
         if price_risk_per_contract == 0:
              print("⚠️ Price risk is zero. Cannot calculate position size.")
              return symbol_info.volume_min
 
-        # Simpler calculation assuming pip value is relatively constant near entry
-        # More accurate calculation would involve currency conversion rates if needed
-        # Let's use the price_risk * contract_size directly if symbol currency matches account currency
-        # This needs improvement for multi-currency environments.
-        # For now, assume account currency matches quote currency or base currency value adjustment is simple.
-
+        # Simple calculation: position size = risk amount / risk per contract
         position_size = risk_amount / price_risk_per_contract
-        # If tick_value is available and makes sense, use it (more accurate for non-forex):
-        # Example: If tick_value represents profit per tick per lot:
-        # points_risk = abs(entry_price - stop_loss_price) / symbol_info.point
-        # risk_per_lot = points_risk * tick_value * (1/tick_size) # Need to verify this formula based on broker specifics
-        # if risk_per_lot > 0:
-        #    position_size = risk_amount / risk_per_lot
-
-
+        
         # Ensure volume step and limits
-        if symbol_info.volume_step == 0: # Avoid division by zero if step is invalid
-            rounded_size = round(position_size, 8) # Use reasonable precision
+        volume_step = getattr(symbol_info, 'volume_step', 0.01)  # Default to 0.01 if not present
+        volume_min = getattr(symbol_info, 'volume_min', 0.01)    # Default to 0.01 if not present  
+        volume_max = getattr(symbol_info, 'volume_max', 100.0)   # Default to 100 if not present
+        
+        if volume_step <= 0:  # Avoid division by zero
+            rounded_size = round(position_size, 2)  # Round to 2 decimal places as a fallback
+            print(f"⚠️ Invalid volume step ({volume_step}). Using rounded value.")
         else:
-            rounded_size = round(position_size / symbol_info.volume_step) * symbol_info.volume_step
+            rounded_size = round(position_size / volume_step) * volume_step
 
-        final_size = max(min(rounded_size, symbol_info.volume_max), symbol_info.volume_min)
+        # Ensure position size is within limits
+        final_size = max(min(rounded_size, volume_max), volume_min)
 
-        # Prevent minuscule sizes very close to zero after rounding
-        if final_size < symbol_info.volume_min:
-             final_size = symbol_info.volume_min
-
-        if final_size > symbol_info.volume_max:
-             final_size = symbol_info.volume_max
-
-
-        #print(f"Risk Amount: {risk_amount:.2f}, Price Risk: {abs(entry_price - stop_loss_price)}, Price Risk Per Contract: {price_risk_per_contract}")
-        #print(f"Calculated Size: {position_size:.4f}, Rounded Size: {rounded_size:.4f}, Final Size: {final_size:.4f}")
-
+        print(f"💰 Position sizing: Risk=${risk_amount:.2f}, SL distance={price_risk:.5f}, Size={final_size:.4f} lots")
         return final_size
 
 
@@ -441,33 +456,108 @@ class TradeExecutor:
     def execute_trade(symbol, trade_action, volume, price, sl_price, tp_price, magic_number, deviation):
         """Executes a market order with SL and TP."""
         order_type = mt5.ORDER_TYPE_BUY if trade_action == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_SELL
+        
+        # Store SL/TP for later modification - send the initial order without them
+        stored_sl = sl_price
+        stored_tp = tp_price
+        
+        # Store initial positions to compare later
+        initial_positions = MT5Helper.get_open_positions(symbol)
+        initial_position_tickets = set()
+        if initial_positions:
+            initial_position_tickets = {pos.ticket for pos in initial_positions}
+        
+        # STEP 1: Send market order WITHOUT SL/TP
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": float(volume),
             "type": order_type,
             "price": price,
-            "sl": float(sl_price) if sl_price is not None else 0.0,
-            "tp": float(tp_price) if tp_price is not None else 0.0,
             "deviation": deviation,
             "magic": magic_number,
             "comment": "Generic Trader Execution",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK, # Or IOC - FOK preferred for market orders with SL/TP
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        print(f"▶️ Sending {('BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL')} Order: Vol={volume}, Price={price}, SL={sl_price}, TP={tp_price}")
+        print(f"▶️ Sending {('BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL')} Order: Vol={volume}, Price={price}")
         result = mt5.order_send(request)
 
         if result is None:
             print(f"❌ Order Send Failed (None result): {mt5.last_error()}")
             return None
-        elif MT5Helper.is_trade_successful(result):
-            print(f"✅ Order Sent Successfully: Deal={result.deal}, Order={result.order}, Retcode={result.retcode}")
-            return result.deal # Return deal ticket if successful
-        else:
+        elif not MT5Helper.is_trade_successful(result):
             print(f"❌ Order Send Failed: Retcode={result.retcode}, Comment={result.comment}, Error={mt5.last_error()}")
             return None
+        
+        print(f"✅ Order Sent Successfully: Deal={result.deal}, Order={result.order}, Retcode={result.retcode}")
+        
+        # STEP 2: Find the newly created position and set SL/TP
+        position = None
+        for i in range(10):  # Try a few times to get the position
+            positions = MT5Helper.get_open_positions(symbol)
+            if positions:
+                for pos in positions:
+                    if pos.ticket not in initial_position_tickets:
+                        position = pos
+                        break
+            if position:
+                break
+            time.sleep(0.1)
+            
+        if not position:
+            print("⚠️ Could not find position to set SL/TP")
+            return result.deal  # Return deal ticket anyway since trade was successful
+            
+        # Validate price and stop loss levels
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is not None:
+            # Make sure we have a valid point value
+            point = symbol_info.point if hasattr(symbol_info, 'point') else 0.00001
+            digits = symbol_info.digits if hasattr(symbol_info, 'digits') else 5
+            
+            # Get current position price
+            pos_price = position.price_open
+            
+            # Calculate proper SL/TP if needed
+            # Use simple fixed values (not percentage-based)
+            if stored_sl is None or stored_sl == 0 or stored_sl == pos_price:
+                if order_type == mt5.ORDER_TYPE_BUY:
+                    stored_sl = pos_price - 50
+                else:  # SELL
+                    stored_sl = pos_price + 50
+                print(f"Using fixed SL: {stored_sl}")
+                
+            if stored_tp is None or stored_tp == 0 or stored_tp == pos_price:
+                if order_type == mt5.ORDER_TYPE_BUY:
+                    stored_tp = pos_price + 100
+                else:  # SELL
+                    stored_tp = pos_price - 100
+                print(f"Using fixed TP: {stored_tp}")
+                
+            # Round to appropriate number of digits
+            stored_sl = round(stored_sl, digits)
+            stored_tp = round(stored_tp, digits)
+            
+        # Create modify request
+        modify_request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "sl": float(stored_sl),
+            "tp": float(stored_tp),
+            "position": position.ticket
+        }
+        
+        print(f"🛡️ Setting SL: {stored_sl} | 🎯 TP: {stored_tp}")
+        modify_result = mt5.order_send(modify_request)
+        
+        if not MT5Helper.is_modification_successful(modify_result):
+            print(f"⚠️ Failed to set SL/TP: {mt5.last_error()}")
+        else:
+            print(f"✅ SL/TP set successfully")
+            
+        return result.deal # Return deal ticket if successful
 
     @staticmethod
     def close_position(position, deviation):
@@ -486,6 +576,7 @@ class TradeExecutor:
             print(f"❌ Cannot close position {ticket}, failed to get price for {symbol}")
             return False
 
+        # Use IOC filling mode only
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -536,92 +627,14 @@ class TradeExecutor:
         return all_closed
 
 
-# --- Strategy Interface ---
-
-class BaseStrategy(ABC):
-    """Abstract Base Class for all trading strategies."""
-
-    def __init__(self, symbol, timeframe, symbol_info, strategy_config=None):
-        """
-        Initialize the strategy.
-
-        Args:
-            symbol (str): The trading symbol.
-            timeframe (int): The MT5 timeframe constant.
-            symbol_info (mt5.SymbolInfo): MT5 symbol information object.
-            strategy_config (dict, optional): Strategy-specific configuration. Defaults to None.
-        """
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.symbol_info = symbol_info
-        self.config = strategy_config or {}
-        self.data = pd.DataFrame() # To store historical data and indicators
-
-    def update_data(self, new_data):
-        """
-        Updates the strategy's internal data cache. Can be overridden for complex merging.
-        Default implementation replaces the data.
-        """
-        if new_data is not None and not new_data.empty:
-            self.data = new_data.copy()
-            #print(f"Strategy data updated. Last candle time: {self.data.index[-1]}")
-
-
-    @abstractmethod
-    def calculate_indicators(self):
-        """
-        Calculate necessary indicators and store them in self.data.
-        This method should modify self.data inplace.
-        """
-        pass
-
-    @abstractmethod
-    def generate_entry_signal(self):
-        """
-        Checks the latest data and indicators to generate an entry signal.
-
-        Returns:
-            tuple or None: (signal_type, entry_price, stop_loss_price, take_profit_price) or None
-            signal_type (int): mt5.ORDER_TYPE_BUY or mt5.ORDER_TYPE_SELL
-            entry_price (float): Suggested entry price (e.g., current ask/bid).
-            stop_loss_price (float): Calculated stop loss price.
-            take_profit_price (float): Calculated take profit price.
-            Returns None if no entry signal.
-        """
-        pass
-
-    @abstractmethod
-    def generate_exit_signal(self, position):
-        """
-        Checks the latest data and indicators to see if an existing position should be closed.
-
-        Args:
-            position (mt5.PositionInfo): The open position object to evaluate.
-
-        Returns:
-            bool: True if the position should be closed, False otherwise.
-        """
-        pass
-
-    def get_required_data_count(self):
-        """
-        Returns the minimum number of historical data points needed by the strategy.
-        Should be overridden by subclasses if they need more than a default small buffer.
-        """
-        return 50 # Default minimum reasonable buffer
-
-    def get_config(self, key, default=None):
-        """Helper to get strategy-specific config values."""
-        return self.config.get(key, default)
-
 # --- Main Execution ---
 
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Generic MT5 Trading Bot')
-    parser.add_argument('symbol', help='Trading symbol (e.g., XAUUSD.s)')
-    parser.add_argument('--strategy', default='strategies.ema_strategy.EMAStrategy',
-                       help='Python path to the strategy class (e.g., strategies.my_strategy.MyStrategy)')
+    parser.add_argument('symbol', help='Trading symbol (e.g., BTCUSD)')
+    parser.add_argument('--strategy', default='ec',
+                       help='Strategy to use (e.g., "ec" for EMA Crossover or full Python path to strategy class)')
     parser.add_argument('--risk', type=float, default=RISK_CONFIG['DEFAULT_RISK_PERCENTAGE'] * 100.0,
                        help=f'Risk percentage per trade (default: {RISK_CONFIG["DEFAULT_RISK_PERCENTAGE"] * 100.0})')
     # Add more arguments as needed (e.g., config file path)
@@ -630,6 +643,11 @@ def parse_arguments():
 def load_strategy_class(strategy_path):
     """Dynamically loads the strategy class from the given path."""
     try:
+        # First check if strategy_path is an alias in our mapping
+        if strategy_path in STRATEGY_MAPPING:
+            strategy_path = STRATEGY_MAPPING[strategy_path]
+            print(f"📈 Using strategy alias: {strategy_path}")
+        
         module_path, class_name = strategy_path.rsplit('.', 1)
         module = importlib.import_module(module_path)
         strategy_class = getattr(module, class_name)
@@ -663,14 +681,12 @@ def main():
     strategy = StrategyClass(args.symbol, CORE_CONFIG['TIMEFRAME'], symbol_info, strategy_config)
     print(f"📈 Strategy Loaded: {args.strategy}")
     print(f"💰 Risk Per Trade: {args.risk}% | Initial Balance: ${account_info.balance:.2f}")
-    print(f" S Symbol: {args.symbol} | Timeframe: {CORE_CONFIG['TIMEFRAME']}") # Add timeframe name later
+    print(f"🔄 Symbol: {args.symbol} | Example usage: python generic_trader.py BTCUSD --strategy ec --risk 1.0")
 
     # --- State Variables ---
     last_data_fetch_time = None
     timeframe_seconds = get_timeframe_minutes(CORE_CONFIG['TIMEFRAME']) * 60
     required_data_count = max(CORE_CONFIG['DATA_FETCH_COUNT'], strategy.get_required_data_count())
-    candles_since_last_close = 0
-    waiting_after_close = False
 
     print("🤖 Bot running... Press Ctrl+C to stop")
     try:
@@ -689,16 +705,6 @@ def main():
                     strategy.calculate_indicators()
                     last_data_fetch_time = current_time
                     #print(f"Indicators calculated. Last data point: {strategy.data.index[-1]}")
-
-                    # Update candle count after closing position
-                    if waiting_after_close:
-                         candles_since_last_close += 1
-                         print(f"⏳ Waiting period: {candles_since_last_close}/{POSITION_CONFIG['WAIT_CANDLES_AFTER_CLOSE']} candles passed since close.")
-                         if candles_since_last_close >= POSITION_CONFIG['WAIT_CANDLES_AFTER_CLOSE']:
-                             print("✅ Waiting period finished.")
-                             waiting_after_close = False
-                             candles_since_last_close = 0
-
                 else:
                     print("⚠️ Failed to fetch or update data, skipping cycle.")
                     time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'] * 10) # Longer sleep on data error
@@ -712,73 +718,76 @@ def main():
                 time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'] * 5)
                 continue
 
-            position_closed_this_cycle = False
+            # Check open positions and close them if needed based on strategy
             if open_positions:
-                #print(f"Managing {len(open_positions)} open position(s)...")
+                print(f"Managing {len(open_positions)} open position(s)...")
                 for pos in open_positions:
                     # Check if strategy wants to exit this position
                     if strategy.generate_exit_signal(pos):
                         print(f"🚪 Strategy generated exit signal for position {pos.ticket}.")
                         if TradeExecutor.close_position(pos, RISK_CONFIG['DEVIATION']):
-                            position_closed_this_cycle = True
-                            # Reset waiting period if we closed a position
-                            waiting_after_close = True
-                            candles_since_last_close = 0
-                            print(f"⏳ Waiting period activated ({POSITION_CONFIG['WAIT_CANDLES_AFTER_CLOSE']} candles).")
+                            print(f"✅ Position {pos.ticket} closed.")
                         else:
                             print(f"⚠️ Failed to close position {pos.ticket} on exit signal.")
-                            # Decide on error handling: retry? stop? log?
 
             # --- Entry Signal Check ---
-            # Only check for entries if no positions are open (or strategy allows multiple)
-            # and not in the waiting period after a close.
+            # Always check for entry signals on each cycle, whether we closed positions or not
             open_positions = MT5Helper.get_open_positions(args.symbol) # Re-check after potential closes
-            if not open_positions and not waiting_after_close:
-                 #print("Checking for entry signals...")
+            
+            # Process entry signals if there are no open positions
+            if not open_positions:
                  entry_signal = strategy.generate_entry_signal()
                  if entry_signal:
                      signal_type, entry_price, sl_price, tp_price = entry_signal
-                     trade_action = signal_type # Should be mt5.ORDER_TYPE_BUY or mt5.ORDER_TYPE_SELL
-
-                     # Ensure prices are valid floats
-                     if not all(isinstance(p, (int, float)) for p in [entry_price, sl_price, tp_price] if p is not None):
-                          print(f"⚠️ Invalid prices received from strategy: Entry={entry_price}, SL={sl_price}, TP={tp_price}")
-                          continue
-
-                     # Round prices to symbol digits
-                     digits = symbol_info.digits
-                     sl_price = round(sl_price, digits) if sl_price is not None else None
-                     tp_price = round(tp_price, digits) if tp_price is not None else None
-                     entry_price = round(entry_price, digits) # Adjust entry based on type later if needed
-
-                     if sl_price is None:
-                         print("⚠️ Strategy provided entry signal without Stop Loss. Skipping trade.")
-                         continue # Require SL for risk management
-
-                     # Calculate volume
+                     
+                     # The strategy returns None for SL/TP - we need to calculate them based on risk
+                     # Get the symbol info again in case it's needed
+                     symbol_info = DataFetcher.get_symbol_info(args.symbol)
+                     
+                     # USE SIMPLE FIXED VALUES FOR SL AND TP
+                     # For BUY: TP is entry + 100, SL is entry - 50
+                     # For SELL: TP is entry - 100, SL is entry + 50
+                     if signal_type == mt5.ORDER_TYPE_BUY:
+                         sl_price = entry_price - 50
+                         tp_price = entry_price + 100
+                     else:  # SELL
+                         sl_price = entry_price + 50
+                         tp_price = entry_price - 100
+                         
+                     # Round to appropriate number of digits if needed
+                     if hasattr(symbol_info, 'digits'):
+                         digits = symbol_info.digits
+                         sl_price = round(sl_price, digits)
+                         tp_price = round(tp_price, digits)
+                     
+                     print(f"🎯 Signal details: Entry={entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
+                     
+                     # Calculate volume (still using risk-based calculation)
                      volume = RiskManager.calculate_position_size(
                          symbol_info, account_info.balance, risk_percentage, entry_price, sl_price
                      )
 
+                     # Verify the calculated volume is valid
+                     if not isinstance(volume, (int, float)) or volume <= 0:
+                         print(f"⚠️ Invalid volume calculated: {volume}. Using minimum volume instead.")
+                         volume = getattr(symbol_info, 'volume_min', 0.01)  # Default to 0.01 if not available
+                     
                      if volume < symbol_info.volume_min:
-                         print(f"⚠️ Calculated volume {volume} is below minimum {symbol_info.volume_min}. Skipping trade.")
-                         continue
+                         print(f"⚠️ Calculated volume {volume} is below minimum {symbol_info.volume_min}. Adjusting to minimum.")
+                         volume = symbol_info.volume_min
 
-                     print(f"🎯 Entry Signal Received: {'BUY' if trade_action == mt5.ORDER_TYPE_BUY else 'SELL'}")
+                     print(f"🎯 Entry Signal Received: {'BUY' if signal_type == mt5.ORDER_TYPE_BUY else 'SELL'}")
                      print(f"   Entry={entry_price}, SL={sl_price}, TP={tp_price}, Vol={volume}")
 
                      # Execute Trade
                      deal_ticket = TradeExecutor.execute_trade(
-                         args.symbol, trade_action, volume, entry_price, sl_price, tp_price,
+                         args.symbol, signal_type, volume, entry_price, sl_price, tp_price,
                          RISK_CONFIG['MAGIC_NUMBER'], RISK_CONFIG['DEVIATION']
                      )
                      if deal_ticket:
                          print(f"✅ Trade Executed. Deal Ticket: {deal_ticket}")
-                         # Optional: Add delay or confirmation check
                      else:
                          print(f"❌ Trade Execution Failed.")
-                         # Optional: Log error, maybe retry later
-
 
             # --- Loop Sleep ---
             time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'])
