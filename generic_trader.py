@@ -453,7 +453,28 @@ class TradeExecutor:
     """Handles trade execution and position management."""
     @staticmethod
     def execute_trade(symbol, trade_action, volume, price, sl_price, tp_price, magic_number, deviation):
-        """Executes a market order with SL and TP."""
+        """
+        Executes a market order with SL and TP directly included in the order.
+        
+        This method handles:
+        1. Getting current market prices for entry
+        2. Calculating appropriate SL/TP levels
+        3. Placing the order with SL/TP included
+        
+        Args:
+            symbol (str): Trading symbol
+            trade_action (int): MT5 trade action (BUY/SELL)
+            volume (float): Trading volume in lots
+            price (float): Suggested entry price (may be overridden with current market price)
+            sl_price (float): Suggested stop loss price (not used, calculated from entry)
+            tp_price (float): Suggested take profit price (not used, calculated from entry)
+            magic_number (int): Magic number for identification
+            deviation (int): Maximum price deviation allowed
+            
+        Returns:
+            int or None: Deal ticket if successful, None otherwise
+        """
+        # Convert trade action to order type
         order_type = mt5.ORDER_TYPE_BUY if trade_action == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_SELL
         
         # Get the symbol info for formatting
@@ -462,35 +483,49 @@ class TradeExecutor:
             print("❌ Failed to get symbol info")
             return None
             
-        # Determine entry price - use current bid/ask if needed
+        # Get current market prices for more reliable entry
         current_tick = mt5.symbol_info_tick(symbol)
         if current_tick is None:
             print("❌ Failed to get current prices")
             return None
             
-        # Use current market prices for more reliable order execution
+        # Use current market prices for more reliable execution
         if order_type == mt5.ORDER_TYPE_BUY:
+            # For BUY orders, use ask price
             actual_entry_price = current_tick.ask
         else:  # SELL
+            # For SELL orders, use bid price
             actual_entry_price = current_tick.bid
         
-        # Calculate SL/TP based on actual entry price
-        digits = symbol_info.digits if hasattr(symbol_info, 'digits') else 5
-        
-        if order_type == mt5.ORDER_TYPE_BUY:
-            sl_price = actual_entry_price - 40    
-            tp_price = actual_entry_price + 80
-        else:  # SELL
-            sl_price = actual_entry_price + 40
-            tp_price = actual_entry_price - 80
+        # Get required symbol properties for SL/TP calculation
+        try:
+            # Get digit precision for price rounding
+            digits = symbol_info.digits
             
-        # Round to appropriate number of digits
-        sl_price = round(sl_price, digits)
-        tp_price = round(tp_price, digits)
+            # Verify we have valid point value (needed for some calculations)
+            if not hasattr(symbol_info, 'point') or symbol_info.point <= 0:
+                raise ValueError(f"Invalid point value for {symbol}")
+                
+            # Calculate SL/TP based on actual entry price
+            if order_type == mt5.ORDER_TYPE_BUY:
+                # For BUY: SL below entry, TP above entry
+                sl_price = actual_entry_price - 40    
+                tp_price = actual_entry_price + 80
+            else:  # SELL
+                # For SELL: SL above entry, TP below entry
+                sl_price = actual_entry_price + 40
+                tp_price = actual_entry_price - 80
+                
+            # Round to appropriate number of digits
+            sl_price = round(sl_price, digits)
+            tp_price = round(tp_price, digits)
+        except Exception as e:
+            print(f"❌ Error calculating SL/TP levels: {e}")
+            return None
         
         print(f"🎯 Calculated prices: Entry={actual_entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
         
-        # Execute Trade directly with SL/TP included in the order
+        # Create the order request with SL/TP included
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -506,10 +541,11 @@ class TradeExecutor:
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
         
+        # Send the order
         print(f"▶️ Sending {('BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL')} order with SL/TP")
         result = mt5.order_send(request)
-        print(f"🛡️ Order Result: {result}")
         
+        # Handle result
         if result is None:
             print(f"❌ Order Send Failed (None result): {mt5.last_error()}")
             return None
@@ -692,7 +728,7 @@ def main():
                         if TradeExecutor.close_position(pos, RISK_CONFIG['DEVIATION']):
                             print(f"✅ Position {pos.ticket} closed.")
                             # Reset prev_signal to allow reentry after closing
-                            strategy.prev_signal = None
+                            strategy.reset_signal_state()
                         else:
                             print(f"⚠️ Failed to close position {pos.ticket} on exit signal.")
 
@@ -727,6 +763,7 @@ def main():
                      print(f"🎯 Entry Signal Received: {'BUY' if signal_type == mt5.ORDER_TYPE_BUY else 'SELL'}")
                      
                      # Execute Trade using the TradeExecutor class
+                     # SL/TP calculation is handled inside the TradeExecutor.execute_trade method
                      deal_ticket = TradeExecutor.execute_trade(
                          args.symbol, signal_type, volume, entry_price, sl_price, tp_price,
                          RISK_CONFIG['MAGIC_NUMBER'], RISK_CONFIG['DEVIATION']
@@ -736,7 +773,8 @@ def main():
                          print(f"✅ Trade Executed. Deal Ticket: {deal_ticket}")
                      else:
                          print(f"❌ Trade Execution Failed.")
-                         strategy.prev_signal = None  # Reset to try again
+                         # Reset strategy state if trade failed to allow retrying
+                         strategy.reset_signal_state()
 
             # --- Loop Sleep ---
             time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'])

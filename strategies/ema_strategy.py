@@ -9,6 +9,7 @@ SIGNAL_FILTERS = {
     'SLOPE_PERIODS': 3,  # Periods to calculate slope over
     'MIN_SLOPE_THRESHOLD': 0.000001,  # Minimum slope for trend direction
     'MAX_OPPOSITE_SLOPE': -0.000002,  # Maximum allowed opposite slope
+    'LOOKBACK_CANDLES': 5,  # Number of recent candles to check for crossover
 }
 
 class EMAStrategy(BaseStrategy):
@@ -17,7 +18,6 @@ class EMAStrategy(BaseStrategy):
     def __init__(self, symbol, timeframe, symbol_info, strategy_config=None):
         """Initialize the strategy with default parameters"""
         super().__init__(symbol, timeframe, symbol_info, strategy_config)
-        self.prev_signal = None
         
     def calculate_indicators(self):
         """
@@ -31,7 +31,16 @@ class EMAStrategy(BaseStrategy):
         return 50  # Should be enough for EMA calculation and analysis
     
     def calculate_slope(self, series, periods=SIGNAL_FILTERS['SLOPE_PERIODS']):
-        """Calculate the slope of a series over specified periods"""
+        """
+        Calculate the slope of a series over specified periods
+        
+        Args:
+            series (Series): Data series to calculate slope for
+            periods (int): Number of periods to use
+            
+        Returns:
+            float: The calculated slope value
+        """
         if len(series) < periods:
             return 0
         
@@ -41,7 +50,15 @@ class EMAStrategy(BaseStrategy):
         return slope
     
     def check_slope_conditions(self, direction="BUY"):
-        """Check if slope conditions are met for the given trade direction"""
+        """
+        Check if slope conditions are met for the given trade direction
+        
+        Args:
+            direction (str): Trade direction to check for ("BUY" or "SELL")
+            
+        Returns:
+            bool: True if slope conditions are met
+        """
         if len(self.data) < SIGNAL_FILTERS['SLOPE_PERIODS']:
             return False
             
@@ -71,7 +88,15 @@ class EMAStrategy(BaseStrategy):
             return slope_ok
     
     def check_separation(self, direction="BUY"):
-        """Check if EMAs have sufficient separation after crossover"""
+        """
+        Check if EMAs have sufficient separation after crossover
+        
+        Args:
+            direction (str): Trade direction to check for ("BUY" or "SELL")
+            
+        Returns:
+            bool: True if EMAs have sufficient separation
+        """
         if self.data.empty or len(self.data) < 2:
             return False
             
@@ -79,16 +104,7 @@ class EMAStrategy(BaseStrategy):
         current_slow = self.data['slow_ema'].iloc[-1]
         
         diff = current_fast - current_slow
-        
-        # Get the point value safely
-        try:
-            from generic_trader import DataFetcher
-            point = DataFetcher.get_symbol_point(self.symbol_info)
-        except (ImportError, ValueError) as e:
-            print(f"⚠️ Error getting point value: {e}")
-            # Cannot proceed without a valid point value
-            raise ValueError(f"Cannot check separation without a valid point value: {e}")
-            
+        point = self.get_point_value()
         diff_points = abs(diff / point)
         
         if direction == "BUY":
@@ -96,19 +112,23 @@ class EMAStrategy(BaseStrategy):
         else:  # SELL
             sep_ok = diff < 0 and diff_points >= SIGNAL_FILTERS['MIN_SEPARATION_POINTS']
             
-        # print(f"Separation Check ({direction}) - {diff_points:.1f} points - {'✅' if sep_ok else '❌'}")
         return sep_ok
     
     def check_price_confirmation(self, direction="BUY"):
         """
         Check if price confirms the signal direction
         Relaxed to check only against slow EMA
+        
+        Args:
+            direction (str): Trade direction to check for ("BUY" or "SELL")
+            
+        Returns:
+            bool: True if price confirms signal direction
         """
         if self.data.empty or len(self.data) < 1:
             return False
             
         last_close = self.data['close'].iloc[-1]
-        fast_ema = self.data['fast_ema'].iloc[-1]
         slow_ema = self.data['slow_ema'].iloc[-1]
         
         if direction == "BUY":
@@ -119,6 +139,112 @@ class EMAStrategy(BaseStrategy):
             price_ok = last_close < slow_ema
             
         return price_ok
+        
+    def detect_recent_crossover(self):
+        """
+        Check if a crossover occurred in the last few candles
+        
+        Returns:
+            tuple: (crossover_detected, signal_type, potential_signal, candles_ago)
+            or (False, None, None, None) if no crossover detected
+        """
+        crossover_detected = False
+        signal_type = None
+        potential_signal = None
+        candles_ago = None
+        
+        # Check if a crossover happened within the last few candles
+        lookback = min(SIGNAL_FILTERS['LOOKBACK_CANDLES'], len(self.data)-1)
+        
+        for i in range(1, lookback+1):
+            idx_fast = self.data['fast_ema'].iloc[-i]
+            idx_slow = self.data['slow_ema'].iloc[-i]
+            prev_idx_fast = self.data['fast_ema'].iloc[-(i+1)]
+            prev_idx_slow = self.data['slow_ema'].iloc[-(i+1)]
+            
+            # BUY crossover within last few candles
+            if prev_idx_fast <= prev_idx_slow and idx_fast > idx_slow:
+                crossover_detected = True
+                if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_SELL:
+                    potential_signal = "BUY"
+                    signal_type = mt5.ORDER_TYPE_BUY
+                    candles_ago = i
+                    print(f"\n📊 Recent BUY Crossover detected {i} candles ago")
+                    return crossover_detected, signal_type, potential_signal, candles_ago
+                    
+            # SELL crossover within last few candles
+            elif prev_idx_fast >= prev_idx_slow and idx_fast < idx_slow:
+                crossover_detected = True
+                if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_BUY:
+                    potential_signal = "SELL"
+                    signal_type = mt5.ORDER_TYPE_SELL
+                    candles_ago = i
+                    print(f"\n📊 Recent SELL Crossover detected {i} candles ago")
+                    return crossover_detected, signal_type, potential_signal, candles_ago
+                    
+        # Check for immediate crossover (most recent candle)
+        current_fast = self.data['fast_ema'].iloc[-1]
+        current_slow = self.data['slow_ema'].iloc[-1]
+        prev_fast = self.data['fast_ema'].iloc[-2]
+        prev_slow = self.data['slow_ema'].iloc[-2]
+        
+        if prev_fast <= prev_slow and current_fast > current_slow:
+            crossover_detected = True
+            if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_SELL:
+                potential_signal = "BUY"
+                signal_type = mt5.ORDER_TYPE_BUY
+                candles_ago = 0
+                print(f"\n📊 Analyzing BUY Signal (immediate crossover)")
+                
+        elif prev_fast >= prev_slow and current_fast < current_slow:
+            crossover_detected = True
+            if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_BUY:
+                potential_signal = "SELL"
+                signal_type = mt5.ORDER_TYPE_SELL
+                candles_ago = 0
+                print(f"\n📊 Analyzing SELL Signal (immediate crossover)")
+                
+        return crossover_detected, signal_type, potential_signal, candles_ago
+        
+    def detect_existing_trend(self):
+        """
+        Check for strong existing trend when no crossover was detected
+        
+        Returns:
+            tuple: (trend_detected, signal_type, potential_signal)
+            or (False, None, None) if no strong trend detected
+        """
+        if self.data.empty or len(self.data) < 2:
+            return False, None, None
+            
+        current_fast = self.data['fast_ema'].iloc[-1]
+        current_slow = self.data['slow_ema'].iloc[-1]
+        diff = current_fast - current_slow
+        point = self.get_point_value()
+        diff_points = abs(diff / point)
+        
+        # Need minimum separation for existing trend
+        if diff_points < SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
+            return False, None, None
+            
+        trend_detected = False
+        signal_type = None
+        potential_signal = None
+        
+        # Strong existing BUY trend
+        if current_fast > current_slow and not self.prev_signal:
+            trend_detected = True
+            potential_signal = "BUY"
+            signal_type = mt5.ORDER_TYPE_BUY
+            print(f"\n📊 Analyzing existing BUY trend (no recent crossover):")
+        # Strong existing SELL trend
+        elif current_fast < current_slow and not self.prev_signal:
+            trend_detected = True
+            potential_signal = "SELL"
+            signal_type = mt5.ORDER_TYPE_SELL
+            print(f"\n📊 Analyzing existing SELL trend (no recent crossover):")
+            
+        return trend_detected, signal_type, potential_signal
     
     def generate_entry_signal(self):
         """
@@ -127,153 +253,65 @@ class EMAStrategy(BaseStrategy):
         
         Returns:
             tuple or None: (signal_type, entry_price, None, None) or None
-            The SL/TP will be calculated by the risk manager based on the risk parameter
+            The SL/TP will be calculated later based on actual entry price
         """
         if self.data.empty or len(self.data) < 10:  # Need at least 10 candles
             return None
             
-        # Get current and previous values
+        # Get current EMA values for logging
         current_fast = self.data['fast_ema'].iloc[-1]
         current_slow = self.data['slow_ema'].iloc[-1]
         prev_fast = self.data['fast_ema'].iloc[-2]
         prev_slow = self.data['slow_ema'].iloc[-2]
-        
-        # Get the point value safely
-        try:
-            from generic_trader import DataFetcher
-            point = DataFetcher.get_symbol_point(self.symbol_info)
-        except (ImportError, ValueError) as e:
-            print(f"⚠️ Error getting point value: {e}")
-            raise ValueError(f"Cannot generate entry signal without a valid point value: {e}")
+        point = self.get_point_value()
             
-        # Initialize variables
-        potential_signal = None
-        signal_type = None
-        crossover_detected = False
-        recent_crossover = False
+        # Try to detect a recent crossover first
+        crossover_detected, signal_type, potential_signal, candles_ago = self.detect_recent_crossover()
         
-        # Check if a crossover happened within the last 5 candles
-        for i in range(1, min(6, len(self.data)-1)):  # Check last 5 candles
-            idx_fast = self.data['fast_ema'].iloc[-i]
-            idx_slow = self.data['slow_ema'].iloc[-i]
-            prev_idx_fast = self.data['fast_ema'].iloc[-(i+1)]
-            prev_idx_slow = self.data['slow_ema'].iloc[-(i+1)]
-            
-            # BUY crossover within last few candles
-            if prev_idx_fast <= prev_idx_slow and idx_fast > idx_slow:
-                recent_crossover = True
-                if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_SELL:
-                    potential_signal = "BUY"
-                    signal_type = mt5.ORDER_TYPE_BUY
-                    print(f"\n📊 Recent BUY Crossover detected {i} candles ago")
-                    break
-                    
-            # SELL crossover within last few candles
-            elif prev_idx_fast >= prev_idx_slow and idx_fast < idx_slow:
-                recent_crossover = True
-                if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_BUY:
-                    potential_signal = "SELL"
-                    signal_type = mt5.ORDER_TYPE_SELL
-                    print(f"\n📊 Recent SELL Crossover detected {i} candles ago")
-                    break
-        
-        # Check for immediate crossover if no recent one was found
-        if not recent_crossover:
-            if prev_fast <= prev_slow and current_fast > current_slow:
-                crossover_detected = True
-                if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_SELL:
-                    potential_signal = "BUY"
-                    signal_type = mt5.ORDER_TYPE_BUY
-            elif prev_fast >= prev_slow and current_fast < current_slow:
-                crossover_detected = True
-                if not self.prev_signal or self.prev_signal == mt5.ORDER_TYPE_BUY:
-                    potential_signal = "SELL"
-                    signal_type = mt5.ORDER_TYPE_SELL
-        
-        # Get current EMA diff for strength analysis
-        diff = current_fast - current_slow
-        diff_points = abs(diff / point)
-        
-        # Check for strong existing trend if no crossover detected
-        if not (crossover_detected or recent_crossover) and diff_points >= SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
-            # Strong existing BUY trend
-            if current_fast > current_slow and not self.prev_signal:
-                potential_signal = "BUY"
-                signal_type = mt5.ORDER_TYPE_BUY
-                print(f"\n📊 Analyzing existing BUY trend (no recent crossover):")
-            # Strong existing SELL trend
-            elif current_fast < current_slow and not self.prev_signal:
-                potential_signal = "SELL"
-                signal_type = mt5.ORDER_TYPE_SELL
-                print(f"\n📊 Analyzing existing SELL trend (no recent crossover):")
+        # If no crossover detected, check for existing trend
+        if not crossover_detected:
+            trend_detected, signal_type, potential_signal = self.detect_existing_trend()
+        else:
+            trend_detected = False
                 
-        # If we have a potential signal (crossover or strong trend), analyze it
+        # If we have a potential signal, analyze it
         if potential_signal:
             diff_value = current_fast - current_slow
             diff_points = abs(diff_value / point)
             prev_diff = prev_fast - prev_slow
             
-            # Create a detailed log message with EMA values and differences
-            if crossover_detected:
-                print(f"\n📊 Analyzing {potential_signal} Signal (immediate crossover):")
-                print(f"   Previous Candle: Fast EMA = {prev_fast:.5f}, Slow EMA = {prev_slow:.5f} (Diff: {prev_diff:.5f})")
-            print(f"   Current Candle:  Fast EMA = {current_fast:.5f}, Slow EMA = {current_slow:.5f} (Diff: {diff_value:.5f})")
+            # Log current state
+            print(f"   Current Candle: Fast EMA = {current_fast:.5f}, Slow EMA = {current_slow:.5f} (Diff: {diff_value:.5f})")
             print(f"   Signal Strength: {diff_points:.1f} points (min required: {SIGNAL_FILTERS['MIN_CROSSOVER_POINTS']})")
             
+            # Check conditions specific to signal type
             slope_ok = self.check_slope_conditions(potential_signal)
-            separation_ok = True  # Relaxed - we'll just require EMA orientation rather than specific separation
             price_ok = self.check_price_confirmation(potential_signal)
             
             print(f"Slope: {'✅' if slope_ok else '❌'}, Price: {'✅' if price_ok else '❌'}")
             
-            # Relaxed condition check for immediate or recent crossovers
-            if (crossover_detected or recent_crossover) and slope_ok and price_ok:
+            # Signal validation logic based on detection method
+            valid_signal = False
+            
+            # Crossover-based signal (less strict)
+            if crossover_detected and slope_ok and price_ok:
+                valid_signal = True
                 print(f"\n🚀 VALID {potential_signal} SIGNAL - Crossover with confirming slope and price")
                 
-                # Get current price for entry
-                if potential_signal == "BUY":
-                    if 'ask' in self.data.columns:
-                        entry_price = self.data['ask'].iloc[-1]
-                    else:
-                        entry_price = self.data['close'].iloc[-1]
-                        print("⚠️ Warning: Using close price instead of ask price for BUY order")
-                    
-                    self.prev_signal = mt5.ORDER_TYPE_BUY
-                else:  # SELL
-                    if 'bid' in self.data.columns:
-                        entry_price = self.data['bid'].iloc[-1]
-                    else:
-                        entry_price = self.data['close'].iloc[-1]
-                        print("⚠️ Warning: Using close price instead of bid price for SELL order")
-                    
-                    self.prev_signal = mt5.ORDER_TYPE_SELL
-                
-                # Return entry signal - SL/TP will be calculated by RiskManager based on risk parameter
-                return signal_type, entry_price, None, None
-            
-            # Stricter condition check for existing trends (no recent crossover)
-            elif not (crossover_detected or recent_crossover) and slope_ok and separation_ok and price_ok and diff_points >= SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
+            # Existing trend signal (more strict - requires separation as well)
+            elif trend_detected and slope_ok and price_ok and diff_points >= SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
+                valid_signal = True
                 print(f"\n🚀 VALID {potential_signal} SIGNAL - Strong existing trend")
                 
-                # Get current price for entry
-                if potential_signal == "BUY":
-                    if 'ask' in self.data.columns:
-                        entry_price = self.data['ask'].iloc[-1]
-                    else:
-                        entry_price = self.data['close'].iloc[-1]
-                        print("⚠️ Warning: Using close price instead of ask price for BUY order")
-                    
-                    self.prev_signal = mt5.ORDER_TYPE_BUY
-                else:  # SELL
-                    if 'bid' in self.data.columns:
-                        entry_price = self.data['bid'].iloc[-1]
-                    else:
-                        entry_price = self.data['close'].iloc[-1]
-                        print("⚠️ Warning: Using close price instead of bid price for SELL order")
-                    
-                    self.prev_signal = mt5.ORDER_TYPE_SELL
+            # If valid signal, calculate entry price and return signal
+            if valid_signal:
+                # Get appropriate market price for entry
+                entry_price = self.get_market_price(signal_type)
                 
-                # Return entry signal - SL/TP will be calculated by RiskManager based on risk parameter
+                # Store signal type for next cycle
+                self.prev_signal = signal_type
+                
+                # Return signal info - SL/TP will be calculated by TradeExecutor
                 return signal_type, entry_price, None, None
         
         return None
@@ -284,7 +322,7 @@ class EMAStrategy(BaseStrategy):
         This will close a position when the EMAs cross in the opposite direction.
         
         Args:
-            position: MT5 position information object
+            position (mt5.PositionInfo): The open position object to evaluate
             
         Returns:
             bool: True if the position should be closed, False otherwise
@@ -292,7 +330,7 @@ class EMAStrategy(BaseStrategy):
         if self.data.empty or len(self.data) < 2:
             return False
             
-        # Get current and previous values
+        # Get current and previous EMA values
         current_fast = self.data['fast_ema'].iloc[-1]
         current_slow = self.data['slow_ema'].iloc[-1]
         prev_fast = self.data['fast_ema'].iloc[-2]
