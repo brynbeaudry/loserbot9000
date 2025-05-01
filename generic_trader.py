@@ -261,8 +261,7 @@ class MT5Helper:
     @staticmethod
     def is_modification_successful(result):
          # Similar check for modification results (SL/TP)
-         success = (result is not None and
-                    result.retcode in [mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, 10008])
+         success = mt5.last_error() == (1, "Success")
          if not success:
               last_err_code, last_err_msg = mt5.last_error()
               if last_err_code == 1:
@@ -457,107 +456,69 @@ class TradeExecutor:
         """Executes a market order with SL and TP."""
         order_type = mt5.ORDER_TYPE_BUY if trade_action == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_SELL
         
-        # Store SL/TP for later modification - send the initial order without them
-        stored_sl = sl_price
-        stored_tp = tp_price
+        # Get the symbol info for formatting
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            print("❌ Failed to get symbol info")
+            return None
+            
+        # Determine entry price - use current bid/ask if needed
+        current_tick = mt5.symbol_info_tick(symbol)
+        if current_tick is None:
+            print("❌ Failed to get current prices")
+            return None
+            
+        # Use current market prices for more reliable order execution
+        if order_type == mt5.ORDER_TYPE_BUY:
+            actual_entry_price = current_tick.ask
+        else:  # SELL
+            actual_entry_price = current_tick.bid
         
-        # Store initial positions to compare later
-        initial_positions = MT5Helper.get_open_positions(symbol)
-        initial_position_tickets = set()
-        if initial_positions:
-            initial_position_tickets = {pos.ticket for pos in initial_positions}
+        # Calculate SL/TP based on actual entry price
+        digits = symbol_info.digits if hasattr(symbol_info, 'digits') else 5
         
-        # STEP 1: Send market order WITHOUT SL/TP
+        if order_type == mt5.ORDER_TYPE_BUY:
+            sl_price = actual_entry_price - 40    
+            tp_price = actual_entry_price + 80
+        else:  # SELL
+            sl_price = actual_entry_price + 40
+            tp_price = actual_entry_price - 80
+            
+        # Round to appropriate number of digits
+        sl_price = round(sl_price, digits)
+        tp_price = round(tp_price, digits)
+        
+        print(f"🎯 Calculated prices: Entry={actual_entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
+        
+        # Execute Trade directly with SL/TP included in the order
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": float(volume),
             "type": order_type,
-            "price": price,
+            "price": actual_entry_price,
+            "sl": sl_price,
+            "tp": tp_price,
             "deviation": deviation,
             "magic": magic_number,
-            "comment": "Generic Trader Execution",
+            "comment": "Trade with SL/TP",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-
-        print(f"▶️ Sending {('BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL')} Order: Vol={volume}, Price={price}")
+        
+        print(f"▶️ Sending {('BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL')} order with SL/TP")
         result = mt5.order_send(request)
-
+        print(f"🛡️ Order Result: {result}")
+        
         if result is None:
             print(f"❌ Order Send Failed (None result): {mt5.last_error()}")
             return None
         elif not MT5Helper.is_trade_successful(result):
             print(f"❌ Order Send Failed: Retcode={result.retcode}, Comment={result.comment}, Error={mt5.last_error()}")
             return None
-        
-        print(f"✅ Order Sent Successfully: Deal={result.deal}, Order={result.order}, Retcode={result.retcode}")
-        
-        # STEP 2: Find the newly created position and set SL/TP
-        position = None
-        for i in range(10):  # Try a few times to get the position
-            positions = MT5Helper.get_open_positions(symbol)
-            if positions:
-                for pos in positions:
-                    if pos.ticket not in initial_position_tickets:
-                        position = pos
-                        break
-            if position:
-                break
-            time.sleep(0.1)
-            
-        if not position:
-            print("⚠️ Could not find position to set SL/TP")
-            return result.deal  # Return deal ticket anyway since trade was successful
-            
-        # Validate price and stop loss levels
-        symbol_info = mt5.symbol_info(symbol)
-        if symbol_info is not None:
-            # Make sure we have a valid point value
-            point = symbol_info.point if hasattr(symbol_info, 'point') else 0.00001
-            digits = symbol_info.digits if hasattr(symbol_info, 'digits') else 5
-            
-            # Get current position price
-            pos_price = position.price_open
-            
-            # Calculate proper SL/TP if needed
-            # Use simple fixed values (not percentage-based)
-            if stored_sl is None or stored_sl == 0 or stored_sl == pos_price:
-                if order_type == mt5.ORDER_TYPE_BUY:
-                    stored_sl = pos_price - 50
-                else:  # SELL
-                    stored_sl = pos_price + 50
-                print(f"Using fixed SL: {stored_sl}")
-                
-            if stored_tp is None or stored_tp == 0 or stored_tp == pos_price:
-                if order_type == mt5.ORDER_TYPE_BUY:
-                    stored_tp = pos_price + 100
-                else:  # SELL
-                    stored_tp = pos_price - 100
-                print(f"Using fixed TP: {stored_tp}")
-                
-            # Round to appropriate number of digits
-            stored_sl = round(stored_sl, digits)
-            stored_tp = round(stored_tp, digits)
-            
-        # Create modify request
-        modify_request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "symbol": symbol,
-            "sl": float(stored_sl),
-            "tp": float(stored_tp),
-            "position": position.ticket
-        }
-        
-        print(f"🛡️ Setting SL: {stored_sl} | 🎯 TP: {stored_tp}")
-        modify_result = mt5.order_send(modify_request)
-        
-        if not MT5Helper.is_modification_successful(modify_result):
-            print(f"⚠️ Failed to set SL/TP: {mt5.last_error()}")
         else:
-            print(f"✅ SL/TP set successfully")
-            
-        return result.deal # Return deal ticket if successful
+            print(f"✅ Trade Executed: Deal={result.deal}, Order={result.order}, Retcode={result.retcode}")
+            return result.deal
 
     @staticmethod
     def close_position(position, deviation):
@@ -635,8 +596,8 @@ def parse_arguments():
     parser.add_argument('symbol', help='Trading symbol (e.g., BTCUSD)')
     parser.add_argument('--strategy', default='ec',
                        help='Strategy to use (e.g., "ec" for EMA Crossover or full Python path to strategy class)')
-    parser.add_argument('--risk', type=float, default=RISK_CONFIG['DEFAULT_RISK_PERCENTAGE'] * 100.0,
-                       help=f'Risk percentage per trade (default: {RISK_CONFIG["DEFAULT_RISK_PERCENTAGE"] * 100.0})')
+    parser.add_argument('--volume', type=float, default=0.01,
+                       help='Fixed volume/lot size to trade (default: 0.01)')
     # Add more arguments as needed (e.g., config file path)
     return parser.parse_args()
 
@@ -661,7 +622,7 @@ def load_strategy_class(strategy_path):
 def main():
     """Main trading loop."""
     args = parse_arguments()
-    risk_percentage = args.risk / 100.0 # Convert percentage to decimal
+    fixed_volume = args.volume  # Use the fixed volume from command line
 
     if not MT5Helper.initialize_mt5(): return
     if not MT5Helper.check_autotrading_enabled(): MT5Helper.shutdown(); return
@@ -680,31 +641,34 @@ def main():
     strategy_config = {} # Example: Load from json file based on strategy name/args
     strategy = StrategyClass(args.symbol, CORE_CONFIG['TIMEFRAME'], symbol_info, strategy_config)
     print(f"📈 Strategy Loaded: {args.strategy}")
-    print(f"💰 Risk Per Trade: {args.risk}% | Initial Balance: ${account_info.balance:.2f}")
-    print(f"🔄 Symbol: {args.symbol} | Example usage: python generic_trader.py BTCUSD --strategy ec --risk 1.0")
+    print(f"💰 Fixed Volume: {args.volume} lots | Balance: ${account_info.balance:.2f}")
+    print(f"🔄 Symbol: {args.symbol} | Example usage: python generic_trader.py BTCUSD --strategy ec --volume 0.01")
 
     # --- State Variables ---
     last_data_fetch_time = None
     timeframe_seconds = get_timeframe_minutes(CORE_CONFIG['TIMEFRAME']) * 60
     required_data_count = max(CORE_CONFIG['DATA_FETCH_COUNT'], strategy.get_required_data_count())
+    
+    # More frequent data fetching for real-time analysis
+    data_check_interval = min(timeframe_seconds / 10, 15)  # Check at least 10 times per candle, max every 15 seconds
 
     print("🤖 Bot running... Press Ctrl+C to stop")
     try:
         while True:
             current_time = get_server_time()
             # --- Data Fetching & Indicator Calculation ---
-            # Fetch data roughly once per timeframe or if not fetched recently
+            # Fetch data more frequently for real-time signal detection
             should_fetch = (last_data_fetch_time is None or
-                            (current_time - last_data_fetch_time).total_seconds() >= timeframe_seconds / 2) # Fetch mid-candle too
+                           (current_time - last_data_fetch_time).total_seconds() >= data_check_interval)
 
             if should_fetch:
-                #print(f"Fetching data at {current_time}...")
+                # print(f"Fetching data at {current_time}...")
                 df = DataFetcher.get_historical_data(args.symbol, CORE_CONFIG['TIMEFRAME'], required_data_count)
                 if df is not None and not df.empty:
                     strategy.update_data(df)
                     strategy.calculate_indicators()
                     last_data_fetch_time = current_time
-                    #print(f"Indicators calculated. Last data point: {strategy.data.index[-1]}")
+                    # print(f"Indicators calculated. Last data point: {strategy.data.index[-1]}")80
                 else:
                     print("⚠️ Failed to fetch or update data, skipping cycle.")
                     time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'] * 10) # Longer sleep on data error
@@ -720,13 +684,15 @@ def main():
 
             # Check open positions and close them if needed based on strategy
             if open_positions:
-                print(f"Managing {len(open_positions)} open position(s)...")
+                # print(f"Managing {len(open_positions)} open position(s)...")
                 for pos in open_positions:
                     # Check if strategy wants to exit this position
                     if strategy.generate_exit_signal(pos):
                         print(f"🚪 Strategy generated exit signal for position {pos.ticket}.")
                         if TradeExecutor.close_position(pos, RISK_CONFIG['DEVIATION']):
                             print(f"✅ Position {pos.ticket} closed.")
+                            # Reset prev_signal to allow reentry after closing
+                            strategy.prev_signal = None
                         else:
                             print(f"⚠️ Failed to close position {pos.ticket} on exit signal.")
 
@@ -740,54 +706,37 @@ def main():
                  if entry_signal:
                      signal_type, entry_price, sl_price, tp_price = entry_signal
                      
-                     # The strategy returns None for SL/TP - we need to calculate them based on risk
-                     # Get the symbol info again in case it's needed
+                     # Get the symbol info for formatting
                      symbol_info = DataFetcher.get_symbol_info(args.symbol)
-                     
-                     # USE SIMPLE FIXED VALUES FOR SL AND TP
-                     # For BUY: TP is entry + 100, SL is entry - 50
-                     # For SELL: TP is entry - 100, SL is entry + 50
-                     if signal_type == mt5.ORDER_TYPE_BUY:
-                         sl_price = entry_price - 50
-                         tp_price = entry_price + 100
-                     else:  # SELL
-                         sl_price = entry_price + 50
-                         tp_price = entry_price - 100
+                     if symbol_info is None:
+                         print("❌ Failed to get symbol info")
+                         continue
                          
-                     # Round to appropriate number of digits if needed
-                     if hasattr(symbol_info, 'digits'):
-                         digits = symbol_info.digits
-                         sl_price = round(sl_price, digits)
-                         tp_price = round(tp_price, digits)
+                     # Use fixed volume from command line arguments
+                     volume = fixed_volume
                      
-                     print(f"🎯 Signal details: Entry={entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
-                     
-                     # Calculate volume (still using risk-based calculation)
-                     volume = RiskManager.calculate_position_size(
-                         symbol_info, account_info.balance, risk_percentage, entry_price, sl_price
-                     )
-
-                     # Verify the calculated volume is valid
-                     if not isinstance(volume, (int, float)) or volume <= 0:
-                         print(f"⚠️ Invalid volume calculated: {volume}. Using minimum volume instead.")
-                         volume = getattr(symbol_info, 'volume_min', 0.01)  # Default to 0.01 if not available
-                     
-                     if volume < symbol_info.volume_min:
-                         print(f"⚠️ Calculated volume {volume} is below minimum {symbol_info.volume_min}. Adjusting to minimum.")
+                     # Ensure the volume is within symbol limits
+                     if hasattr(symbol_info, 'volume_min') and volume < symbol_info.volume_min:
+                         print(f"⚠️ Specified volume {volume} is below minimum {symbol_info.volume_min}. Adjusting to minimum.")
                          volume = symbol_info.volume_min
+                     
+                     if hasattr(symbol_info, 'volume_max') and volume > symbol_info.volume_max:
+                         print(f"⚠️ Specified volume {volume} is above maximum {symbol_info.volume_max}. Adjusting to maximum.")
+                         volume = symbol_info.volume_max
 
                      print(f"🎯 Entry Signal Received: {'BUY' if signal_type == mt5.ORDER_TYPE_BUY else 'SELL'}")
-                     print(f"   Entry={entry_price}, SL={sl_price}, TP={tp_price}, Vol={volume}")
-
-                     # Execute Trade
+                     
+                     # Execute Trade using the TradeExecutor class
                      deal_ticket = TradeExecutor.execute_trade(
                          args.symbol, signal_type, volume, entry_price, sl_price, tp_price,
                          RISK_CONFIG['MAGIC_NUMBER'], RISK_CONFIG['DEVIATION']
                      )
+                     
                      if deal_ticket:
                          print(f"✅ Trade Executed. Deal Ticket: {deal_ticket}")
                      else:
                          print(f"❌ Trade Execution Failed.")
+                         strategy.prev_signal = None  # Reset to try again
 
             # --- Loop Sleep ---
             time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'])
