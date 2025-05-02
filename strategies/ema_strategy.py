@@ -1,15 +1,26 @@
 import MetaTrader5 as mt5
 import numpy as np
 from strategies.base_strategy import BaseStrategy
+import importlib
+import sys
+
+# Add parent directory to path to import get_candle_boundaries
+sys.path.append('..')
+# Try to import from the parent module
+try:
+    from generic_trader import get_candle_boundaries, get_server_time
+except ImportError:
+    # If import fails, raise the error
+    raise
 
 # Signal Filter Parameters (from ema_crossover_strategy.py)
 SIGNAL_FILTERS = {
-    'MIN_CROSSOVER_POINTS': 1,  # Minimum points required for initial crossover
+    'MIN_CROSSOVER_POINTS': 10,  # Minimum points required for initial crossover
     'MIN_SEPARATION_POINTS': 2,  # Minimum separation after crossover
     'SLOPE_PERIODS': 3,  # Periods to calculate slope over
     'MIN_SLOPE_THRESHOLD': 0.000001,  # Minimum slope for trend direction
     'MAX_OPPOSITE_SLOPE': -0.000002,  # Maximum allowed opposite slope
-    'LOOKBACK_CANDLES': 5,  # Number of recent candles to check for crossover
+    'LOOKBACK_CANDLES': 3,  # Number of recent candles to check for crossover
 }
 
 class EMAStrategy(BaseStrategy):
@@ -18,6 +29,7 @@ class EMAStrategy(BaseStrategy):
     def __init__(self, symbol, timeframe, symbol_info, strategy_config=None):
         """Initialize the strategy with default parameters"""
         super().__init__(symbol, timeframe, symbol_info, strategy_config)
+        self.last_trade_close_time = None  # Track when last trade was closed
         
     def calculate_indicators(self):
         """
@@ -139,6 +151,70 @@ class EMAStrategy(BaseStrategy):
             price_ok = last_close < slow_ema
             
         return price_ok
+    
+    def is_time_in_candle(self, time_to_check, candle_time):
+        """
+        General utility method to check if a time is within a specific candle period
+        
+        Args:
+            time_to_check: The timestamp to check
+            candle_time: The timestamp of the candle to check against
+            
+        Returns:
+            bool: True if time_to_check is within the candle that contains candle_time
+        """
+        if time_to_check is None or candle_time is None:
+            return False
+            
+        try:
+            # Get the boundaries of the candle containing candle_time
+            candle_start, candle_end = get_candle_boundaries(candle_time, self.timeframe)
+            
+            # Check if time_to_check falls within these boundaries
+            return candle_start <= time_to_check < candle_end
+            
+        except Exception as e:
+            print(f"⚠️ Error in is_time_in_candle: {e}. Assuming times are not in the same candle.")
+            return False
+    
+    def is_last_trade_in_current_candle(self):
+        """
+        Check if the last trade close time is within the current candle period
+        
+        Returns:
+            bool: True if the last trade was closed in the current candle
+        """
+        if self.last_trade_close_time is None or self.data.empty:
+            return False
+            
+        # Get the timestamp of the current candle
+        current_candle_time = self.data.index[-1]
+        
+        # Check if last trade close time is in the current candle
+        return self.is_time_in_candle(self.last_trade_close_time, current_candle_time)
+
+    def get_candles_after_last_trade(self):
+        """
+        Identifies candles that formed completely after the last trade was closed.
+        
+        Returns:
+            list: Indices of candles that formed after the last trade close time
+        """
+        if self.last_trade_close_time is None or self.data.empty:
+            # If no previous trade or no data, consider all candles
+            return list(range(len(self.data)))
+            
+        # Get candles that started after the last trade close time
+        post_trade_candles = []
+        for i in range(len(self.data)):
+            candle_time = self.data.index[i]
+            candle_start, _ = get_candle_boundaries(candle_time, self.timeframe)
+            
+            # If candle started after the trade closed, include it
+            if candle_start > self.last_trade_close_time:
+                post_trade_candles.append(i)
+                
+        return post_trade_candles
         
     def detect_recent_crossover(self):
         """
@@ -208,15 +284,23 @@ class EMAStrategy(BaseStrategy):
         
     def detect_existing_trend(self):
         """
-        Check for strong existing trend when no crossover was detected
-        
-        Returns:
-            tuple: (trend_detected, signal_type, potential_signal)
-            or (False, None, None) if no strong trend detected
+        Check for strong existing trend when no crossover was detected.
+        Requires multi-candle confirmation of the trend.
+        Only considers candles that formed after the last trade was closed.
         """
-        if self.data.empty or len(self.data) < 2:
+        if self.data.empty or len(self.data) < 5:  # Need at least 5 candles
             return False, None, None
             
+        # Get indices of candles that formed after the last trade
+        post_trade_candles = self.get_candles_after_last_trade()
+        
+        # Ensure we have enough post-trade candles for analysis
+        REQUIRED_POST_TRADE_CANDLES = 3
+        if len(post_trade_candles) < REQUIRED_POST_TRADE_CANDLES:
+            print(f"⏳ Only {len(post_trade_candles)} candles since last trade, need at least {REQUIRED_POST_TRADE_CANDLES} for trend confirmation")
+            return False, None, None
+            
+        # Use the most recent data point for initial check
         current_fast = self.data['fast_ema'].iloc[-1]
         current_slow = self.data['slow_ema'].iloc[-1]
         diff = current_fast - current_slow
@@ -226,36 +310,98 @@ class EMAStrategy(BaseStrategy):
         # Need minimum separation for existing trend
         if diff_points < SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
             return False, None, None
-            
-        trend_detected = False
-        signal_type = None
-        potential_signal = None
         
-        # Strong existing BUY trend
+        # Check if trend has existed for multiple consecutive candles
+        REQUIRED_TREND_CANDLES = 3  # Require at least 3 candles of consistent trend
+        
+        # For BUY trend, fast EMA must be above slow EMA for several candles
         if current_fast > current_slow and not self.prev_signal:
-            trend_detected = True
-            potential_signal = "BUY"
-            signal_type = mt5.ORDER_TYPE_BUY
-            print(f"\n📊 Analyzing existing BUY trend (no recent crossover):")
-        # Strong existing SELL trend
-        elif current_fast < current_slow and not self.prev_signal:
-            trend_detected = True
-            potential_signal = "SELL"
-            signal_type = mt5.ORDER_TYPE_SELL
-            print(f"\n📊 Analyzing existing SELL trend (no recent crossover):")
+            # Check if this pattern holds for REQUIRED_TREND_CANDLES consecutive candles
+            trend_length = 1  # Start with current candle
+            post_trade_trend_length = 1 if self.data.index[-1] in [self.data.index[i] for i in post_trade_candles] else 0
             
-        return trend_detected, signal_type, potential_signal
+            for i in range(2, min(REQUIRED_TREND_CANDLES + 1, len(self.data))):
+                past_fast = self.data['fast_ema'].iloc[-i]
+                past_slow = self.data['slow_ema'].iloc[-i]
+                candle_index = len(self.data) - i
+                
+                # Check if the candle is after the last trade
+                is_post_trade = candle_index in post_trade_candles
+                
+                if past_fast > past_slow:
+                    trend_length += 1
+                    if is_post_trade:
+                        post_trade_trend_length += 1
+                else:
+                    break  # Trend interrupted
+            
+            # The trend must be at least REQUIRED_TREND_CANDLES long overall
+            # AND we need at least 2 candles of trend confirmation after the last trade
+            if trend_length >= REQUIRED_TREND_CANDLES and post_trade_trend_length >= 2:
+                print(f"\n📊 Analyzing existing BUY trend - Confirmed for {trend_length} candles total, {post_trade_trend_length} since last trade")
+                return True, mt5.ORDER_TYPE_BUY, "BUY"
+            elif post_trade_trend_length < 2:
+                print(f"⏳ BUY trend only confirmed for {post_trade_trend_length} candles since last trade, need at least 2")
+            elif trend_length < REQUIRED_TREND_CANDLES:
+                print(f"⏳ BUY trend only confirmed for {trend_length} candles total, need at least {REQUIRED_TREND_CANDLES}")
+                
+        # For SELL trend, fast EMA must be below slow EMA for several candles
+        elif current_fast < current_slow and not self.prev_signal:
+            # Check if this pattern holds for REQUIRED_TREND_CANDLES consecutive candles
+            trend_length = 1  # Start with current candle
+            post_trade_trend_length = 1 if self.data.index[-1] in [self.data.index[i] for i in post_trade_candles] else 0
+            
+            for i in range(2, min(REQUIRED_TREND_CANDLES + 1, len(self.data))):
+                past_fast = self.data['fast_ema'].iloc[-i]
+                past_slow = self.data['slow_ema'].iloc[-i]
+                candle_index = len(self.data) - i
+                
+                # Check if the candle is after the last trade
+                is_post_trade = candle_index in post_trade_candles
+                
+                if past_fast < past_slow:
+                    trend_length += 1
+                    if is_post_trade:
+                        post_trade_trend_length += 1
+                else:
+                    break  # Trend interrupted
+            
+            # The trend must be at least REQUIRED_TREND_CANDLES long overall
+            # AND we need at least 2 candles of trend confirmation after the last trade
+            if trend_length >= REQUIRED_TREND_CANDLES and post_trade_trend_length >= 2:
+                print(f"\n📊 Analyzing existing SELL trend - Confirmed for {trend_length} candles total, {post_trade_trend_length} since last trade")
+                return True, mt5.ORDER_TYPE_SELL, "SELL"
+            elif post_trade_trend_length < 2:
+                print(f"⏳ SELL trend only confirmed for {post_trade_trend_length} candles since last trade, need at least 2")
+            elif trend_length < REQUIRED_TREND_CANDLES:
+                print(f"⏳ SELL trend only confirmed for {trend_length} candles total, need at least {REQUIRED_TREND_CANDLES}")
+        
+        # If we get here, no multi-candle trend was detected
+        return False, None, None
     
-    def generate_entry_signal(self):
+    def generate_entry_signal(self, open_positions=None):
         """
         Checks for EMA crossover entry signals with additional filters.
         Also considers existing strong trends even without recent crossover.
         
+        Args:
+            open_positions (list, optional): List of currently open positions to check
+                                            if previous position was closed by SL/TP.
+            
         Returns:
             tuple or None: (signal_type, entry_price, None, None) or None
             The SL/TP will be calculated later based on actual entry price
         """
         if self.data.empty or len(self.data) < 10:  # Need at least 10 candles
+            return None
+            
+        # Check if the previous signal is still valid (detects SL/TP closures)
+        if open_positions is not None:
+            self.check_if_prev_signal_valid(open_positions)
+            
+        # Check if last trade close time is in the current candle - if so, skip generating signals
+        if self.is_last_trade_in_current_candle():
+            print(f"⏳ Waiting for next candle after position close at {self.last_trade_close_time}")
             return None
             
         # Get current EMA values for logging
@@ -349,4 +495,43 @@ class EMAStrategy(BaseStrategy):
             print(f"⚠️ EXIT SIGNAL: Fast EMA crossed above Slow EMA - Close SELL position")
             return True
             
+        return False
+        
+    def reset_signal_state(self):
+        """
+        Reset strategy internal state after position closing or failed orders.
+        Also records the timestamp when a position was closed to prevent immediate reentry.
+        """
+        # Record the time of the position close
+        current_server_time = get_server_time()
+        
+        if not self.data.empty:
+            # Use the timestamp of the current candle
+            self.last_trade_close_time = current_server_time
+            print(f"🕒 Position closed at {self.last_trade_close_time}. Waiting for next candle and new trend formation before new entry.")
+        else:
+            # If no data available, use server time
+            self.last_trade_close_time = current_server_time
+            print(f"🕒 Position closed at {self.last_trade_close_time} (server time). Waiting for next candle and new trend formation before new entry.")
+            
+        # Call the parent class method to reset other state
+        super().reset_signal_state()
+
+    def check_if_prev_signal_valid(self, open_positions):
+        """
+        Checks if the previous signal is still valid by checking if there are open positions.
+        If the previous position was closed by SL/TP, we need to reset the signal state.
+        
+        Args:
+            open_positions (list): List of currently open positions
+            
+        Returns:
+            bool: True if signal was reset, False otherwise
+        """
+        # If we have prev_signal but no open positions, the position must have been closed externally
+        # via SL/TP or manual intervention
+        if self.prev_signal is not None and not open_positions:
+            print(f"🔄 Detected position closed by SL/TP or manually. Resetting signal state.")
+            self.reset_signal_state()
+            return True
         return False 

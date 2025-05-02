@@ -738,7 +738,7 @@ def main():
             
             # Process entry signals if there are no open positions
             if not open_positions:
-                 entry_signal = strategy.generate_entry_signal()
+                 entry_signal = strategy.generate_entry_signal(open_positions)
                  if entry_signal:
                      signal_type, entry_price, sl_price, tp_price = entry_signal
                      
@@ -775,6 +775,10 @@ def main():
                          print(f"❌ Trade Execution Failed.")
                          # Reset strategy state if trade failed to allow retrying
                          strategy.reset_signal_state()
+            else:
+                # Even if we have open positions, still call generate_entry_signal with open_positions
+                # This allows the strategy to detect if positions were closed by SL/TP
+                strategy.generate_entry_signal(open_positions)
 
             # --- Loop Sleep ---
             time.sleep(CORE_CONFIG['LOOP_SLEEP_SECONDS'])
