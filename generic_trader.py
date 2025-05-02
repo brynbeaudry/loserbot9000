@@ -37,7 +37,12 @@ RISK_CONFIG = {
     'DEFAULT_RISK_PERCENTAGE': 0.01,  # Default 1% risk per trade
     'MAGIC_NUMBER': 234000,
     'DEVIATION': 20,  # Price deviation allowed for market orders
-    'DEFAULT_TP_RATIO': 1.0 # Default Take Profit / Stop Loss ratio
+    'DEFAULT_TP_RATIO': 1.0, # Default Take Profit / Stop Loss ratio
+    'ATR_SL_MULTIPLIER': 1.25,  # Multiple of ATR for stop loss
+    'ATR_TP_MULTIPLIER': 2.0,   # Multiple of ATR for take profit
+    'ATR_LOOKBACK_CANDLES': 20, # Number of candles to fetch for ATR calculation
+    'FALLBACK_SL_POINTS': 40,   # Fallback SL distance in points if ATR not available
+    'FALLBACK_TP_POINTS': 80    # Fallback TP distance in points if ATR not available
 }
 
 # Position Management Configuration (Can be overridden by strategy)
@@ -115,6 +120,47 @@ class IndicatorCalculator:
 
         return macd_df
 
+    @staticmethod
+    def calculate_atr(ohlc_data, period=14):
+        """
+        Calculate Average True Range (ATR)
+        
+        Args:
+            ohlc_data (DataFrame): OHLC DataFrame with 'high', 'low', 'close' columns
+            period (int): ATR period, default 14
+            
+        Returns:
+            Series: ATR values
+        """
+        if len(ohlc_data) < period + 1:
+            return pd.Series(index=ohlc_data.index, dtype='float64')
+            
+        # Create a new DataFrame to avoid modifying the input
+        df = pd.DataFrame(index=ohlc_data.index)
+        
+        # Calculate True Range
+        df['high'] = ohlc_data['high']
+        df['low'] = ohlc_data['low']
+        df['close'] = ohlc_data['close']
+        df['prev_close'] = ohlc_data['close'].shift(1)
+        
+        # Handle the first row where prev_close is NaN
+        df.loc[df.index[0], 'prev_close'] = df['close'].iloc[0]
+        
+        # Calculate the three components of True Range
+        df['tr1'] = df['high'] - df['low']
+        df['tr2'] = abs(df['high'] - df['prev_close'])
+        df['tr3'] = abs(df['low'] - df['prev_close'])
+        
+        # True Range is the maximum of the three components
+        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+        
+        # Calculate Average True Range (ATR)
+        # Use simple rolling mean - this is more reliable for small datasets
+        df['atr'] = df['tr'].rolling(window=period, min_periods=1).mean()
+        
+        return df['atr']
+
     # --- Add more indicator methods here (e.g., MACD, Bollinger Bands) ---
 
 # Indicator Configuration (Used by DataFetcher)
@@ -144,6 +190,12 @@ INDICATOR_CONFIG = [
         'params': {'fast_period': 12, 'slow_period': 26, 'signal_period': 9}, # Standard MACD periods
         'input_col': 'close',
         'output_cols': ['macd', 'macd_signal', 'macd_hist'] # Function returns these columns
+    },
+    {
+        'name': 'atr',
+        'function': IndicatorCalculator.calculate_atr,
+        'params': {'period': 14}, # 14-period ATR as requested by user
+        'input_col': 'ohlc', # Indicates function needs the full OHLC DataFrame
     },
     # --- Add more indicators here ---
 ]
@@ -346,31 +398,38 @@ class DataFetcher:
                     params = indicator_conf.get('params', {})
                     output_cols = indicator_conf.get('output_cols') # Check for multiple output cols
 
-                    if input_col_name in df.columns:
-                        input_series = df[input_col_name]
-                        try:
-                            # Pass the input series and other params to the function
+                    try:
+                        # Special case for indicators that need the full DataFrame (like ATR)
+                        if input_col_name is None or input_col_name == 'ohlc':
+                            # Pass the full DataFrame to the calculation function
+                            if output_cols:
+                                # Function returns a DataFrame with multiple columns
+                                indicator_df = calc_function(df, **params)
+                                df = df.join(indicator_df, how='left')
+                            else:
+                                # Function returns a single Series
+                                df[output_col_name] = calc_function(df, **params)
+                        elif input_col_name in df.columns:
+                            # Standard case - pass a single column
+                            input_series = df[input_col_name]
                             if output_cols:
                                 # Function returns a DataFrame with multiple columns
                                 indicator_df = calc_function(input_series, **params)
-                                # Merge the results into the main DataFrame
                                 df = df.join(indicator_df, how='left')
-                                #print(f"Calculated multi-indicator: {output_cols}")
                             else:
                                 # Function returns a single Series
                                 df[output_col_name] = calc_function(input_series, **params)
-                                #print(f"Calculated indicator: {output_col_name}")
-                        except Exception as e:
-                            print(f"❌ Error calculating indicator '{output_col_name}': {e}")
-                            # Add NaN column(s) on error
+                        else:
+                            print(f"⚠️ Input column '{input_col_name}' not found for indicator '{output_col_name}'. Skipping.")
+                            # Ensure all expected output columns exist, even if NaN
                             if output_cols:
                                 for col in output_cols:
                                     df[col] = np.nan
                             else:
                                 df[output_col_name] = np.nan
-                    else:
-                        print(f"⚠️ Input column '{input_col_name}' not found for indicator '{output_col_name}'. Skipping.")
-                        # Ensure all expected output columns exist, even if NaN
+                    except Exception as e:
+                        print(f"❌ Error calculating indicator '{output_col_name}': {e}")
+                        # Add NaN column(s) on error
                         if output_cols:
                             for col in output_cols:
                                 df[col] = np.nan
@@ -378,7 +437,6 @@ class DataFetcher:
                             df[output_col_name] = np.nan
             else:
                  print("⚠️ DataFrame is empty, cannot calculate indicators.")
-
 
             return df
         except Exception as e:
@@ -448,6 +506,104 @@ class RiskManager:
         print(f"💰 Position sizing: Risk=${risk_amount:.2f}, SL distance={price_risk:.5f}, Size={final_size:.4f} lots")
         return final_size
 
+    @staticmethod
+    def calculate_dynamic_sltp(symbol_info, order_type, entry_price, atr_value=None):
+        """
+        Calculate dynamic SL/TP levels based on ATR or fallback to fixed values.
+        
+        Args:
+            symbol_info (mt5.SymbolInfo): Symbol information object
+            order_type (int): Order type (BUY/SELL)
+            entry_price (float): Entry price for the trade
+            atr_value (float, optional): Current ATR value. If None, will use fixed values.
+            
+        Returns:
+            tuple: (sl_price, tp_price)
+        """
+        try:
+            # Get digit precision for price rounding
+            digits = symbol_info.digits
+            
+            # Verify we have valid point value
+            if not hasattr(symbol_info, 'point') or symbol_info.point <= 0:
+                raise ValueError(f"Invalid point value for {symbol_info.name}")
+            
+            # If ATR not provided, use fixed values based on point
+            if atr_value is None or pd.isna(atr_value) or atr_value <= 0:
+                print("⚠️ Using fixed SL/TP values instead of ATR")
+                atr_value = RISK_CONFIG['FALLBACK_SL_POINTS'] * symbol_info.point
+                # Use the fixed multipliers for the fallback case
+                sl_multiplier = 1.0  # Use exactly the fallback value for SL
+                tp_multiplier = RISK_CONFIG['FALLBACK_TP_POINTS'] / RISK_CONFIG['FALLBACK_SL_POINTS']  # Calculate ratio
+            else:
+                print(f"📊 Using ATR for SL/TP: {atr_value:.5f}")
+                # Use the ATR multipliers from config
+                sl_multiplier = RISK_CONFIG['ATR_SL_MULTIPLIER']
+                tp_multiplier = RISK_CONFIG['ATR_TP_MULTIPLIER']
+            
+            # Calculate SL/TP based on configured multipliers
+            if order_type == mt5.ORDER_TYPE_BUY:
+                # For BUY: SL below entry, TP above entry
+                sl_price = entry_price - (sl_multiplier * atr_value)
+                tp_price = entry_price + (tp_multiplier * atr_value)
+            else:  # SELL
+                # For SELL: SL above entry, TP below entry
+                sl_price = entry_price + (sl_multiplier * atr_value)
+                tp_price = entry_price - (tp_multiplier * atr_value)
+            
+            # Round to appropriate number of digits
+            sl_price = round(sl_price, digits)
+            tp_price = round(tp_price, digits)
+            
+            # Ensure SL/TP are within allowed distance from current price
+            min_stop_level = symbol_info.trade_stops_level * symbol_info.point
+            if min_stop_level > 0:
+                if order_type == mt5.ORDER_TYPE_BUY:
+                    min_sl = entry_price - min_stop_level
+                    min_tp = entry_price + min_stop_level
+                    # Ensure SL is not too close
+                    if sl_price > min_sl:
+                        sl_price = min_sl
+                        print(f"⚠️ Adjusted SL to minimum allowed distance: {min_stop_level} points")
+                    # Ensure TP is not too close
+                    if tp_price < min_tp:
+                        tp_price = min_tp
+                        print(f"⚠️ Adjusted TP to minimum allowed distance: {min_stop_level} points")
+                else:  # SELL
+                    min_sl = entry_price + min_stop_level
+                    min_tp = entry_price - min_stop_level
+                    # Ensure SL is not too close
+                    if sl_price < min_sl:
+                        sl_price = min_sl
+                        print(f"⚠️ Adjusted SL to minimum allowed distance: {min_stop_level} points")
+                    # Ensure TP is not too close
+                    if tp_price > min_tp:
+                        tp_price = min_tp
+                        print(f"⚠️ Adjusted TP to minimum allowed distance: {min_stop_level} points")
+            
+            # Log the SL/TP distances
+            sl_distance = abs(entry_price - sl_price)
+            tp_distance = abs(entry_price - tp_price)
+            print(f"📏 SL Distance: {sl_distance:.5f} ({sl_multiplier}x ATR), TP Distance: {tp_distance:.5f} ({tp_multiplier}x ATR)")
+            
+            return sl_price, tp_price
+            
+        except Exception as e:
+            print(f"❌ Error in calculate_dynamic_sltp: {e}")
+            # Fallback to simple fixed values based on order type
+            fallback_sl_points = RISK_CONFIG['FALLBACK_SL_POINTS'] * symbol_info.point
+            fallback_tp_points = RISK_CONFIG['FALLBACK_TP_POINTS'] * symbol_info.point
+            
+            if order_type == mt5.ORDER_TYPE_BUY:
+                sl_price = entry_price - fallback_sl_points
+                tp_price = entry_price + fallback_tp_points
+            else:  # SELL
+                sl_price = entry_price + fallback_sl_points
+                tp_price = entry_price - fallback_tp_points
+            
+            print(f"⚠️ Using fallback SL/TP values")
+            return round(sl_price, symbol_info.digits), round(tp_price, symbol_info.digits)
+
 
 class TradeExecutor:
     """Handles trade execution and position management."""
@@ -489,6 +645,23 @@ class TradeExecutor:
             print("❌ Failed to get current prices")
             return None
             
+        # Get historical data to calculate ATR (need this for dynamic SL/TP)
+        rates = mt5.copy_rates_from_pos(symbol, CORE_CONFIG['TIMEFRAME'], 0, RISK_CONFIG['ATR_LOOKBACK_CANDLES'])
+        if rates is None or len(rates) == 0:
+            print("❌ Failed to get historical data for ATR calculation")
+            return None
+            
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        df.set_index('time', inplace=True)
+        
+        # Calculate ATR
+        atr_value = IndicatorCalculator.calculate_atr(df).iloc[-1]
+        if pd.isna(atr_value) or atr_value <= 0:
+            print(f"⚠️ Invalid ATR value: {atr_value}. Using fallback.")
+            # Will use fallback in RiskManager
+            atr_value = None
+            
         # Use current market prices for more reliable execution
         if order_type == mt5.ORDER_TYPE_BUY:
             # For BUY orders, use ask price
@@ -497,28 +670,11 @@ class TradeExecutor:
             # For SELL orders, use bid price
             actual_entry_price = current_tick.bid
         
-        # Get required symbol properties for SL/TP calculation
+        # Calculate dynamic SL/TP based on ATR
         try:
-            # Get digit precision for price rounding
-            digits = symbol_info.digits
-            
-            # Verify we have valid point value (needed for some calculations)
-            if not hasattr(symbol_info, 'point') or symbol_info.point <= 0:
-                raise ValueError(f"Invalid point value for {symbol}")
-                
-            # Calculate SL/TP based on actual entry price
-            if order_type == mt5.ORDER_TYPE_BUY:
-                # For BUY: SL below entry, TP above entry
-                sl_price = actual_entry_price - 40    
-                tp_price = actual_entry_price + 80
-            else:  # SELL
-                # For SELL: SL above entry, TP below entry
-                sl_price = actual_entry_price + 40
-                tp_price = actual_entry_price - 80
-                
-            # Round to appropriate number of digits
-            sl_price = round(sl_price, digits)
-            tp_price = round(tp_price, digits)
+            sl_price, tp_price = RiskManager.calculate_dynamic_sltp(
+                symbol_info, order_type, actual_entry_price, atr_value
+            )
         except Exception as e:
             print(f"❌ Error calculating SL/TP levels: {e}")
             return None
@@ -536,7 +692,7 @@ class TradeExecutor:
             "tp": tp_price,
             "deviation": deviation,
             "magic": magic_number,
-            "comment": "Trade with SL/TP",
+            "comment": "Trade with ATR-based SL/TP",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }

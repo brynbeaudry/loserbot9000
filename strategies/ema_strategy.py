@@ -282,107 +282,10 @@ class EMAStrategy(BaseStrategy):
                 
         return crossover_detected, signal_type, potential_signal, candles_ago
         
-    def detect_existing_trend(self):
-        """
-        Check for strong existing trend when no crossover was detected.
-        Requires multi-candle confirmation of the trend.
-        Only considers candles that formed after the last trade was closed.
-        """
-        if self.data.empty or len(self.data) < 5:  # Need at least 5 candles
-            return False, None, None
-            
-        # Get indices of candles that formed after the last trade
-        post_trade_candles = self.get_candles_after_last_trade()
-        
-        # Ensure we have enough post-trade candles for analysis
-        REQUIRED_POST_TRADE_CANDLES = 3
-        if len(post_trade_candles) < REQUIRED_POST_TRADE_CANDLES:
-            print(f"⏳ Only {len(post_trade_candles)} candles since last trade, need at least {REQUIRED_POST_TRADE_CANDLES} for trend confirmation")
-            return False, None, None
-            
-        # Use the most recent data point for initial check
-        current_fast = self.data['fast_ema'].iloc[-1]
-        current_slow = self.data['slow_ema'].iloc[-1]
-        diff = current_fast - current_slow
-        point = self.get_point_value()
-        diff_points = abs(diff / point)
-        
-        # Need minimum separation for existing trend
-        if diff_points < SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
-            return False, None, None
-        
-        # Check if trend has existed for multiple consecutive candles
-        REQUIRED_TREND_CANDLES = 3  # Require at least 3 candles of consistent trend
-        
-        # For BUY trend, fast EMA must be above slow EMA for several candles
-        if current_fast > current_slow and not self.prev_signal:
-            # Check if this pattern holds for REQUIRED_TREND_CANDLES consecutive candles
-            trend_length = 1  # Start with current candle
-            post_trade_trend_length = 1 if self.data.index[-1] in [self.data.index[i] for i in post_trade_candles] else 0
-            
-            for i in range(2, min(REQUIRED_TREND_CANDLES + 1, len(self.data))):
-                past_fast = self.data['fast_ema'].iloc[-i]
-                past_slow = self.data['slow_ema'].iloc[-i]
-                candle_index = len(self.data) - i
-                
-                # Check if the candle is after the last trade
-                is_post_trade = candle_index in post_trade_candles
-                
-                if past_fast > past_slow:
-                    trend_length += 1
-                    if is_post_trade:
-                        post_trade_trend_length += 1
-                else:
-                    break  # Trend interrupted
-            
-            # The trend must be at least REQUIRED_TREND_CANDLES long overall
-            # AND we need at least 2 candles of trend confirmation after the last trade
-            if trend_length >= REQUIRED_TREND_CANDLES and post_trade_trend_length >= 2:
-                print(f"\n📊 Analyzing existing BUY trend - Confirmed for {trend_length} candles total, {post_trade_trend_length} since last trade")
-                return True, mt5.ORDER_TYPE_BUY, "BUY"
-            elif post_trade_trend_length < 2:
-                print(f"⏳ BUY trend only confirmed for {post_trade_trend_length} candles since last trade, need at least 2")
-            elif trend_length < REQUIRED_TREND_CANDLES:
-                print(f"⏳ BUY trend only confirmed for {trend_length} candles total, need at least {REQUIRED_TREND_CANDLES}")
-                
-        # For SELL trend, fast EMA must be below slow EMA for several candles
-        elif current_fast < current_slow and not self.prev_signal:
-            # Check if this pattern holds for REQUIRED_TREND_CANDLES consecutive candles
-            trend_length = 1  # Start with current candle
-            post_trade_trend_length = 1 if self.data.index[-1] in [self.data.index[i] for i in post_trade_candles] else 0
-            
-            for i in range(2, min(REQUIRED_TREND_CANDLES + 1, len(self.data))):
-                past_fast = self.data['fast_ema'].iloc[-i]
-                past_slow = self.data['slow_ema'].iloc[-i]
-                candle_index = len(self.data) - i
-                
-                # Check if the candle is after the last trade
-                is_post_trade = candle_index in post_trade_candles
-                
-                if past_fast < past_slow:
-                    trend_length += 1
-                    if is_post_trade:
-                        post_trade_trend_length += 1
-                else:
-                    break  # Trend interrupted
-            
-            # The trend must be at least REQUIRED_TREND_CANDLES long overall
-            # AND we need at least 2 candles of trend confirmation after the last trade
-            if trend_length >= REQUIRED_TREND_CANDLES and post_trade_trend_length >= 2:
-                print(f"\n📊 Analyzing existing SELL trend - Confirmed for {trend_length} candles total, {post_trade_trend_length} since last trade")
-                return True, mt5.ORDER_TYPE_SELL, "SELL"
-            elif post_trade_trend_length < 2:
-                print(f"⏳ SELL trend only confirmed for {post_trade_trend_length} candles since last trade, need at least 2")
-            elif trend_length < REQUIRED_TREND_CANDLES:
-                print(f"⏳ SELL trend only confirmed for {trend_length} candles total, need at least {REQUIRED_TREND_CANDLES}")
-        
-        # If we get here, no multi-candle trend was detected
-        return False, None, None
-    
     def generate_entry_signal(self, open_positions=None):
         """
         Checks for EMA crossover entry signals with additional filters.
-        Also considers existing strong trends even without recent crossover.
+        Trend-based signals have been removed, now only using crossover signals.
         
         Args:
             open_positions (list, optional): List of currently open positions to check
@@ -411,20 +314,13 @@ class EMAStrategy(BaseStrategy):
         prev_slow = self.data['slow_ema'].iloc[-2]
         point = self.get_point_value()
             
-        # Try to detect a recent crossover first
+        # Try to detect a recent crossover
         crossover_detected, signal_type, potential_signal, candles_ago = self.detect_recent_crossover()
         
-        # If no crossover detected, check for existing trend
-        if not crossover_detected:
-            trend_detected, signal_type, potential_signal = self.detect_existing_trend()
-        else:
-            trend_detected = False
-                
-        # If we have a potential signal, analyze it
+        # If we have a potential signal from crossover, analyze it
         if potential_signal:
             diff_value = current_fast - current_slow
             diff_points = abs(diff_value / point)
-            prev_diff = prev_fast - prev_slow
             
             # Log current state
             print(f"   Current Candle: Fast EMA = {current_fast:.5f}, Slow EMA = {current_slow:.5f} (Diff: {diff_value:.5f})")
@@ -436,21 +332,11 @@ class EMAStrategy(BaseStrategy):
             
             print(f"Slope: {'✅' if slope_ok else '❌'}, Price: {'✅' if price_ok else '❌'}")
             
-            # Signal validation logic based on detection method
-            valid_signal = False
-            
-            # Crossover-based signal (less strict)
-            if crossover_detected and slope_ok and price_ok:
+            # Validate crossover signal
+            if slope_ok and price_ok:
                 valid_signal = True
                 print(f"\n🚀 VALID {potential_signal} SIGNAL - Crossover with confirming slope and price")
                 
-            # Existing trend signal (more strict - requires separation as well)
-            elif trend_detected and slope_ok and price_ok and diff_points >= SIGNAL_FILTERS['MIN_SEPARATION_POINTS']:
-                valid_signal = True
-                print(f"\n🚀 VALID {potential_signal} SIGNAL - Strong existing trend")
-                
-            # If valid signal, calculate entry price and return signal
-            if valid_signal:
                 # Get appropriate market price for entry
                 entry_price = self.get_market_price(signal_type)
                 

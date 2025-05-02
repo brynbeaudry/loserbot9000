@@ -6,6 +6,12 @@
 - Don't automatically reverse your position until the closing position of a previous candle is a certain threshold over the slow EMA
   - Lots of reversals that cost you have turned out to not need to be reversed after the candle closes.
 
+  - Let SL Take care of things once you are in a positioon. Cross over happen some much on a trend, don''t listen to small crossovers as a way to exit the position. 
+
+  - Maybe try only buying after close, exactly on the oppppen of the next one once you've made the decison
+
+  - Ema cross over in the other direction needs to be a trend when you are in a positioon. THis just needs to be safe, remember, it's running all day. 
+
 ## Stop Loss / Take Profit Enhancements
 
 - Positioooon closing (sltp) can be done based on MACD
