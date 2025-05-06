@@ -17,8 +17,8 @@ except ImportError:
 AI_SLOP_CONFIG = {
     # Risk and Money Management
     'RISK_PERCENT': 0.01,           # 1% risk per trade
-    'SL_ATR_MULT': 2.0,             # Stop loss multiplier of ATR
-    'TP_ATR_MULT': 4.0,             # Take profit multiplier of ATR
+    'SL_ATR_MULT': 8.0,             # Stop loss multiplier of ATR (increased from 2.0 to 3.0 for more breathing room)
+    'TP_ATR_MULT': 16.0,             # Take profit multiplier of ATR (increased to maintain 1:2 risk/reward)
     
     # Filter Thresholds
     'MAX_SPREAD_POINTS': 2000,      # Maximum allowed spread in points (increased for crypto)
@@ -31,12 +31,24 @@ AI_SLOP_CONFIG = {
     'MACD_HIST_MEAN_WINDOW': 5,     # Bars for MACD histogram mean
     'RSI_MEAN_WINDOW': 5,           # Bars for RSI mean
     
+    # Trend Strength Parameters
+    'MIN_TREND_STRENGTH': 0.3,      # Minimum trend strength score (0-1)
+    'PRICE_DISTANCE_FACTOR': 0.5,   # Factor for how close price should be to MA for entry
+    
+    # Momentum Confirmation Parameters
+    'MOMENTUM_INDICATORS_REQUIRED': 3,  # Number of indicators required (3 out of 5 - more strict than before)
+    'MOMENTUM_INDICATORS_TOTAL': 5,     # Total number of indicators used (MACD, RSI, Stochastic, EMA50, BB)
+    'MOMENTUM_LOOKBACK': 3,             # Additional lookback periods for momentum consistency check
+    
     # Momentum Thresholds
     'RSI_BULLISH_THRESHOLD': 55,    # RSI above this is bullish
     'RSI_BEARISH_THRESHOLD': 45,    # RSI below this is bearish
     
+    # Trading Behavior
+    'ALLOW_REVERSAL_TRADES': False,  # Allow trading potential trend reversals (when momentum contradicts trend)
+    
     # Data Analysis
-    'TIMEFRAME': 'M1',              # Default timeframe to use for analysis (changed to M1)
+    'TIMEFRAME': 'M1',              # Default timeframe to use for analysis (M1 provides more signals)
     'ANALYSIS_HOURS': 24,           # Hours of data to analyze
     'TEMP_DATA_DIR': 'temp_data'    # Directory for temporary data files
 }
@@ -65,6 +77,9 @@ class AISlope1Strategy(BaseStrategy):
         self.derived_metrics = {}
         self.entry_decision = None
         self.price_levels = {'entry': None, 'stop': None, 'tp': None}
+        
+        # Track the last processed candle to only trade at new candle formation
+        self.last_processed_candle_time = None
         
         # Create temp directory if it doesn't exist
         os.makedirs(self.config['TEMP_DATA_DIR'], exist_ok=True)
@@ -591,54 +606,318 @@ class AISlope1Strategy(BaseStrategy):
         ema50_last = self.indicators['ema50'].iloc[-1]
         ema200_last = self.indicators['ema200'].iloc[-1]
         ema200_slope = self.derived_metrics['ema200_slope50']
+        ema50_slope = self.derived_metrics['ema50_slope20']
+        
+        # Detailed trend analysis for logging
+        print("\n📈 TREND ANALYSIS DETAILS:")
+        print(f"  - EMA50 ({ema50_last:.5f}) vs EMA200 ({ema200_last:.5f}): {'ABOVE ✅' if ema50_last > ema200_last else 'BELOW ❌'}")
+        print(f"  - EMA200 Slope: {ema200_slope:.8f} ({'RISING ✅' if ema200_slope > 0 else 'FALLING ❌'})")
+        print(f"  - EMA50 Slope: {ema50_slope:.8f} ({'RISING ✅' if ema50_slope > 0 else 'FALLING ❌'})")
         
         # Classify trend based on EMA relationship and slope
-        if (ema50_last > ema200_last) and (ema200_slope > 0):
+        uptrend_conditions = [
+            ema50_last > ema200_last,
+            ema200_slope > 0
+        ]
+        
+        downtrend_conditions = [
+            ema50_last < ema200_last,
+            ema200_slope < 0
+        ]
+        
+        # Count how many conditions are met
+        uptrend_score = sum(uptrend_conditions)
+        downtrend_score = sum(downtrend_conditions)
+        
+        if uptrend_score == 2:
             trend = 'uptrend'
-        elif (ema50_last < ema200_last) and (ema200_slope < 0):
+            print(f"  - STRONG UPTREND: EMA50 > EMA200 and EMA200 rising")
+        elif downtrend_score == 2:
             trend = 'downtrend'
+            print(f"  - STRONG DOWNTREND: EMA50 < EMA200 and EMA200 falling")
+        elif uptrend_score > downtrend_score:
+            trend = 'uptrend'
+            print(f"  - WEAK UPTREND: Not all conditions met")
+        elif downtrend_score > uptrend_score:
+            trend = 'downtrend'
+            print(f"  - WEAK DOWNTREND: Not all conditions met")
         else:
             trend = 'neutral'
+            print(f"  - NEUTRAL TREND: Mixed signals")
             
-        print(f"Trend Classification: {trend.upper()}")
+        print(f"  - FINAL TREND CLASSIFICATION: {trend.upper()}")
         return trend
         
     def _confirm_momentum(self):
         """
         Step 6: MOMENTUM CONFIRMATION
         Check if momentum indicators confirm the trend direction.
+        Enhanced to use multiple indicators with configurable threshold.
         
         Returns:
             tuple: (bullish_momentum, bearish_momentum)
         """
-        # Get momentum indicators
+        # Get momentum indicators for the most recent candle
         macd_hist_mean = self.derived_metrics['macd_hist_mean5']
         rsi_mean = self.derived_metrics['rsi_mean5']
         stoch_k = self.derived_metrics['stoch_k_last']
         stoch_d = self.derived_metrics['stoch_d_last']
         
-        # Get config thresholds
+        # Get latest prices and indicators
+        last_close = self.indicators['close'].iloc[-1]
+        ema50_last = self.indicators['ema50'].iloc[-1]
+        bb_upper = self.indicators['bb_upper'].iloc[-1]
+        bb_lower = self.indicators['bb_lower'].iloc[-1]
+        bb_middle = (bb_upper + bb_lower) / 2
+        
+        # Get config settings
         rsi_bullish = self.config['RSI_BULLISH_THRESHOLD']
         rsi_bearish = self.config['RSI_BEARISH_THRESHOLD']
+        required_indicators = self.config['MOMENTUM_INDICATORS_REQUIRED']
+        total_indicators = self.config['MOMENTUM_INDICATORS_TOTAL']
+        lookback = self.config['MOMENTUM_LOOKBACK']
         
-        # Check bullish momentum conditions
-        bullish_mom = (macd_hist_mean > 0) and (rsi_mean > rsi_bullish) and (stoch_k > stoch_d)
+        # 1. MACD Histogram
+        macd_bullish = macd_hist_mean > 0
+        macd_bearish = macd_hist_mean < 0
         
-        # Check bearish momentum conditions
-        bearish_mom = (macd_hist_mean < 0) and (rsi_mean < rsi_bearish) and (stoch_k < stoch_d)
+        # 2. RSI
+        rsi_bullish_signal = rsi_mean > rsi_bullish
+        rsi_bearish_signal = rsi_mean < rsi_bearish
         
+        # 3. Stochastic
+        stoch_bullish = stoch_k > stoch_d
+        stoch_bearish = stoch_k < stoch_d
+        
+        # 4. Price vs EMA50
+        ema50_bullish = last_close > ema50_last
+        ema50_bearish = last_close < ema50_last
+        
+        # 5. Bollinger Band position
+        # Middle to upper band is bullish territory, middle to lower is bearish
+        bb_bullish = last_close > bb_middle
+        bb_bearish = last_close < bb_middle
+        
+        # Count bullish signals
+        bullish_count = sum([
+            macd_bullish,
+            rsi_bullish_signal,
+            stoch_bullish,
+            ema50_bullish,
+            bb_bullish
+        ])
+        
+        # Count bearish signals
+        bearish_count = sum([
+            macd_bearish,
+            rsi_bearish_signal,
+            stoch_bearish,
+            ema50_bearish,
+            bb_bearish
+        ])
+        
+        # Check if we have enough confirming indicators
+        bullish_mom = bullish_count >= required_indicators
+        bearish_mom = bearish_count >= required_indicators
+        
+        # Additional check for historical momentum consistency
+        # This helps ensure the momentum signal isn't just momentary
+        if bullish_mom or bearish_mom:
+            consistent = self._check_momentum_consistency(lookback, 
+                                                        bullish_mom, 
+                                                        bearish_mom)
+            if not consistent:
+                print("⚠️ Momentum not consistent over lookback period")
+                bullish_mom = bearish_mom = False
+        
+        # Log individual indicator statuses
         print(f"Momentum Analysis:")
-        print(f"  - MACD Histogram Mean: {macd_hist_mean:.6f} {'✅' if macd_hist_mean > 0 else '❌'} for bulls")
-        print(f"  - RSI Mean: {rsi_mean:.2f} {'✅' if rsi_mean > rsi_bullish else '❌'} for bulls, {'✅' if rsi_mean < rsi_bearish else '❌'} for bears")
-        print(f"  - Stochastic K vs D: {stoch_k:.2f} vs {stoch_d:.2f} {'✅' if stoch_k > stoch_d else '❌'} for bulls")
+        print(f"  - MACD Histogram Mean: {macd_hist_mean:.6f} {'✅' if macd_bullish else '❌'} for bulls")
+        print(f"  - RSI Mean: {rsi_mean:.2f} {'✅' if rsi_bullish_signal else '❌'} for bulls, {'✅' if rsi_bearish_signal else '❌'} for bears")
+        print(f"  - Stochastic K vs D: {stoch_k:.2f} vs {stoch_d:.2f} {'✅' if stoch_bullish else '❌'} for bulls")
+        print(f"  - Price vs EMA50: {last_close:.5f} vs {ema50_last:.5f} {'✅' if ema50_bullish else '❌'} for bulls")
+        print(f"  - Bollinger Position: {'Above Middle ✅' if bb_bullish else 'Below Middle ❌'} for bulls")
+        print(f"  - Indicator Count: {bullish_count}/{total_indicators} bullish, {bearish_count}/{total_indicators} bearish")
+        print(f"  - Requirement: {required_indicators}/{total_indicators} indicators needed")
         print(f"  - Overall Momentum: {'BULLISH ✅' if bullish_mom else ''} {'BEARISH ✅' if bearish_mom else ''} {'NEUTRAL ⚠️' if not (bullish_mom or bearish_mom) else ''}")
         
         return (bullish_mom, bearish_mom)
         
+    def _check_momentum_consistency(self, lookback, is_bullish, is_bearish):
+        """
+        Check if momentum is consistent over the lookback period.
+        
+        Args:
+            lookback (int): Number of periods to look back
+            is_bullish (bool): Current bullish momentum status
+            is_bearish (bool): Current bearish momentum status
+            
+        Returns:
+            bool: True if momentum is consistent with recent history
+        """
+        # Skip if we're not analyzing any particular momentum
+        if not (is_bullish or is_bearish):
+            return False
+            
+        # Get recent values from indicators
+        macd_hist = self.indicators['macd_hist'].tail(lookback+1)
+        rsi = self.indicators['rsi14'].tail(lookback+1)
+        
+        if is_bullish:
+            # For bullish momentum, check if:
+            # 1. MACD histogram trend is upward or positive
+            macd_positive_count = (macd_hist > 0).sum()
+            macd_uptrend = macd_positive_count >= (lookback / 2)
+            
+            # 2. RSI is trending up
+            rsi_diff = rsi.diff().dropna()
+            rsi_up_count = (rsi_diff > 0).sum()
+            rsi_uptrend = rsi_up_count >= (len(rsi_diff) / 2)
+            
+            # Need both conditions for consistency
+            consistent = macd_uptrend and rsi_uptrend
+            
+        elif is_bearish:
+            # For bearish momentum, check if:
+            # 1. MACD histogram trend is downward or negative
+            macd_negative_count = (macd_hist < 0).sum()
+            macd_downtrend = macd_negative_count >= (lookback / 2)
+            
+            # 2. RSI is trending down
+            rsi_diff = rsi.diff().dropna()
+            rsi_down_count = (rsi_diff < 0).sum()
+            rsi_downtrend = rsi_down_count >= (len(rsi_diff) / 2)
+            
+            # Need both conditions for consistency
+            consistent = macd_downtrend and rsi_downtrend
+            
+        else:
+            consistent = False
+            
+        print(f"  - Historical momentum {'consistent ✅' if consistent else 'inconsistent ❌'} over {lookback} periods")
+        return consistent
+        
+    def _calculate_trend_strength(self):
+        """
+        Calculate the trend strength based on multiple factors.
+        Returns a score between 0-1 where higher values indicate stronger trends.
+        """
+        try:
+            # Get key indicators for trend strength calculation
+            ema50 = self.indicators['ema50'].iloc[-20:]  # Last 20 values
+            ema200 = self.indicators['ema200'].iloc[-20:]
+            price = self.indicators['close'].iloc[-20:]  # Recent price movement
+            
+            # 1. Calculate EMA slope consistencies
+            ema50_changes = ema50.diff().dropna()
+            ema200_changes = ema200.diff().dropna()
+            
+            # Percentage of bars where slope is consistent with trend
+            if len(ema50_changes) > 0:
+                ema50_slope_consistency = len(ema50_changes[ema50_changes > 0]) / len(ema50_changes) \
+                    if self.entry_decision == 'long' else \
+                    len(ema50_changes[ema50_changes < 0]) / len(ema50_changes)
+            else:
+                ema50_slope_consistency = 0.5
+                
+            if len(ema200_changes) > 0:
+                ema200_slope_consistency = len(ema200_changes[ema200_changes > 0]) / len(ema200_changes) \
+                    if self.entry_decision == 'long' else \
+                    len(ema200_changes[ema200_changes < 0]) / len(ema200_changes)
+            else:
+                ema200_slope_consistency = 0.5
+            
+            # 2. Calculate price movement consistency with trend
+            price_changes = price.diff().dropna()
+            if len(price_changes) > 0:
+                price_consistency = len(price_changes[price_changes > 0]) / len(price_changes) \
+                    if self.entry_decision == 'long' else \
+                    len(price_changes[price_changes < 0]) / len(price_changes)
+            else:
+                price_consistency = 0.5
+            
+            # 3. Calculate EMA alignment strength (how far apart EMAs are)
+            ema_gap = (abs(ema50.iloc[-1] - ema200.iloc[-1]) / ema50.iloc[-1]) * 100  # Gap as % of price
+            # Normalize gap to 0-1 scale (larger gaps up to 2% of price get higher scores)
+            ema_gap_score = min(ema_gap / 2.0, 1.0)
+            
+            # 4. Calculate ADX-like trend strength using recent price movement
+            # (simplified approach - true ADX is more complex)
+            range_sum = 0
+            directional_movement = 0
+            for i in range(1, min(14, len(price))):
+                day_range = max(price.iloc[i] - price.iloc[i-1], 0) if self.entry_decision == 'long' \
+                    else max(price.iloc[i-1] - price.iloc[i], 0)
+                range_sum += abs(price.iloc[i] - price.iloc[i-1])
+                directional_movement += day_range
+            
+            dm_strength = directional_movement / range_sum if range_sum > 0 else 0.5
+            
+            # Combine factors with weightings
+            weights = {
+                'ema50_consistency': 0.25,
+                'ema200_consistency': 0.15,
+                'price_consistency': 0.30,
+                'ema_gap': 0.10,
+                'dm_strength': 0.20
+            }
+            
+            trend_strength = (
+                weights['ema50_consistency'] * ema50_slope_consistency +
+                weights['ema200_consistency'] * ema200_slope_consistency +
+                weights['price_consistency'] * price_consistency +
+                weights['ema_gap'] * ema_gap_score +
+                weights['dm_strength'] * dm_strength
+            )
+            
+            # Ensure trend strength is within 0-1 bounds
+            trend_strength = max(0.0, min(1.0, trend_strength))
+            
+            return trend_strength
+            
+        except Exception as e:
+            print(f"⚠️ Error calculating trend strength: {e}")
+            return 0.5  # Return neutral value on error
+            
+    def _check_price_position(self):
+        """
+        Check if price is in a good position for entry relative to moving averages.
+        Avoid entries when price has already moved too far from its average.
+        
+        Returns:
+            bool: True if price position is favorable for entry
+        """
+        try:
+            # Get relevant indicators
+            close = self.indicators['close'].iloc[-1]
+            ema21 = self.indicators['ema21'].iloc[-1]  # Medium-term EMA
+            atr = self.indicators['atr14'].iloc[-1]
+            
+            # Calculate distance as multiple of ATR
+            distance = abs(close - ema21) / atr
+            
+            # Get the maximum allowed distance based on config
+            max_distance = self.config['PRICE_DISTANCE_FACTOR'] * self.config['SL_ATR_MULT']
+            
+            # Check if price is not too extended
+            price_position_ok = distance <= max_distance
+            
+            if not price_position_ok:
+                print(f"⚠️ Price too far from EMA21: {distance:.2f} ATR (max: {max_distance:.2f} ATR)")
+            else:
+                print(f"✅ Price position ok: {distance:.2f} ATR from EMA21")
+                
+            return price_position_ok
+            
+        except Exception as e:
+            print(f"⚠️ Error checking price position: {e}")
+            return True  # Allow entry on error (fail-safe)
+    
     def _make_entry_decision(self):
         """
         Step 7: ENTRY DECISION
         Determine whether to enter a long position, short position, or skip.
+        Enhanced with trend strength and price position checks.
         
         Returns:
             str: 'long', 'short', or 'skip'
@@ -654,18 +933,92 @@ class AISlope1Strategy(BaseStrategy):
         # Get momentum confirmation
         bullish_mom, bearish_mom = self._confirm_momentum()
         
-        # Make entry decision
-        if trend == 'uptrend' and bullish_mom:
-            decision = 'long'
-            print("🔼 Entry Decision: LONG - Uptrend with bullish momentum")
-        elif trend == 'downtrend' and bearish_mom:
-            decision = 'short'
-            print("🔽 Entry Decision: SHORT - Downtrend with bearish momentum")
+        # Check if reversal trades are allowed
+        allow_reversal = self.config.get('ALLOW_REVERSAL_TRADES', False)
+        
+        # Log detailed decision reasoning
+        print("\n🔍 DECISION ANALYSIS:")
+        
+        # Check trend and momentum alignment for possible long entry
+        if trend == 'uptrend':
+            print("  - Uptrend detected ✅")
+            if bullish_mom:
+                print("  - Bullish momentum confirmed ✅")
+                print("  - TREND-MOMENTUM ALIGNMENT: Potentially valid LONG setup ✅")
+                self.entry_decision = 'long'
+            else:
+                print("  - Bullish momentum NOT confirmed ❌")
+                print("    → Needed: Bullish MACD, RSI > 55, Stochastic K>D, etc.")
+                print("    → Got: Not enough bullish indicators")
+                print("  - TREND-MOMENTUM MISMATCH: Uptrend with non-bullish momentum - NO TRADE ❌")
+                return 'skip'
+        # Check trend and momentum alignment for possible short entry
+        elif trend == 'downtrend':
+            print("  - Downtrend detected ✅")
+            if bearish_mom:
+                print("  - Bearish momentum confirmed ✅")
+                print("  - TREND-MOMENTUM ALIGNMENT: Potentially valid SHORT setup ✅")
+                self.entry_decision = 'short'
+            else:
+                print("  - Bearish momentum NOT confirmed ❌")
+                print("    → Needed: Negative MACD, RSI < 45, Stochastic K<D, etc.")
+                print("    → Got: Too many bullish indicators, not enough bearish ones")
+                print("  - TREND-MOMENTUM MISMATCH: Downtrend with bullish momentum")
+                
+                # Check if we should allow potential reversal trades
+                if allow_reversal and bullish_mom:
+                    print("    → POTENTIAL TREND REVERSAL DETECTED")
+                    print("    → REVERSAL TRADES ENABLED: Taking LONG trade against trend ⚠️")
+                    self.entry_decision = 'long'
+                else:
+                    print("    → This is a potential trend reversal signal, but we're avoiding it for safety")
+                    print("    → Waiting for momentum to align with trend direction")
+                    return 'skip'
+        # Neutral trend but potentially strong momentum
+        elif allow_reversal:
+            if bullish_mom:
+                print("  - Neutral trend with strong BULLISH momentum")
+                print("  - REVERSAL TRADES ENABLED: Taking LONG trade based on momentum only ⚠️")
+                self.entry_decision = 'long'
+            elif bearish_mom:
+                print("  - Neutral trend with strong BEARISH momentum")
+                print("  - REVERSAL TRADES ENABLED: Taking SHORT trade based on momentum only ⚠️")
+                self.entry_decision = 'short'
+            else:
+                print("  - Neutral trend with NO clear momentum - NO TRADE ❌")
+                return 'skip'
+        # Neutral trend - no trade (if reversal trades not allowed)
         else:
-            decision = 'skip'
-            print("⏹️ Entry Decision: SKIP - Conditions not optimal")
+            print("  - Neutral trend detected - NO TRADE ❌")
+            return 'skip'
             
-        return decision
+        # Now check trend strength
+        trend_strength = self._calculate_trend_strength()
+        min_strength = self.config['MIN_TREND_STRENGTH']
+        
+        print(f"  - Trend strength: {trend_strength:.2f} (minimum: {min_strength:.2f})")
+        if trend_strength < min_strength and not (allow_reversal and (bullish_mom or bearish_mom)):
+            print("  - Trend not strong enough - NO TRADE ❌")
+            return 'skip'
+            
+        # Check if price is in a good position for entry
+        if not self._check_price_position():
+            print("  - Price position unfavorable - NO TRADE ❌")
+            return 'skip'
+            
+        # All checks passed, confirm the entry decision
+        if self.entry_decision == 'long':
+            if trend == 'downtrend' and allow_reversal:
+                print("🔼 FINAL DECISION: LONG (REVERSAL TRADE) ⚠️")
+            else:
+                print("🔼 FINAL DECISION: LONG - Strong uptrend with bullish momentum ✅")
+        else:
+            if trend == 'uptrend' and allow_reversal:
+                print("🔽 FINAL DECISION: SHORT (REVERSAL TRADE) ⚠️")
+            else:
+                print("🔽 FINAL DECISION: SHORT - Strong downtrend with bearish momentum ✅")
+            
+        return self.entry_decision
         
     def _calculate_price_levels(self):
         """
@@ -713,6 +1066,7 @@ class AISlope1Strategy(BaseStrategy):
     def generate_entry_signal(self, open_positions=None):
         """
         Generates entry signals based on comprehensive market analysis.
+        Only makes decisions at the start of a new candle.
         
         Args:
             open_positions (list, optional): List of currently open positions
@@ -733,8 +1087,45 @@ class AISlope1Strategy(BaseStrategy):
             if time_diff < wait_time:
                 print(f"⏳ Waiting for {(wait_time - time_diff)/60:.1f} more minutes after last trade close")
                 return None
+        
+        # Check if we're at the beginning of a new candle
+        server_time = get_server_time()
+        current_candle_start, current_candle_end = get_candle_boundaries(server_time, self.timeframe)
+        time_since_candle_open = (server_time - current_candle_start).total_seconds()
+        candle_total_seconds = (current_candle_end - current_candle_start).total_seconds()
+        
+        # Only trade in the first 20% of the candle's total time
+        candle_entry_threshold = 0.2 * candle_total_seconds
+        if time_since_candle_open > candle_entry_threshold:
+            remaining = current_candle_end - server_time
+            # print(f"⏱️ TIMING: Too far into candle ({(time_since_candle_open/candle_total_seconds)*100:.1f}% elapsed). Next candle in {remaining.total_seconds()/60:.1f} min.")
+            return None
+        # else:
+            #print(f"⏱️ TIMING: Within entry window ({(time_since_candle_open/candle_total_seconds)*100:.1f}% of candle elapsed, max 20%) ✅")
+            
+        # Only proceed if this is a new candle we haven't processed yet
+        if self.last_processed_candle_time:
+            # Use strict comparison with candle boundaries
+            # Get the last processed candle's start time
+            last_candle_start, _ = get_candle_boundaries(self.last_processed_candle_time, self.timeframe)
+            
+            # Skip if we've already processed this candle
+            if current_candle_start <= last_candle_start:
+                # print(f"🔄 CANDLE: Already processed this candle - skipping.")
+                return None
+                
+            # Calculate minutes since candle opened
+            minutes_since_open = (server_time - current_candle_start).total_seconds() / 60
+            print(f"🔄 CANDLE: New candle detected at {current_candle_start} ✅")
+            
+        else:
+            # First run - just log the current candle time
+            print(f"🔄 CANDLE: Initial candle at {current_candle_start} - first run ✅")
             
         print("\n🔄 Starting AISlope1 analysis pipeline")
+        
+        # Update the last processed candle time
+        self.last_processed_candle_time = current_candle_start
             
         # Step 1-3: Run market analysis and prepare data
         if not self._run_market_analysis():
@@ -781,6 +1172,38 @@ class AISlope1Strategy(BaseStrategy):
         
         return signal_type, entry_price, sl_price, tp_price
         
+    def _get_current_candle_time(self):
+        """
+        Get the start time of the current candle.
+        
+        Returns:
+            datetime or None: Start time of the current candle, or None if error
+        """
+        try:
+            # Get the most recent candle
+            rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, 1)
+            if rates is None or len(rates) == 0:
+                print(f"⚠️ Could not get current candle data for {self.symbol}")
+                return None
+                
+            # Get the current server time for proper timezone reference
+            server_time = get_server_time()
+            
+            # Convert the timestamp to datetime using server timezone
+            candle_time = datetime.fromtimestamp(rates[0]['time'], tz=server_time.tzinfo)
+            
+            # Get the candle boundaries to ensure we're working with the candle start time
+            try:
+                candle_start, _ = get_candle_boundaries(candle_time, self.timeframe)
+                return candle_start
+            except Exception as e:
+                print(f"⚠️ Error getting candle boundaries: {e}. Using raw candle time.")
+                return candle_time
+                
+        except Exception as e:
+            print(f"❌ Error getting current candle time: {e}")
+            return None
+            
     def generate_exit_signal(self, position):
         """
         This strategy does not generate exit signals - relies on SL/TP.
@@ -799,9 +1222,15 @@ class AISlope1Strategy(BaseStrategy):
         Reset strategy internal state after position closing or failed orders.
         Also records the timestamp when a position was closed to prevent immediate reentry.
         """
-        # Record the time of the position close
+        # Record the time of the position close using server time
         self.last_trade_close_time = get_server_time()
         print(f"🕒 Position closed at {self.last_trade_close_time}. Waiting before new entry.")
+        
+        # Update the last processed candle time to the current candle
+        # This prevents immediate reentry within the same candle
+        current_candle_start, _ = get_candle_boundaries(self.last_trade_close_time, self.timeframe)
+        self.last_processed_candle_time = current_candle_start
+        print(f"🔄 Updated last processed candle to {current_candle_start}")
             
         # Call the parent class method to reset other state
         super().reset_signal_state() 

@@ -509,7 +509,7 @@ class RiskManager:
         return final_size
 
     @staticmethod
-    def calculate_dynamic_sltp(symbol_info, order_type, entry_price, atr_value=None):
+    def calculate_dynamic_sltp(symbol_info, order_type, entry_price, atr_value=None, sl_multiplier=None, tp_multiplier=None):
         """
         Calculate dynamic SL/TP levels based on ATR or fallback to fixed values.
         
@@ -518,6 +518,8 @@ class RiskManager:
             order_type (int): Order type (BUY/SELL)
             entry_price (float): Entry price for the trade
             atr_value (float, optional): Current ATR value. If None, will use fixed values.
+            sl_multiplier (float, optional): Custom SL ATR multiplier. If None, uses RISK_CONFIG.
+            tp_multiplier (float, optional): Custom TP ATR multiplier. If None, uses RISK_CONFIG.
             
         Returns:
             tuple: (sl_price, tp_price)
@@ -535,23 +537,24 @@ class RiskManager:
                 print("⚠️ Using fixed SL/TP values instead of ATR")
                 atr_value = RISK_CONFIG['FALLBACK_SL_POINTS'] * symbol_info.point
                 # Use the fixed multipliers for the fallback case
-                sl_multiplier = 1.0  # Use exactly the fallback value for SL
-                tp_multiplier = RISK_CONFIG['FALLBACK_TP_POINTS'] / RISK_CONFIG['FALLBACK_SL_POINTS']  # Calculate ratio
+                sl_mult = 1.0  # Use exactly the fallback value for SL
+                tp_mult = RISK_CONFIG['FALLBACK_TP_POINTS'] / RISK_CONFIG['FALLBACK_SL_POINTS']  # Calculate ratio
             else:
                 print(f"📊 Using ATR for SL/TP: {atr_value:.5f}")
-                # Use the ATR multipliers from config
-                sl_multiplier = RISK_CONFIG['ATR_SL_MULTIPLIER']
-                tp_multiplier = RISK_CONFIG['ATR_TP_MULTIPLIER']
+                # Use provided multipliers or fall back to RISK_CONFIG
+                sl_mult = sl_multiplier if sl_multiplier is not None else RISK_CONFIG['ATR_SL_MULTIPLIER']
+                tp_mult = tp_multiplier if tp_multiplier is not None else RISK_CONFIG['ATR_TP_MULTIPLIER']
+                print(f"📏 Using SL multiplier: {sl_mult:.2f}x, TP multiplier: {tp_mult:.2f}x")
             
             # Calculate SL/TP based on configured multipliers
             if order_type == mt5.ORDER_TYPE_BUY:
                 # For BUY: SL below entry, TP above entry
-                sl_price = entry_price - (sl_multiplier * atr_value)
-                tp_price = entry_price + (tp_multiplier * atr_value)
+                sl_price = entry_price - (sl_mult * atr_value)
+                tp_price = entry_price + (tp_mult * atr_value)
             else:  # SELL
                 # For SELL: SL above entry, TP below entry
-                sl_price = entry_price + (sl_multiplier * atr_value)
-                tp_price = entry_price - (tp_multiplier * atr_value)
+                sl_price = entry_price + (sl_mult * atr_value)
+                tp_price = entry_price - (tp_mult * atr_value)
             
             # Round to appropriate number of digits
             sl_price = round(sl_price, digits)
@@ -586,7 +589,7 @@ class RiskManager:
             # Log the SL/TP distances
             sl_distance = abs(entry_price - sl_price)
             tp_distance = abs(entry_price - tp_price)
-            print(f"📏 SL Distance: {sl_distance:.5f} ({sl_multiplier}x ATR), TP Distance: {tp_distance:.5f} ({tp_multiplier}x ATR)")
+            print(f"📏 SL Distance: {sl_distance:.5f} ({sl_mult}x ATR), TP Distance: {tp_distance:.5f} ({tp_mult}x ATR)")
             
             return sl_price, tp_price
             
@@ -610,7 +613,7 @@ class RiskManager:
 class TradeExecutor:
     """Handles trade execution and position management."""
     @staticmethod
-    def execute_trade(symbol, trade_action, volume, price, sl_price, tp_price, magic_number, deviation):
+    def execute_trade(symbol, trade_action, volume, price, sl_price, tp_price, magic_number, deviation, strategy=None):
         """
         Executes a market order with SL and TP directly included in the order.
         
@@ -628,6 +631,7 @@ class TradeExecutor:
             tp_price (float): Suggested take profit price (not used, calculated from entry)
             magic_number (int): Magic number for identification
             deviation (int): Maximum price deviation allowed
+            strategy (BaseStrategy, optional): Strategy instance to check for custom SL/TP settings
             
         Returns:
             int or None: Deal ticket if successful, None otherwise
@@ -672,10 +676,23 @@ class TradeExecutor:
             # For SELL orders, use bid price
             actual_entry_price = current_tick.bid
         
+        # Check for strategy-specific SL/TP ATR multipliers
+        sl_multiplier = None
+        tp_multiplier = None
+        
+        if strategy is not None and hasattr(strategy, 'config'):
+            # Check if strategy has its own SL/TP multipliers
+            sl_multiplier = strategy.config.get('SL_ATR_MULT')
+            tp_multiplier = strategy.config.get('TP_ATR_MULT')
+            
+            if sl_multiplier is not None and tp_multiplier is not None:
+                print(f"⚙️ Using strategy-specific settings: SL={sl_multiplier}x ATR, TP={tp_multiplier}x ATR")
+        
         # Calculate dynamic SL/TP based on ATR
         try:
             sl_price, tp_price = RiskManager.calculate_dynamic_sltp(
-                symbol_info, order_type, actual_entry_price, atr_value
+                symbol_info, order_type, actual_entry_price, atr_value,
+                sl_multiplier, tp_multiplier
             )
         except Exception as e:
             print(f"❌ Error calculating SL/TP levels: {e}")
@@ -936,7 +953,7 @@ def main():
                      # SL/TP calculation is handled inside the TradeExecutor.execute_trade method
                      deal_ticket = TradeExecutor.execute_trade(
                          args.symbol, signal_type, volume, entry_price, sl_price, tp_price,
-                         RISK_CONFIG['MAGIC_NUMBER'], RISK_CONFIG['DEVIATION']
+                         RISK_CONFIG['MAGIC_NUMBER'], RISK_CONFIG['DEVIATION'], strategy
                      )
                      
                      if deal_ticket:
