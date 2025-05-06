@@ -36,7 +36,7 @@ AI_SLOP_CONFIG = {
     'RSI_BEARISH_THRESHOLD': 45,    # RSI below this is bearish
     
     # Data Analysis
-    'TIMEFRAME': 'M5',              # Timeframe to use for analysis
+    'TIMEFRAME': 'M1',              # Default timeframe to use for analysis (changed to M1)
     'ANALYSIS_HOURS': 24,           # Hours of data to analyze
     'TEMP_DATA_DIR': 'temp_data'    # Directory for temporary data files
 }
@@ -53,6 +53,10 @@ class AISlope1Strategy(BaseStrategy):
         
         # Merge provided config with default config
         self.config = {**AI_SLOP_CONFIG, **(strategy_config or {})}
+        
+        # The timeframe passed from generic_trader is stored in self.timeframe
+        # It's an MT5 constant like mt5.TIMEFRAME_M1, mt5.TIMEFRAME_M5, etc.
+        # The config contains a string version just for display purposes
         
         # State variables
         self.last_trade_close_time = None
@@ -278,16 +282,22 @@ class AISlope1Strategy(BaseStrategy):
             temp_csv = os.path.join(self.config['TEMP_DATA_DIR'], 
                                    f"{self.symbol}_{timestamp}_analysis.csv")
             
-            # Map timeframe string to MT5 constant
-            timeframe_map = {
-                "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
-                "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
-                "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, 
-                "D1": mt5.TIMEFRAME_D1
+            # Convert MT5 timeframe constant to string for display purposes
+            timeframe_str_map = {
+                mt5.TIMEFRAME_M1: "M1",
+                mt5.TIMEFRAME_M5: "M5",
+                mt5.TIMEFRAME_M15: "M15",
+                mt5.TIMEFRAME_M30: "M30",
+                mt5.TIMEFRAME_H1: "H1",
+                mt5.TIMEFRAME_H4: "H4",
+                mt5.TIMEFRAME_D1: "D1"
             }
-            timeframe = timeframe_map.get(self.config['TIMEFRAME'], mt5.TIMEFRAME_M5)
+            timeframe_str = timeframe_str_map.get(self.timeframe, "M1")
             
-            # Calculate candles to fetch
+            # Use the timeframe constant passed from generic_trader
+            timeframe = self.timeframe  # Use MT5 timeframe constant from parent
+            
+            # Calculate candles to fetch based on analysis hours
             hours = self.config['ANALYSIS_HOURS']
             if timeframe == mt5.TIMEFRAME_M1:
                 candles_per_hour = 60
@@ -305,8 +315,8 @@ class AISlope1Strategy(BaseStrategy):
             num_candles = int(hours * candles_per_hour)
             num_candles = max(num_candles, 250)  # Ensure enough for indicators
             
-            print(f"📊 Running market analysis for {self.symbol} ({self.config['TIMEFRAME']}, {self.config['ANALYSIS_HOURS']}h)...")
-            print(f"📈 Fetching {num_candles} {self.config['TIMEFRAME']} candles for {self.symbol}...")
+            print(f"📊 Running market analysis for {self.symbol} ({timeframe_str}, {self.config['ANALYSIS_HOURS']}h)...")
+            print(f"📈 Fetching {num_candles} {timeframe_str} candles for {self.symbol}...")
                 
             # Use existing MT5 connection to get data (no initialize/shutdown)
             rates = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, num_candles)
