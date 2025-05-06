@@ -1,0 +1,20 @@
+
+Column Name Descriptions:
+------------------------
+* Open/High/Low/Close Price: Standard price data for each candle
+* EMA (X): Exponential Moving Average with X periods, shows trend direction
+* MACD Line: Moving Average Convergence/Divergence trend-following momentum indicator
+* MACD Signal Line: 9-period EMA of MACD Line, used for crossover signals
+* MACD Histogram: Difference between MACD Line and Signal Line
+* RSI: Relative Strength Index, shows overbought/oversold conditions (>70=overbought, <30=oversold)
+* ATR: Average True Range, measures volatility
+* Bollinger Bands: Price channels based on standard deviation from SMA
+* Stochastic %K/%D: Momentum oscillator comparing close price to high/low range
+* Candle Direction: Whether the candle closed up or down from previous
+* Crossover Signals: Values of 1 (buy), -1 (sell), or 0 (no signal) based on indicator crossovers
+* Trend vs EMA200: Shows if price is above (1) or below (-1) the 200 EMA
+
+
+Summary Statistics:
+Analysis Time,Symbol,Timeframe,Hours Analyzed,Number of Candles,Starting Price,Ending Price,Price Change,Price Change (%),Number of Price Legs,Average Leg Size,Maximum Leg Size,Minimum Leg Size,Average ATR,ATR as % of Price,Suggested Stop Loss,Suggested Take Profit,SL as % of Price,TP as % of Price
+2025-05-05 16:13:11.134176,BTCUSD,M1,24,1440,94759.45,95054.32,294.8700000000099,0.3111774076358653,715,38.291832167832254,357.52999999999884,0.010000000009313226,46.994094785018284,0.049439199380962674,58.74261848127286,93.98818957003657,0.06179899922620335,0.09887839876192535

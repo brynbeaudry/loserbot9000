@@ -23,6 +23,11 @@ SIGNAL_FILTERS = {
     'LOOKBACK_CANDLES': 3,  # Number of recent candles to check for crossover
 }
 
+# EMA Strategy Configuration
+EMA_STRATEGY_CONFIG = {
+    'USE_EMA_EXIT_SIGNALS': False,  # Toggle for EMA-based exit signals (disabled by default)
+}
+
 class EMAStrategy(BaseStrategy):
     """Implementation of EMA crossover strategy compatible with generic_trader framework"""
     
@@ -350,8 +355,7 @@ class EMAStrategy(BaseStrategy):
     
     def generate_exit_signal(self, position):
         """
-        Checks if an existing position should be closed based on EMA crossover logic.
-        This will close a position when the EMAs cross in the opposite direction.
+        Generate exit signals based on EMA crossover logic if enabled in configuration.
         
         Args:
             position (mt5.PositionInfo): The open position object to evaluate
@@ -359,6 +363,16 @@ class EMAStrategy(BaseStrategy):
         Returns:
             bool: True if the position should be closed, False otherwise
         """
+        # Check if EMA exit signals are enabled in configuration
+        # First check instance config, fall back to global config
+        use_ema_exit = EMA_STRATEGY_CONFIG['USE_EMA_EXIT_SIGNALS']
+        
+        # If EMA exit signals are disabled, always return False
+        if not use_ema_exit:
+            # Exit signals disabled - positions will be managed by their SL/TP levels
+            return False
+            
+        # If EMA exit signals are enabled, use the original EMA crossover logic
         if self.data.empty or len(self.data) < 2:
             return False
             

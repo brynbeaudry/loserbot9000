@@ -21,6 +21,8 @@ ACCOUNT_CONFIG = {
 STRATEGY_MAPPING = {
     'ec': 'strategies.ema_strategy.EMAStrategy',      # EMA Crossover
     'ema': 'strategies.ema_strategy.EMAStrategy',     # Alternative alias
+    'ai1': 'strategies.ai_slop_1.AISlope1Strategy',   # AI Slope Strategy v1
+    'ai_slop_1': 'strategies.ai_slop_1.AISlope1Strategy'  # Full name alias
 }
 
 # Core Trader Configuration
@@ -790,6 +792,8 @@ def parse_arguments():
                        help='Strategy to use (e.g., "ec" for EMA Crossover or full Python path to strategy class)')
     parser.add_argument('--volume', type=float, default=0.01,
                        help='Fixed volume/lot size to trade (default: 0.01)')
+    parser.add_argument('--config', type=str, default=None,
+                       help='JSON string with strategy configuration parameters (e.g., \'{"SL_ATR_MULT": 2.0}\')')
     # Add more arguments as needed (e.g., config file path)
     return parser.parse_args()
 
@@ -815,6 +819,17 @@ def main():
     """Main trading loop."""
     args = parse_arguments()
     fixed_volume = args.volume  # Use the fixed volume from command line
+    
+    # Parse strategy config from JSON if provided
+    strategy_config = {}
+    if args.config:
+        try:
+            import json
+            strategy_config = json.loads(args.config)
+            print(f"📝 Loaded strategy config: {strategy_config}")
+        except json.JSONDecodeError as e:
+            print(f"❌ Error parsing config JSON: {e}")
+            return
 
     if not MT5Helper.initialize_mt5(): return
     if not MT5Helper.check_autotrading_enabled(): MT5Helper.shutdown(); return
@@ -829,8 +844,7 @@ def main():
     StrategyClass = load_strategy_class(args.strategy)
     if StrategyClass is None: MT5Helper.shutdown(); return
 
-    # TODO: Load strategy-specific config from file or args if needed
-    strategy_config = {} # Example: Load from json file based on strategy name/args
+    # Initialize strategy with the provided config
     strategy = StrategyClass(args.symbol, CORE_CONFIG['TIMEFRAME'], symbol_info, strategy_config)
     print(f"📈 Strategy Loaded: {args.strategy}")
     print(f"💰 Fixed Volume: {args.volume} lots | Balance: ${account_info.balance:.2f}")
