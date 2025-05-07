@@ -21,8 +21,8 @@ ACCOUNT_CONFIG = {
 STRATEGY_MAPPING = {
     'ec': 'strategies.ema_strategy.EMAStrategy',      # EMA Crossover
     'ema': 'strategies.ema_strategy.EMAStrategy',     # Alternative alias
-    'ai1': 'strategies.ai_slop_1.AISlope1Strategy',   # AI Slope Strategy v1
-    'ai_slop_1': 'strategies.ai_slop_1.AISlope1Strategy'  # Full name alias
+    'ai_slop_1': 'strategies.ai_slop_1.AISlope1Strategy',  # Full name alias
+    'ai_slop_2': 'strategies.ai_slop_2.AISlope2Strategy'  # Full name alias
 }
 
 # Core Trader Configuration
@@ -377,72 +377,87 @@ class DataFetcher:
             
             # If we can't identify the symbol, raise an error
             raise ValueError(f"Cannot determine point value for symbol {symbol_name}. Symbol info lacks 'point' attribute.")
-    
+
     @staticmethod
     def get_historical_data(symbol, timeframe, count):
+        """Safely retrieve historical data from MT5 with error handling"""
         try:
-            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
-            if rates is None or len(rates) == 0:
-                print(f"❌ Failed to get historical data for {symbol} ({timeframe}): {mt5.last_error()}")
+            # Limit count to a safe maximum to avoid MT5 errors
+            MAX_SAFE_BARS = 1000
+            if count > MAX_SAFE_BARS:
+                print(f"⚠️ Limiting data request from {count} to {MAX_SAFE_BARS} bars to avoid MT5 errors")
+                count = MAX_SAFE_BARS
+            
+            # Attempt to get data from MT5
+            try:
+                rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+                if rates is None or len(rates) == 0:
+                    err_code, err_msg = mt5.last_error()
+                    print(f"❌ Failed to get historical data for {symbol} ({timeframe}): Error {err_code}: {err_msg}")
+                    return None
+            except Exception as e:
+                print(f"❌ MT5 data retrieval error: {e}")
+                print(f"⚠️ Make sure {symbol} is available in your MT5 terminal and has sufficient history")
                 return None
-
+            
+            # Process the data
             df = pd.DataFrame(rates)
-            # Convert MT5 timestamp (seconds since epoch) to datetime objects (UTC)
             df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-            df.set_index('time', inplace=True) # Set time as index for easier slicing
-
-            # Dynamically calculate and add indicators based on config
+            df.set_index('time', inplace=True)
+            
+            # Add indicators if data is valid
             if not df.empty:
                 for indicator_conf in INDICATOR_CONFIG:
-                    input_col_name = indicator_conf.get('input_col', 'close') # Default to 'close'
-                    output_col_name = indicator_conf['name']
-                    calc_function = indicator_conf['function']
-                    params = indicator_conf.get('params', {})
-                    output_cols = indicator_conf.get('output_cols') # Check for multiple output cols
-
                     try:
-                        # Special case for indicators that need the full DataFrame (like ATR)
+                        # Get indicator parameters
+                        input_col_name = indicator_conf.get('input_col', 'close')
+                        output_col_name = indicator_conf['name']
+                        calc_function = indicator_conf['function']
+                        params = indicator_conf.get('params', {})
+                        output_cols = indicator_conf.get('output_cols')
+                        
+                        # Calculate indicators based on type
                         if input_col_name is None or input_col_name == 'ohlc':
-                            # Pass the full DataFrame to the calculation function
+                            # Full DataFrame indicators (like ATR)
                             if output_cols:
-                                # Function returns a DataFrame with multiple columns
                                 indicator_df = calc_function(df, **params)
                                 df = df.join(indicator_df, how='left')
                             else:
-                                # Function returns a single Series
                                 df[output_col_name] = calc_function(df, **params)
                         elif input_col_name in df.columns:
-                            # Standard case - pass a single column
+                            # Single column indicators
                             input_series = df[input_col_name]
                             if output_cols:
-                                # Function returns a DataFrame with multiple columns
                                 indicator_df = calc_function(input_series, **params)
                                 df = df.join(indicator_df, how='left')
                             else:
-                                # Function returns a single Series
                                 df[output_col_name] = calc_function(input_series, **params)
                         else:
+                            # Handle missing input column
                             print(f"⚠️ Input column '{input_col_name}' not found for indicator '{output_col_name}'. Skipping.")
-                            # Ensure all expected output columns exist, even if NaN
                             if output_cols:
                                 for col in output_cols:
                                     df[col] = np.nan
                             else:
                                 df[output_col_name] = np.nan
                     except Exception as e:
+                        # Handle indicator calculation errors
                         print(f"❌ Error calculating indicator '{output_col_name}': {e}")
-                        # Add NaN column(s) on error
                         if output_cols:
                             for col in output_cols:
                                 df[col] = np.nan
                         else:
                             df[output_col_name] = np.nan
             else:
-                 print("⚠️ DataFrame is empty, cannot calculate indicators.")
-
+                print("⚠️ DataFrame is empty, cannot calculate indicators.")
+                
             return df
+            
         except Exception as e:
-            print(f"Exception in get_historical_data: {e}")
+            # Handle any other unexpected errors
+            print(f"❌ Exception in get_historical_data: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     @staticmethod
@@ -490,7 +505,7 @@ class RiskManager:
 
         # Simple calculation: position size = risk amount / risk per contract
         position_size = risk_amount / price_risk_per_contract
-        
+
         # Ensure volume step and limits
         volume_step = getattr(symbol_info, 'volume_step', 0.01)  # Default to 0.01 if not present
         volume_min = getattr(symbol_info, 'volume_min', 0.01)    # Default to 0.01 if not present  
@@ -715,11 +730,11 @@ class TradeExecutor:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-        
+
         # Send the order
         print(f"▶️ Sending {('BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL')} order with SL/TP")
         result = mt5.order_send(request)
-        
+
         # Handle result
         if result is None:
             print(f"❌ Order Send Failed (None result): {mt5.last_error()}")
@@ -932,9 +947,9 @@ def main():
                      # Get the symbol info for formatting
                      symbol_info = DataFetcher.get_symbol_info(args.symbol)
                      if symbol_info is None:
-                         print("❌ Failed to get symbol info")
-                         continue
-                         
+                        print("❌ Failed to get symbol info")
+                        continue
+
                      # Use fixed volume from command line arguments
                      volume = fixed_volume
                      

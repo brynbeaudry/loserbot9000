@@ -17,17 +17,25 @@ except ImportError:
 AI_SLOP_CONFIG = {
     # Risk and Money Management
     'RISK_PERCENT': 0.01,           # 1% risk per trade
-    'SL_ATR_MULT': 8.0,             # Stop loss multiplier of ATR (increased from 2.0 to 3.0 for more breathing room)
-    'TP_ATR_MULT': 16.0,             # Take profit multiplier of ATR (increased to maintain 1:2 risk/reward)
+    'SL_ATR_MULT': 2.0,             # Stop loss multiplier of ATR
+    'TP_ATR_MULT': 4.0,            # Take profit multiplier of ATR
     
     # Filter Thresholds
     'MAX_SPREAD_POINTS': 2000,      # Maximum allowed spread in points (increased for crypto)
     'MAX_VOLATILITY_PERCENT': 0.75, # Maximum allowed ATR as % of price
     'MIN_VOLUME_QUANTILE': 0.1,     # Minimum volume quantile threshold (lowered for crypto)
     
+    # EMA Configuration
+    'LONG_EMA_PERIOD': 100,         # Period for the long-term EMA (e.g. 200, 100)
+    'MEDIUM_EMA_PERIOD': 25,        # Period for the medium-term EMA
+    'FAST_EMA_PERIOD': 13,          # Period for the fast EMA
+    'FASTER_EMA_PERIOD': 8,        # Period for the faster EMA
+    'FASTEST_EMA_PERIOD': 5,        # Period for the fastest EMA
+    'ULTRA_FAST_EMA_PERIOD': 3,     # Period for the ultra-fast EMA
+    
     # Technical Parameters
-    'EMA200_SLOPE_LOOKBACK': 50,    # Bars to measure EMA200 slope
-    'EMA50_SLOPE_LOOKBACK': 20,     # Bars to measure EMA50 slope
+    'LONG_EMA_SLOPE_LOOKBACK': 50,  # Bars to measure long-term EMA slope
+    'MEDIUM_EMA_SLOPE_LOOKBACK': 20,# Bars to measure medium-term EMA slope
     'MACD_HIST_MEAN_WINDOW': 5,     # Bars for MACD histogram mean
     'RSI_MEAN_WINDOW': 5,           # Bars for RSI mean
     
@@ -86,7 +94,28 @@ class AISlope1Strategy(BaseStrategy):
         
     def get_required_data_count(self):
         """Return the minimum number of candles needed for this strategy"""
-        return 250  # Need enough data for EMA200 and other indicators
+        # Ensure we have enough data for the longest EMA plus a buffer
+        longest_ema = max(
+            self.config['LONG_EMA_PERIOD'],
+            self.config['MEDIUM_EMA_PERIOD'],
+            self.config['FAST_EMA_PERIOD'],
+            self.config['FASTER_EMA_PERIOD'],
+            self.config['FASTEST_EMA_PERIOD'],
+            self.config['ULTRA_FAST_EMA_PERIOD']
+        )
+        
+        # Calculate required bars with a safety factor
+        required_bars = int(longest_ema * 1.5)
+        
+        # Set a reasonable maximum to avoid MT5 data retrieval errors
+        # MT5 may have limits on how much historical data can be retrieved at once
+        MAX_SAFE_BARS = 1000
+        
+        if required_bars > MAX_SAFE_BARS:
+            print(f"⚠️ Limiting data request from {required_bars} to {MAX_SAFE_BARS} bars to avoid MT5 errors")
+            required_bars = MAX_SAFE_BARS
+            
+        return required_bars
     
     def calculate_indicators(self):
         """Indicators are loaded from the analysis data or calculated on demand"""
@@ -328,15 +357,39 @@ class AISlope1Strategy(BaseStrategy):
                 candles_per_hour = 1  # Default fallback
                 
             num_candles = int(hours * candles_per_hour)
-            num_candles = max(num_candles, 250)  # Ensure enough for indicators
+            
+            # Ensure we have enough candles for the longest EMA
+            longest_ema = max(
+                self.config['LONG_EMA_PERIOD'],
+                self.config['MEDIUM_EMA_PERIOD'],
+                self.config['FAST_EMA_PERIOD'],
+                self.config['FASTER_EMA_PERIOD'],
+                self.config['FASTEST_EMA_PERIOD'],
+                self.config['ULTRA_FAST_EMA_PERIOD']
+            )
+            
+            # Calculate required candles with safety buffer
+            required_candles = int(longest_ema * 2)  # Double the longest EMA for safety
+            
+            # Set a maximum limit to avoid MT5 errors
+            MAX_SAFE_BARS = 1000
+            
+            # Use the larger of time-based or EMA-based requirements, but cap at maximum
+            num_candles = min(max(num_candles, required_candles), MAX_SAFE_BARS)
             
             print(f"📊 Running market analysis for {self.symbol} ({timeframe_str}, {self.config['ANALYSIS_HOURS']}h)...")
             print(f"📈 Fetching {num_candles} {timeframe_str} candles for {self.symbol}...")
                 
             # Use existing MT5 connection to get data (no initialize/shutdown)
-            rates = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, num_candles)
-            if rates is None or len(rates) == 0:
-                print(f"❌ Failed to get data for {self.symbol}: {mt5.last_error()}")
+            try:
+                rates = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, num_candles)
+                if rates is None or len(rates) == 0:
+                    err_code, err_msg = mt5.last_error()
+                    print(f"❌ Failed to get data for {self.symbol}: Error {err_code}: {err_msg}")
+                    return False
+            except Exception as e:
+                print(f"❌ Exception getting historical data: {e}")
+                print(f"⚠️ Make sure {self.symbol} is available in your MT5 terminal and has sufficient history")
                 return False
                 
             # Create dataframe and calculate indicators
@@ -349,13 +402,21 @@ class AISlope1Strategy(BaseStrategy):
             # Calculate indicators using our own methods
             print("🧮 Calculating technical indicators...")
             
-            # EMAs
-            df['ema_5'] = self._calculate_ema(df['close'], 5)
-            df['ema_8'] = self._calculate_ema(df['close'], 8)
-            df['ema_13'] = self._calculate_ema(df['close'], 13)
-            df['ema_21'] = self._calculate_ema(df['close'], 21)
-            df['ema_50'] = self._calculate_ema(df['close'], 50)
-            df['ema_200'] = self._calculate_ema(df['close'], 200)
+            # Get EMA periods from config
+            ultra_fast_ema = self.config['ULTRA_FAST_EMA_PERIOD']
+            fastest_ema = self.config['FASTEST_EMA_PERIOD']
+            faster_ema = self.config['FASTER_EMA_PERIOD']
+            fast_ema = self.config['FAST_EMA_PERIOD']
+            medium_ema = self.config['MEDIUM_EMA_PERIOD']
+            long_ema = self.config['LONG_EMA_PERIOD']
+            
+            # EMAs with configurable periods
+            df[f'ema_{ultra_fast_ema}'] = self._calculate_ema(df['close'], ultra_fast_ema)
+            df[f'ema_{fastest_ema}'] = self._calculate_ema(df['close'], fastest_ema)
+            df[f'ema_{faster_ema}'] = self._calculate_ema(df['close'], faster_ema)
+            df[f'ema_{fast_ema}'] = self._calculate_ema(df['close'], fast_ema)
+            df[f'ema_{medium_ema}'] = self._calculate_ema(df['close'], medium_ema)
+            df[f'ema_{long_ema}'] = self._calculate_ema(df['close'], long_ema)
             
             # MACD
             macd_df = self._calculate_macd(df['close'])
@@ -397,6 +458,8 @@ class AISlope1Strategy(BaseStrategy):
             return True
         except Exception as e:
             print(f"❌ Error running market analysis: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def _load_analysis_data(self, csv_path):
@@ -438,14 +501,22 @@ class AISlope1Strategy(BaseStrategy):
         
         df = self.analysis_data
         
+        # Get EMA periods from config
+        ultra_fast_ema = self.config['ULTRA_FAST_EMA_PERIOD']
+        fastest_ema = self.config['FASTEST_EMA_PERIOD']
+        faster_ema = self.config['FASTER_EMA_PERIOD']
+        fast_ema = self.config['FAST_EMA_PERIOD']
+        medium_ema = self.config['MEDIUM_EMA_PERIOD']
+        long_ema = self.config['LONG_EMA_PERIOD']
+        
         # Map of indicator names to their readable column names from market_analyzer
         indicator_map = {
-            'ema5': 'EMA (5) - Fast Exponential Moving Average',
-            'ema8': 'EMA (8) - Short-term Trend',
-            'ema13': 'EMA (13) - Medium-term Trend',
-            'ema21': 'EMA (21) - Intermediate Trend',
-            'ema50': 'EMA (50) - Medium-Long Trend',
-            'ema200': 'EMA (200) - Long-term Trend',
+            f'ema{ultra_fast_ema}': f'EMA ({ultra_fast_ema}) - Ultra-Fast Exponential Moving Average',
+            f'ema{fastest_ema}': f'EMA ({fastest_ema}) - Fastest-term Trend',
+            f'ema{faster_ema}': f'EMA ({faster_ema}) - Faster-term Trend',
+            f'ema{fast_ema}': f'EMA ({fast_ema}) - Fast-term Trend',
+            f'ema{medium_ema}': f'EMA ({medium_ema}) - Medium-term Trend',
+            f'ema{long_ema}': f'EMA ({long_ema}) - Long-term Trend',
             'rsi14': 'RSI (14) - Relative Strength Index',
             'macd_hist': 'MACD Histogram',
             'atr14': 'ATR (14) - Average True Range',
@@ -472,18 +543,18 @@ class AISlope1Strategy(BaseStrategy):
                 self.indicators[key] = df[col_name]
             else:
                 # If not, calculate it based on the key
-                if key == 'ema5':
-                    self.indicators[key] = self._calculate_ema(df['close'], 5)
-                elif key == 'ema8':
-                    self.indicators[key] = self._calculate_ema(df['close'], 8)
-                elif key == 'ema13':
-                    self.indicators[key] = self._calculate_ema(df['close'], 13)
-                elif key == 'ema21':
-                    self.indicators[key] = self._calculate_ema(df['close'], 21)
-                elif key == 'ema50':
-                    self.indicators[key] = self._calculate_ema(df['close'], 50)
-                elif key == 'ema200':
-                    self.indicators[key] = self._calculate_ema(df['close'], 200)
+                if key == f'ema{ultra_fast_ema}':
+                    self.indicators[key] = self._calculate_ema(df['close'], ultra_fast_ema)
+                elif key == f'ema{fastest_ema}':
+                    self.indicators[key] = self._calculate_ema(df['close'], fastest_ema)
+                elif key == f'ema{faster_ema}':
+                    self.indicators[key] = self._calculate_ema(df['close'], faster_ema)
+                elif key == f'ema{fast_ema}':
+                    self.indicators[key] = self._calculate_ema(df['close'], fast_ema)
+                elif key == f'ema{medium_ema}':
+                    self.indicators[key] = self._calculate_ema(df['close'], medium_ema)
+                elif key == f'ema{long_ema}':
+                    self.indicators[key] = self._calculate_ema(df['close'], long_ema)
                 elif key == 'rsi14':
                     # Use our internal calculation method
                     self.indicators[key] = self._calculate_rsi(df['close'])
@@ -517,6 +588,10 @@ class AISlope1Strategy(BaseStrategy):
                         print(f"⚠️ Warning: Could not find or calculate indicator '{key}'")
                         self.indicators[key] = pd.Series(index=df.index, dtype='float64')
         
+        # Ensure compatibility with other methods by creating aliases for common EMA references
+        self.indicators['ema50'] = self.indicators[f'ema{medium_ema}']
+        self.indicators['ema200'] = self.indicators[f'ema{long_ema}']
+        
         print("✅ Indicators prepared")
         return True
         
@@ -530,21 +605,29 @@ class AISlope1Strategy(BaseStrategy):
             return False
             
         # Get lookback parameters from config
-        ema200_lookback = self.config['EMA200_SLOPE_LOOKBACK']
-        ema50_lookback = self.config['EMA50_SLOPE_LOOKBACK']
+        long_ema_lookback = self.config['LONG_EMA_SLOPE_LOOKBACK']
+        medium_ema_lookback = self.config['MEDIUM_EMA_SLOPE_LOOKBACK']
         macd_window = self.config['MACD_HIST_MEAN_WINDOW']
         rsi_window = self.config['RSI_MEAN_WINDOW']
         
+        # Get EMA periods from config
+        medium_ema = self.config['MEDIUM_EMA_PERIOD']
+        long_ema = self.config['LONG_EMA_PERIOD']
+        
         # Calculate slopes and means
         self.derived_metrics = {
-            'ema200_slope50': self.indicators['ema200'].diff(ema200_lookback).iloc[-1] / ema200_lookback,
-            'ema50_slope20': self.indicators['ema50'].diff(ema50_lookback).iloc[-1] / ema50_lookback,
+            'long_ema_slope': self.indicators[f'ema{long_ema}'].diff(long_ema_lookback).iloc[-1] / long_ema_lookback,
+            'medium_ema_slope': self.indicators[f'ema{medium_ema}'].diff(medium_ema_lookback).iloc[-1] / medium_ema_lookback,
             'macd_hist_mean5': self.indicators['macd_hist'].tail(macd_window).mean(),
             'rsi_mean5': self.indicators['rsi14'].tail(rsi_window).mean(),
             'stoch_k_last': self.indicators['stoch_k'].iloc[-1],
             'stoch_d_last': self.indicators['stoch_d'].iloc[-1],
             'atr_percent': self.indicators['atr_percent'].iloc[-1]
         }
+        
+        # Create compatible aliases for existing methods
+        self.derived_metrics['ema200_slope50'] = self.derived_metrics['long_ema_slope']
+        self.derived_metrics['ema50_slope20'] = self.derived_metrics['medium_ema_slope']
         
         print("✅ Derived metrics calculated")
         return True
@@ -602,27 +685,31 @@ class AISlope1Strategy(BaseStrategy):
         Returns:
             str: 'uptrend', 'downtrend', or 'neutral'
         """
+        # Get EMA periods from config
+        medium_ema = self.config['MEDIUM_EMA_PERIOD']
+        long_ema = self.config['LONG_EMA_PERIOD']
+        
         # Get latest values and slopes
-        ema50_last = self.indicators['ema50'].iloc[-1]
-        ema200_last = self.indicators['ema200'].iloc[-1]
-        ema200_slope = self.derived_metrics['ema200_slope50']
-        ema50_slope = self.derived_metrics['ema50_slope20']
+        medium_ema_last = self.indicators[f'ema{medium_ema}'].iloc[-1]
+        long_ema_last = self.indicators[f'ema{long_ema}'].iloc[-1]
+        long_ema_slope = self.derived_metrics['long_ema_slope']
+        medium_ema_slope = self.derived_metrics['medium_ema_slope']
         
         # Detailed trend analysis for logging
         print("\n📈 TREND ANALYSIS DETAILS:")
-        print(f"  - EMA50 ({ema50_last:.5f}) vs EMA200 ({ema200_last:.5f}): {'ABOVE ✅' if ema50_last > ema200_last else 'BELOW ❌'}")
-        print(f"  - EMA200 Slope: {ema200_slope:.8f} ({'RISING ✅' if ema200_slope > 0 else 'FALLING ❌'})")
-        print(f"  - EMA50 Slope: {ema50_slope:.8f} ({'RISING ✅' if ema50_slope > 0 else 'FALLING ❌'})")
+        print(f"  - EMA{medium_ema} ({medium_ema_last:.5f}) vs EMA{long_ema} ({long_ema_last:.5f}): {'ABOVE ✅' if medium_ema_last > long_ema_last else 'BELOW ❌'}")
+        print(f"  - EMA{long_ema} Slope: {long_ema_slope:.8f} ({'RISING ✅' if long_ema_slope > 0 else 'FALLING ❌'})")
+        print(f"  - EMA{medium_ema} Slope: {medium_ema_slope:.8f} ({'RISING ✅' if medium_ema_slope > 0 else 'FALLING ❌'})")
         
         # Classify trend based on EMA relationship and slope
         uptrend_conditions = [
-            ema50_last > ema200_last,
-            ema200_slope > 0
+            medium_ema_last > long_ema_last,
+            long_ema_slope > 0
         ]
         
         downtrend_conditions = [
-            ema50_last < ema200_last,
-            ema200_slope < 0
+            medium_ema_last < long_ema_last,
+            long_ema_slope < 0
         ]
         
         # Count how many conditions are met
@@ -631,10 +718,10 @@ class AISlope1Strategy(BaseStrategy):
         
         if uptrend_score == 2:
             trend = 'uptrend'
-            print(f"  - STRONG UPTREND: EMA50 > EMA200 and EMA200 rising")
+            print(f"  - STRONG UPTREND: EMA{medium_ema} > EMA{long_ema} and EMA{long_ema} rising")
         elif downtrend_score == 2:
             trend = 'downtrend'
-            print(f"  - STRONG DOWNTREND: EMA50 < EMA200 and EMA200 falling")
+            print(f"  - STRONG DOWNTREND: EMA{medium_ema} < EMA{long_ema} and EMA{long_ema} falling")
         elif uptrend_score > downtrend_score:
             trend = 'uptrend'
             print(f"  - WEAK UPTREND: Not all conditions met")
@@ -665,7 +752,8 @@ class AISlope1Strategy(BaseStrategy):
         
         # Get latest prices and indicators
         last_close = self.indicators['close'].iloc[-1]
-        ema50_last = self.indicators['ema50'].iloc[-1]
+        medium_ema = self.config['MEDIUM_EMA_PERIOD']
+        medium_ema_last = self.indicators[f'ema{medium_ema}'].iloc[-1]
         bb_upper = self.indicators['bb_upper'].iloc[-1]
         bb_lower = self.indicators['bb_lower'].iloc[-1]
         bb_middle = (bb_upper + bb_lower) / 2
@@ -689,9 +777,9 @@ class AISlope1Strategy(BaseStrategy):
         stoch_bullish = stoch_k > stoch_d
         stoch_bearish = stoch_k < stoch_d
         
-        # 4. Price vs EMA50
-        ema50_bullish = last_close > ema50_last
-        ema50_bearish = last_close < ema50_last
+        # 4. Price vs Medium EMA
+        ema_bullish = last_close > medium_ema_last
+        ema_bearish = last_close < medium_ema_last
         
         # 5. Bollinger Band position
         # Middle to upper band is bullish territory, middle to lower is bearish
@@ -703,7 +791,7 @@ class AISlope1Strategy(BaseStrategy):
             macd_bullish,
             rsi_bullish_signal,
             stoch_bullish,
-            ema50_bullish,
+            ema_bullish,
             bb_bullish
         ])
         
@@ -712,7 +800,7 @@ class AISlope1Strategy(BaseStrategy):
             macd_bearish,
             rsi_bearish_signal,
             stoch_bearish,
-            ema50_bearish,
+            ema_bearish,
             bb_bearish
         ])
         
@@ -735,7 +823,7 @@ class AISlope1Strategy(BaseStrategy):
         print(f"  - MACD Histogram Mean: {macd_hist_mean:.6f} {'✅' if macd_bullish else '❌'} for bulls")
         print(f"  - RSI Mean: {rsi_mean:.2f} {'✅' if rsi_bullish_signal else '❌'} for bulls, {'✅' if rsi_bearish_signal else '❌'} for bears")
         print(f"  - Stochastic K vs D: {stoch_k:.2f} vs {stoch_d:.2f} {'✅' if stoch_bullish else '❌'} for bulls")
-        print(f"  - Price vs EMA50: {last_close:.5f} vs {ema50_last:.5f} {'✅' if ema50_bullish else '❌'} for bulls")
+        print(f"  - Price vs EMA{medium_ema}: {last_close:.5f} vs {medium_ema_last:.5f} {'✅' if ema_bullish else '❌'} for bulls")
         print(f"  - Bollinger Position: {'Above Middle ✅' if bb_bullish else 'Below Middle ❌'} for bulls")
         print(f"  - Indicator Count: {bullish_count}/{total_indicators} bullish, {bearish_count}/{total_indicators} bearish")
         print(f"  - Requirement: {required_indicators}/{total_indicators} indicators needed")
@@ -803,29 +891,33 @@ class AISlope1Strategy(BaseStrategy):
         Returns a score between 0-1 where higher values indicate stronger trends.
         """
         try:
+            # Get EMA periods from config
+            medium_ema = self.config['MEDIUM_EMA_PERIOD']
+            long_ema = self.config['LONG_EMA_PERIOD']
+            
             # Get key indicators for trend strength calculation
-            ema50 = self.indicators['ema50'].iloc[-20:]  # Last 20 values
-            ema200 = self.indicators['ema200'].iloc[-20:]
+            ema_medium = self.indicators[f'ema{medium_ema}'].iloc[-20:]  # Last 20 values
+            ema_long = self.indicators[f'ema{long_ema}'].iloc[-20:]
             price = self.indicators['close'].iloc[-20:]  # Recent price movement
             
             # 1. Calculate EMA slope consistencies
-            ema50_changes = ema50.diff().dropna()
-            ema200_changes = ema200.diff().dropna()
+            ema_medium_changes = ema_medium.diff().dropna()
+            ema_long_changes = ema_long.diff().dropna()
             
             # Percentage of bars where slope is consistent with trend
-            if len(ema50_changes) > 0:
-                ema50_slope_consistency = len(ema50_changes[ema50_changes > 0]) / len(ema50_changes) \
+            if len(ema_medium_changes) > 0:
+                ema_medium_slope_consistency = len(ema_medium_changes[ema_medium_changes > 0]) / len(ema_medium_changes) \
                     if self.entry_decision == 'long' else \
-                    len(ema50_changes[ema50_changes < 0]) / len(ema50_changes)
+                    len(ema_medium_changes[ema_medium_changes < 0]) / len(ema_medium_changes)
             else:
-                ema50_slope_consistency = 0.5
+                ema_medium_slope_consistency = 0.5
                 
-            if len(ema200_changes) > 0:
-                ema200_slope_consistency = len(ema200_changes[ema200_changes > 0]) / len(ema200_changes) \
+            if len(ema_long_changes) > 0:
+                ema_long_slope_consistency = len(ema_long_changes[ema_long_changes > 0]) / len(ema_long_changes) \
                     if self.entry_decision == 'long' else \
-                    len(ema200_changes[ema200_changes < 0]) / len(ema200_changes)
+                    len(ema_long_changes[ema_long_changes < 0]) / len(ema_long_changes)
             else:
-                ema200_slope_consistency = 0.5
+                ema_long_slope_consistency = 0.5
             
             # 2. Calculate price movement consistency with trend
             price_changes = price.diff().dropna()
@@ -837,7 +929,7 @@ class AISlope1Strategy(BaseStrategy):
                 price_consistency = 0.5
             
             # 3. Calculate EMA alignment strength (how far apart EMAs are)
-            ema_gap = (abs(ema50.iloc[-1] - ema200.iloc[-1]) / ema50.iloc[-1]) * 100  # Gap as % of price
+            ema_gap = (abs(ema_medium.iloc[-1] - ema_long.iloc[-1]) / ema_medium.iloc[-1]) * 100  # Gap as % of price
             # Normalize gap to 0-1 scale (larger gaps up to 2% of price get higher scores)
             ema_gap_score = min(ema_gap / 2.0, 1.0)
             
@@ -855,16 +947,16 @@ class AISlope1Strategy(BaseStrategy):
             
             # Combine factors with weightings
             weights = {
-                'ema50_consistency': 0.25,
-                'ema200_consistency': 0.15,
+                'ema_medium_consistency': 0.25,
+                'ema_long_consistency': 0.15,
                 'price_consistency': 0.30,
                 'ema_gap': 0.10,
                 'dm_strength': 0.20
             }
             
             trend_strength = (
-                weights['ema50_consistency'] * ema50_slope_consistency +
-                weights['ema200_consistency'] * ema200_slope_consistency +
+                weights['ema_medium_consistency'] * ema_medium_slope_consistency +
+                weights['ema_long_consistency'] * ema_long_slope_consistency +
                 weights['price_consistency'] * price_consistency +
                 weights['ema_gap'] * ema_gap_score +
                 weights['dm_strength'] * dm_strength
@@ -888,13 +980,16 @@ class AISlope1Strategy(BaseStrategy):
             bool: True if price position is favorable for entry
         """
         try:
+            # Get fast EMA period from config
+            fast_ema = self.config['FAST_EMA_PERIOD']
+            
             # Get relevant indicators
             close = self.indicators['close'].iloc[-1]
-            ema21 = self.indicators['ema21'].iloc[-1]  # Medium-term EMA
+            ema_fast = self.indicators[f'ema{fast_ema}'].iloc[-1]  # Medium-term EMA
             atr = self.indicators['atr14'].iloc[-1]
             
             # Calculate distance as multiple of ATR
-            distance = abs(close - ema21) / atr
+            distance = abs(close - ema_fast) / atr
             
             # Get the maximum allowed distance based on config
             max_distance = self.config['PRICE_DISTANCE_FACTOR'] * self.config['SL_ATR_MULT']
@@ -903,9 +998,9 @@ class AISlope1Strategy(BaseStrategy):
             price_position_ok = distance <= max_distance
             
             if not price_position_ok:
-                print(f"⚠️ Price too far from EMA21: {distance:.2f} ATR (max: {max_distance:.2f} ATR)")
+                print(f"⚠️ Price too far from EMA{fast_ema}: {distance:.2f} ATR (max: {max_distance:.2f} ATR)")
             else:
-                print(f"✅ Price position ok: {distance:.2f} ATR from EMA21")
+                print(f"✅ Price position ok: {distance:.2f} ATR from EMA{fast_ema}")
                 
             return price_position_ok
             
@@ -936,32 +1031,36 @@ class AISlope1Strategy(BaseStrategy):
         # Check if reversal trades are allowed
         allow_reversal = self.config.get('ALLOW_REVERSAL_TRADES', False)
         
+        # Get EMA periods from config
+        medium_ema = self.config['MEDIUM_EMA_PERIOD']
+        long_ema = self.config['LONG_EMA_PERIOD']
+        
         # Log detailed decision reasoning
         print("\n🔍 DECISION ANALYSIS:")
         
         # Check trend and momentum alignment for possible long entry
         if trend == 'uptrend':
-            print("  - Uptrend detected ✅")
+            print(f"  - Uptrend detected (EMA{medium_ema} > EMA{long_ema}, positive slopes) ✅")
             if bullish_mom:
                 print("  - Bullish momentum confirmed ✅")
                 print("  - TREND-MOMENTUM ALIGNMENT: Potentially valid LONG setup ✅")
                 self.entry_decision = 'long'
             else:
                 print("  - Bullish momentum NOT confirmed ❌")
-                print("    → Needed: Bullish MACD, RSI > 55, Stochastic K>D, etc.")
+                print(f"    → Needed: Bullish MACD, RSI > {self.config['RSI_BULLISH_THRESHOLD']}, Stochastic K>D, etc.")
                 print("    → Got: Not enough bullish indicators")
                 print("  - TREND-MOMENTUM MISMATCH: Uptrend with non-bullish momentum - NO TRADE ❌")
                 return 'skip'
         # Check trend and momentum alignment for possible short entry
         elif trend == 'downtrend':
-            print("  - Downtrend detected ✅")
+            print(f"  - Downtrend detected (EMA{medium_ema} < EMA{long_ema}, negative slopes) ✅")
             if bearish_mom:
                 print("  - Bearish momentum confirmed ✅")
                 print("  - TREND-MOMENTUM ALIGNMENT: Potentially valid SHORT setup ✅")
                 self.entry_decision = 'short'
             else:
                 print("  - Bearish momentum NOT confirmed ❌")
-                print("    → Needed: Negative MACD, RSI < 45, Stochastic K<D, etc.")
+                print(f"    → Needed: Negative MACD, RSI < {self.config['RSI_BEARISH_THRESHOLD']}, Stochastic K<D, etc.")
                 print("    → Got: Too many bullish indicators, not enough bearish ones")
                 print("  - TREND-MOMENTUM MISMATCH: Downtrend with bullish momentum")
                 
@@ -977,11 +1076,11 @@ class AISlope1Strategy(BaseStrategy):
         # Neutral trend but potentially strong momentum
         elif allow_reversal:
             if bullish_mom:
-                print("  - Neutral trend with strong BULLISH momentum")
+                print(f"  - Neutral trend with strong BULLISH momentum")
                 print("  - REVERSAL TRADES ENABLED: Taking LONG trade based on momentum only ⚠️")
                 self.entry_decision = 'long'
             elif bearish_mom:
-                print("  - Neutral trend with strong BEARISH momentum")
+                print(f"  - Neutral trend with strong BEARISH momentum")
                 print("  - REVERSAL TRADES ENABLED: Taking SHORT trade based on momentum only ⚠️")
                 self.entry_decision = 'short'
             else:
@@ -1011,12 +1110,12 @@ class AISlope1Strategy(BaseStrategy):
             if trend == 'downtrend' and allow_reversal:
                 print("🔼 FINAL DECISION: LONG (REVERSAL TRADE) ⚠️")
             else:
-                print("🔼 FINAL DECISION: LONG - Strong uptrend with bullish momentum ✅")
+                print(f"🔼 FINAL DECISION: LONG - Strong uptrend with bullish momentum ✅")
         else:
             if trend == 'uptrend' and allow_reversal:
                 print("🔽 FINAL DECISION: SHORT (REVERSAL TRADE) ⚠️")
             else:
-                print("🔽 FINAL DECISION: SHORT - Strong downtrend with bearish momentum ✅")
+                print(f"🔽 FINAL DECISION: SHORT - Strong downtrend with bearish momentum ✅")
             
         return self.entry_decision
         
@@ -1058,8 +1157,9 @@ class AISlope1Strategy(BaseStrategy):
         if entry is not None:
             print(f"Price Levels:")
             print(f"  - Entry: {entry:.5f}")
-            print(f"  - Stop Loss: {stop:.5f} ({sl_mult}x ATR)")
-            print(f"  - Take Profit: {tp:.5f} ({tp_mult}x ATR)")
+            print(f"  - Stop Loss: {stop:.5f} ({sl_mult}x ATR = {sl_mult * atr:.5f})")
+            print(f"  - Take Profit: {tp:.5f} ({tp_mult}x ATR = {tp_mult * atr:.5f})")
+            print(f"  - Risk/Reward Ratio: 1:{tp_mult/sl_mult:.1f}")
             
         return self.price_levels
         
@@ -1169,6 +1269,7 @@ class AISlope1Strategy(BaseStrategy):
         self.prev_signal = signal_type
         
         print(f"✅ Generated {self.entry_decision.upper()} signal: Entry={entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
+        print(f"📏 Risk parameters: SL multiplier={self.config['SL_ATR_MULT']}x ATR, TP multiplier={self.config['TP_ATR_MULT']}x ATR")
         
         return signal_type, entry_price, sl_price, tp_price
         
