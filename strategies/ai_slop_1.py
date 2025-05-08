@@ -17,8 +17,8 @@ except ImportError:
 AI_SLOP_CONFIG = {
     # Risk and Money Management
     'RISK_PERCENT': 0.01,           # 1% risk per trade
-    'SL_ATR_MULT': 2.0,             # Stop loss multiplier of ATR
-    'TP_ATR_MULT': 4.0,            # Take profit multiplier of ATR
+    'SL_ATR_MULT': 3.0,             # Stop loss multiplier of ATR
+    'TP_ATR_MULT': 6.0,            # Take profit multiplier of ATR
     
     # Filter Thresholds
     'MAX_SPREAD_POINTS': 2000,      # Maximum allowed spread in points (increased for crypto)

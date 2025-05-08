@@ -22,7 +22,8 @@ STRATEGY_MAPPING = {
     'ec': 'strategies.ema_strategy.EMAStrategy',      # EMA Crossover
     'ema': 'strategies.ema_strategy.EMAStrategy',     # Alternative alias
     'ai_slop_1': 'strategies.ai_slop_1.AISlope1Strategy',  # Full name alias
-    'ai_slop_2': 'strategies.ai_slop_2.AISlope2Strategy'  # Full name alias
+    'ai_slop_2': 'strategies.ai_slop_2.AISlope2Strategy',  # Full name alias
+    'ai_slop_3': 'strategies.ai_slop_3.AISlope3Strategy'   # Market Structure strategy
 }
 
 # Core Trader Configuration

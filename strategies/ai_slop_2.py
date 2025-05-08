@@ -5,6 +5,7 @@ from strategies.base_strategy import BaseStrategy
 import sys
 import os
 from datetime import datetime, timedelta
+import math
 
 # Add parent directory to path to import needed functions
 sys.path.append('..')
@@ -17,20 +18,23 @@ except ImportError:
 MACD_STRATEGY_CONFIG = {
     # Risk and Money Management
     'RISK_PERCENT': 0.01,           # 1% risk per trade
-    'SL_ATR_MULT': 2.0,             # Stop loss multiplier of ATR
-    'TP_ATR_MULT': 4.0,             # Take profit multiplier of ATR (2:1 reward-risk ratio)
+    'SL_ATR_MULT': 1.0,             # Stop loss multiplier of ATR
+    'TP_ATR_MULT': 2.0,             # Take profit multiplier of ATR (2:1 reward-risk ratio)
     
     # MACD Configuration
     'MACD_FAST_LENGTH': 2,          # Fast length for MACD calculation
     'MACD_SLOW_LENGTH': 8,          # Slow length for MACD calculation
     'MACD_SIGNAL_SMOOTHING': 5,     # Signal line smoothing period
     
-    # Slope/Trend Filters
-    'SLOPE_CHECK_CANDLES': 3,       # Number of candles to measure MACD slope
-    'MIN_SLOPE_THRESHOLD': 0.00001, # Minimum allowed MACD slope
+    # Signal Value Change Requirement
+    'CHECK_CANDLES': 2,              # Number of candles to check for signal value change
+    'MIN_SIGNAL_CHANGE': 1.0,        # Minimum required change in signal value between candles
+    
+    # Histogram Requirements
+    'MIN_HISTOGRAM_VALUE': 10,      # Minimum histogram value to consider significant
     
     # Trading Behavior
-    'WAIT_CANDLES_AFTER_EXIT': 3,   # Candles to wait after exit before re-entry
+    'WAIT_CANDLES_AFTER_EXIT': 0,   # Candles to wait after exit before re-entry
 }
 
 # Example command to run with custom MACD parameters:
@@ -41,29 +45,35 @@ MACD_STRATEGY_CONFIG = {
 
 class AISlope2Strategy(BaseStrategy):
     """
-    MACD Zero-Line Momentum Crossover Strategy
+    MACD Signal Line Zero-Cross Momentum Strategy
     
-    This strategy enters after a complete MACD crossover candle has formed (waits for confirmation).
-    It exits when the histogram becomes negative (for longs) or positive (for shorts).
+    This strategy enters after a MACD Signal Line zero-line crossover, detecting both:
+    - Immediate crossovers (current candle)
+    - Recent crossovers (within the last few candles)
     
-    It checks the slope of the MACD line to ensure there's sufficient directional movement
-    before entering a trade, avoiding flat/choppy markets.
+    It requires significant histogram momentum in the direction of the trade
+    and checks the slope of the Signal line to ensure there's sufficient 
+    directional movement, avoiding flat/choppy markets.
     
-    # === MACD Zero-Line Momentum Crossover Strategy ===
+    # === MACD Signal Line Zero-Cross Momentum Strategy ===
     # Indicators: MACD(2, 8, 5) - configurable parameters
-    # Long Entry: After a complete candle where MACD crosses above 0, with:
-    #   - Rising histogram 
-    #   - MACD > Signal
-    #   - Sufficient positive MACD slope (not too flat over the last N candles)
+    # - MACD Line: Black line
+    # - Signal Line: Red dotted line (zero-line crossover trigger)
+    # - Histogram: Black bars representing difference between MACD and Signal lines
+    #
+    # Long Entry: After Signal line (red dotted) crosses above 0 (current or recent candles), with:
+    #   - Rising histogram with significant positive value
+    #   - MACD > Signal (black above red dotted line)
+    #   - Sufficient positive Signal line slope (not too flat over the last N candles)
     # Long Exit: When histogram becomes negative (MACD crosses below signal line)
     #
-    # Short Entry: After a complete candle where MACD crosses below 0, with:
-    #   - Falling histogram
-    #   - MACD < Signal
-    #   - Sufficient negative MACD slope (not too flat over the last N candles)
+    # Short Entry: After Signal line (red dotted) crosses below 0 (current or recent candles), with:
+    #   - Falling histogram with significant negative value
+    #   - MACD < Signal (black below red dotted line)
+    #   - Sufficient negative Signal line slope (not too flat over the last N candles)
     # Short Exit: When histogram becomes positive (MACD crosses above signal line)
     #
-    # Re-entry: Only after MACD crosses zero again, with a complete confirmation candle
+    # Re-entry: Only after Signal line crosses zero again
     """
     
     def __init__(self, symbol, timeframe, symbol_info, strategy_config=None):
@@ -83,7 +93,7 @@ class AISlope2Strategy(BaseStrategy):
         self.last_processed_candle_time = None
         
         # MACD specific state tracking
-        self.awaiting_next_macd_zero_cross = False
+        self.awaiting_next_signal_zero_cross = False
         self.candles_since_exit = 0
         self.crossover_candle_time = None  # Track when crossover happened
         self.can_enter_after_crossover = False  # Flag to only enter after complete crossover candle
@@ -136,7 +146,7 @@ class AISlope2Strategy(BaseStrategy):
         self.indicators['atr'] = self._calculate_atr(self.data)
         
         # Calculate MACD slope
-        self._calculate_macd_slope()
+        self._calculate_signal_change()
     
     def _calculate_atr(self, ohlc_data, period=14):
         """Calculate Average True Range (ATR) for stop loss and take profit levels"""
@@ -168,26 +178,34 @@ class AISlope2Strategy(BaseStrategy):
         
         return df['atr']
     
-    def _calculate_macd_slope(self):
-        """Calculate the slope of the MACD line over recent candles"""
-        if 'macd' not in self.indicators or len(self.indicators['macd']) < self.config['SLOPE_CHECK_CANDLES']:
-            self.indicators['macd_slope'] = 0
+    def _calculate_signal_change(self):
+        """Calculate the change in Signal line values over recent candles"""
+        if 'signal' not in self.indicators or len(self.indicators['signal']) < self.config['CHECK_CANDLES']:
+            self.indicators['signal_change'] = 0
             return
             
-        # Get last N candles of MACD values for slope calculation
-        n_candles = self.config['SLOPE_CHECK_CANDLES']
-        macd_values = self.indicators['macd'].iloc[-n_candles:].values
+        # Get last N candles of Signal values
+        n_candles = self.config['CHECK_CANDLES']
+        signal_values = self.indicators['signal'].iloc[-n_candles:].values
         
-        # Calculate slope using numpy's polyfit (linear regression)
-        # x values are just the indices [0, 1, 2, ...] representing time periods
-        x = np.arange(n_candles)
-        slope, _ = np.polyfit(x, macd_values, 1)
+        # Calculate the change from first to last value
+        first_value = signal_values[0]
+        last_value = signal_values[-1]
+        signal_change = last_value - first_value
         
-        # Store the slope
-        self.indicators['macd_slope'] = slope
+        # Store the change value
+        self.indicators['signal_change'] = signal_change
         
-        # Log the slope value for debugging
-        print(f"📉 MACD Slope over {n_candles} candles: {slope:.8f}")
+        # Create a simple visual indicator of the change direction
+        if signal_change > 0:
+            direction = "▲"
+        elif signal_change < 0:
+            direction = "▼"
+        else:
+            direction = "◆"
+        
+        # Log the change value for debugging (clean, compact format)
+        print(f"📊 Signal: {first_value:.2f} → {last_value:.2f} ({direction} {signal_change:.2f})")
     
     def update_data(self, new_data):
         """Updates the strategy's data and recalculates indicators"""
@@ -196,7 +214,7 @@ class AISlope2Strategy(BaseStrategy):
             self.calculate_indicators()
     
     def _check_macd_conditions(self):
-        """Check MACD conditions for entry and exit decisions"""
+        """Check MACD and Signal conditions for entry and exit decisions"""
         if self.data.empty or 'macd' not in self.indicators:
             return None
             
@@ -204,23 +222,51 @@ class AISlope2Strategy(BaseStrategy):
         macd_current = self.indicators['macd'].iloc[-1]
         macd_previous = self.indicators['macd'].iloc[-2] if len(self.indicators['macd']) > 1 else 0
         
+        # Get current and previous Signal values
+        signal_current = self.indicators['signal'].iloc[-1]
+        signal_previous = self.indicators['signal'].iloc[-2] if len(self.indicators['signal']) > 1 else 0
+        
+        # For recent crossovers, check a bit further back (last 3-4 candles)
+        signal_values = [self.indicators['signal'].iloc[-i] for i in range(1, min(5, len(self.indicators['signal'])))]
+        prev_signal_values = [self.indicators['signal'].iloc[-i] for i in range(2, min(6, len(self.indicators['signal'])))]
+        
         # Get current and previous histogram values
         hist_current = self.indicators['histogram'].iloc[-1]
         hist_previous = self.indicators['histogram'].iloc[-2] if len(self.indicators['histogram']) > 1 else 0
         
-        # Get current signal line value
-        signal_current = self.indicators['signal'].iloc[-1]
+        # Get Signal change if available
+        signal_change = self.indicators.get('signal_change', 0)
         
-        # Get MACD slope if available
-        macd_slope = self.indicators.get('macd_slope', 0)
+        # Check if change meets minimum threshold (absolute value for short trades)
+        min_change = self.config['MIN_SIGNAL_CHANGE']
+        significant_change = abs(signal_change) >= min_change
         
-        # Check if slope meets minimum threshold (absolute value for short trades)
-        min_slope = self.config['MIN_SLOPE_THRESHOLD']
-        sufficient_slope = abs(macd_slope) >= min_slope
+        # Get minimum histogram value from config
+        min_hist_value = self.config['MIN_HISTOGRAM_VALUE']
         
         # Calculate key conditions for long trades
-        macd_zero_cross_up = macd_previous < 0 and macd_current >= 0
+        signal_zero_cross_up = signal_previous < 0 and signal_current >= 0
+        
+        # Check for recent crossover (within last 3-4 candles)
+        recent_zero_cross_up = False
+        recent_zero_cross_down = False
+        
+        # Look for a sign change from negative to positive (upward cross)
+        for i in range(len(signal_values) - 1):
+            if prev_signal_values[i] < 0 and signal_values[i] >= 0:
+                recent_zero_cross_up = True
+                break
+                
+        # Look for a sign change from positive to negative (downward cross)
+        for i in range(len(signal_values) - 1):
+            if prev_signal_values[i] > 0 and signal_values[i] <= 0:
+                recent_zero_cross_down = True
+                break
+        
         macd_above_zero = macd_current > 0
+        macd_below_zero = macd_current < 0
+        signal_above_zero = signal_current > 0
+        signal_below_zero = signal_current < 0
         histogram_rising = hist_current > hist_previous
         histogram_falling = hist_current < hist_previous
         histogram_positive = hist_current > 0
@@ -228,25 +274,34 @@ class AISlope2Strategy(BaseStrategy):
         macd_above_signal = macd_current > signal_current
         macd_below_signal = macd_current < signal_current
         
+        # Check for significant histogram values
+        significant_positive_histogram = hist_current >= min_hist_value
+        significant_negative_histogram = hist_current <= -min_hist_value
+        
         # Calculate key conditions for short trades
-        macd_zero_cross_down = macd_previous > 0 and macd_current <= 0
-        macd_below_zero = macd_current < 0
+        signal_zero_cross_down = signal_previous > 0 and signal_current <= 0
         
         # Return all conditions as a dictionary
         return {
             # Long conditions
-            'macd_zero_cross_up': macd_zero_cross_up,
+            'signal_zero_cross_up': signal_zero_cross_up,
+            'recent_zero_cross_up': recent_zero_cross_up,
+            'signal_above_zero': signal_above_zero,
             'macd_above_zero': macd_above_zero,
             'histogram_rising': histogram_rising,
             'histogram_positive': histogram_positive,
             'macd_above_signal': macd_above_signal,
+            'significant_positive_histogram': significant_positive_histogram,
             
             # Short conditions
-            'macd_zero_cross_down': macd_zero_cross_down,
+            'signal_zero_cross_down': signal_zero_cross_down,
+            'recent_zero_cross_down': recent_zero_cross_down,
+            'signal_below_zero': signal_below_zero,
             'macd_below_zero': macd_below_zero,
             'histogram_falling': histogram_falling,
             'histogram_negative': histogram_negative,
             'macd_below_signal': macd_below_signal,
+            'significant_negative_histogram': significant_negative_histogram,
             
             # Common values
             'macd_value': macd_current,
@@ -254,8 +309,9 @@ class AISlope2Strategy(BaseStrategy):
             'hist_value': hist_current,
             'hist_prev': hist_previous,
             'macd_prev': macd_previous,
-            'macd_slope': macd_slope,
-            'sufficient_slope': sufficient_slope
+            'signal_prev': signal_previous,
+            'signal_change': signal_change,
+            'significant_change': significant_change
         }
     
     def _calculate_price_levels(self, trade_type):
@@ -307,7 +363,7 @@ class AISlope2Strategy(BaseStrategy):
     def generate_entry_signal(self, open_positions=None):
         """
         Generate entry signals based on MACD zero-line crossover with momentum.
-        Only enters after a complete crossover candle has formed.
+        Detects both immediate and recent crossovers (within the last few candles).
         
         Args:
             open_positions (list, optional): List of currently open positions
@@ -374,90 +430,153 @@ class AISlope2Strategy(BaseStrategy):
             return None
             
         # Check for awaiting next zero cross
-        if self.awaiting_next_macd_zero_cross:
-            if conditions['macd_zero_cross_up'] or conditions['macd_zero_cross_down']:
-                cross_type = "up" if conditions['macd_zero_cross_up'] else "down"
-                print(f"🔄 MACD crossed {cross_type} zero line - resetting re-entry lock")
-                self.awaiting_next_macd_zero_cross = False
-                # Record the crossover candle time - we'll enter on the next candle
-                self.crossover_candle_time = current_candle_start
-                print(f"📝 MACD Crossover detected at {self.crossover_candle_time} - waiting for candle completion")
-                # We'll wait for the next candle before entering
-                self.can_enter_after_crossover = False
+        if self.awaiting_next_signal_zero_cross:
+            # Check for both immediate and recent crossovers
+            if (conditions['signal_zero_cross_up'] or conditions['signal_zero_cross_down'] or 
+                conditions['recent_zero_cross_up'] or conditions['recent_zero_cross_down']):
+                
+                cross_type = "up" if (conditions['signal_zero_cross_up'] or conditions['recent_zero_cross_up']) else "down"
+                cross_timing = "recent" if (conditions['recent_zero_cross_up'] or conditions['recent_zero_cross_down']) else "immediate"
+                
+                print(f"🔄 Zero cross: {cross_timing} {cross_type}")
+                self.awaiting_next_signal_zero_cross = False
+                
+                # If it's a recent crossover, treat it as if it already completed
+                if conditions['recent_zero_cross_up'] or conditions['recent_zero_cross_down']:
+                    print(f"📝 Recent crossover - ready to enter")
+                    # Bypass waiting period but all trading criteria (slope, histogram, etc.)
+                    # will still be evaluated before actually entering a trade
+                    self.can_enter_after_crossover = True
+                else:
+                    # Record the crossover candle time - we'll enter on the next candle
+                    self.crossover_candle_time = current_candle_start
+                    print(f"📝 Immediate crossover - waiting for candle completion")
+                    # We'll wait for the next candle before entering
+                    self.can_enter_after_crossover = False
+                
                 return None
             else:
-                print("⏳ Waiting for MACD to cross zero line before new entry")
+                print("⏳ Waiting for zero cross before new entry")
                 return None
         
-        # Check if we've seen a crossover in this candle
-        if conditions['macd_zero_cross_up'] or conditions['macd_zero_cross_down']:
+        # Check if we've seen a crossover in this candle or recently
+        if conditions['signal_zero_cross_up'] or conditions['signal_zero_cross_down']:
             # Record the crossover candle time - we'll enter on the next candle
             self.crossover_candle_time = current_candle_start
-            cross_type = "above" if conditions['macd_zero_cross_up'] else "below"
-            print(f"📝 MACD Crossover {cross_type} zero detected at {self.crossover_candle_time} - waiting for candle completion")
+            cross_type = "above" if conditions['signal_zero_cross_up'] else "below"
+            print(f"📝 Zero cross: {cross_type} | Waiting for candle completion")
             # We'll wait for the next candle before entering
             self.can_enter_after_crossover = False
             return None
-            
+        elif conditions['recent_zero_cross_up'] or conditions['recent_zero_cross_down']:
+            # For recent crossovers, no need to wait - consider it confirmed already
+            cross_type = "above" if conditions['recent_zero_cross_up'] else "below"
+            print(f"📝 Recent zero cross: {cross_type} | Ready to enter")
+            # Allow entry without waiting for next candle, but all other conditions
+            # (slope, histogram significance, etc.) must still be satisfied
+            self.can_enter_after_crossover = True
+        
         # If a crossover was detected on a previous candle and we have a new candle now, allow entry
         if self.crossover_candle_time is not None and is_new_candle:
             previous_candle_start, _ = get_candle_boundaries(self.crossover_candle_time, self.timeframe)
             if current_candle_start > previous_candle_start:
-                print(f"✅ Crossover candle complete - ready to enter on this candle")
+                print(f"✅ Crossover candle complete - ready to enter")
                 self.can_enter_after_crossover = True
         
         # Evaluate buy/sell signal criteria
-        buy_signal_ready = (conditions['macd_above_zero'] and 
+        buy_signal_ready = (conditions['signal_above_zero'] and 
                            conditions['histogram_rising'] and 
                            conditions['macd_above_signal'] and 
                            self.can_enter_after_crossover and 
-                           conditions['sufficient_slope'] and 
-                           conditions['macd_slope'] > 0)
+                           conditions['significant_change'] and 
+                           conditions['signal_change'] > 0 and
+                           conditions['significant_positive_histogram'])
         
-        sell_signal_ready = (conditions['macd_below_zero'] and 
+        sell_signal_ready = (conditions['signal_below_zero'] and 
                             conditions['histogram_falling'] and 
                             conditions['macd_below_signal'] and 
                             self.can_enter_after_crossover and 
-                            conditions['sufficient_slope'] and 
-                            conditions['macd_slope'] < 0)
+                            conditions['significant_change'] and 
+                            conditions['signal_change'] < 0 and
+                            conditions['significant_negative_histogram'])
                 
-        # Log MACD state for analysis
-        print("\n🔍 MACD ANALYSIS:")
-        print(f"  - MACD: {conditions['macd_value']:.6f} {'✅ Above Zero' if conditions['macd_above_zero'] else '❌ Below Zero'}")
-        print(f"  - Signal: {conditions['signal_value']:.6f}")
-        print(f"  - Histogram: {conditions['hist_value']:.6f} {'✅ Rising' if conditions['histogram_rising'] else '❌ Falling'}")
-        print(f"  - MACD > Signal: {'✅ Yes' if conditions['macd_above_signal'] else '❌ No'}")
-        print(f"  - MACD < Signal: {'✅ Yes' if conditions['macd_below_signal'] else '❌ No'}")
-        print(f"  - Zero-Line Crossover Up: {'✅ Yes' if conditions['macd_zero_cross_up'] else '❌ No'}")
-        print(f"  - Zero-Line Crossover Down: {'✅ Yes' if conditions['macd_zero_cross_down'] else '❌ No'}")
-        print(f"  - Entry Ready After Crossover: {'✅ Yes' if self.can_enter_after_crossover else '❌ No'}")
-        print(f"  - MACD Slope: {conditions['macd_slope']:.8f} {'✅ Sufficient' if conditions['sufficient_slope'] else '❌ Too flat'}")
+        # Log MACD state in a clean, compact format
+        print("\n📊 INDICATOR VALUES:")
+        print(f"  MACD (Black): {conditions['macd_value']:.2f} | Signal (Red): {conditions['signal_value']:.2f}")
+        
+        # Current histogram value and change
+        hist_current = conditions['hist_value']
+        hist_previous = conditions['hist_prev']
+        hist_change = hist_current - hist_previous
+        
+        # Create direction indicator
+        if hist_change > 0:
+            hist_direction = "▲"
+        elif hist_change < 0:
+            hist_direction = "▼"
+        else:
+            hist_direction = "◆"
+            
+        # Show histogram values and signal
+        print(f"  Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
+        print(f"  Min Histogram Required: ±{self.config['MIN_HISTOGRAM_VALUE']:.2f} | Status: {'✅' if ((conditions['histogram_positive'] and conditions['significant_positive_histogram']) or (conditions['histogram_negative'] and conditions['significant_negative_histogram'])) else '❌'}")
+        
+        # Show signal change
+        signal_change = conditions['signal_change']
+        if signal_change > 0:
+            change_direction = "▲"
+        elif signal_change < 0:
+            change_direction = "▼"
+        else:
+            change_direction = "◆"
+        print(f"  Signal Change: {change_direction} {signal_change:.2f} | Min Required: {self.config['MIN_SIGNAL_CHANGE']:.2f} | Status: {'✅' if conditions['significant_change'] else '❌'}")
+        
+        # Show Zero crossovers
+        zero_cross = "✅" if (conditions['signal_zero_cross_up'] or conditions['signal_zero_cross_down'] or conditions['recent_zero_cross_up'] or conditions['recent_zero_cross_down']) else "❌"
+        cross_type = ""
+        if conditions['signal_zero_cross_up'] or conditions['recent_zero_cross_up']:
+            cross_type = "Upward"
+        elif conditions['signal_zero_cross_down'] or conditions['recent_zero_cross_down']:
+            cross_type = "Downward"
+            
+        recent = "Recent" if (conditions['recent_zero_cross_up'] or conditions['recent_zero_cross_down']) else "Immediate" if (conditions['signal_zero_cross_up'] or conditions['signal_zero_cross_down']) else ""
+        
+        if zero_cross == "✅":
+            print(f"  Zero Cross: {zero_cross} | Type: {recent} {cross_type}")
+        else:
+            print(f"  Zero Cross: {zero_cross}")
+            
+        # Print whether we can enter after crossover
+        print(f"  Entry Ready: {'✅' if self.can_enter_after_crossover else '❌'}")
         
         # Print overall signal assessment
         if buy_signal_ready:
-            print(f"🟢 BUY SIGNAL READY: All conditions met for a long position")
+            print(f"\n🟢 LONG SIGNAL: All conditions met for a long position")
         elif sell_signal_ready:
-            print(f"🔴 SELL SIGNAL READY: All conditions met for a short position")
+            print(f"\n🔴 SHORT SIGNAL: All conditions met for a short position")
         else:
-            # Determine which conditions are preventing signal
+            # Show a concise reason why there's no signal
             if not self.can_enter_after_crossover:
-                print(f"⏳ NO SIGNAL YET: Waiting for confirmation candle after zero-line crossover")
-            elif conditions['macd_above_zero'] and conditions['macd_slope'] > 0:
-                print(f"⌛ POTENTIAL BUY: Missing conditions for long entry")
-            elif conditions['macd_below_zero'] and conditions['macd_slope'] < 0:
-                print(f"⌛ POTENTIAL SELL: Missing conditions for short entry")
+                print(f"\n❌ NO SIGNAL: Waiting for confirmation candle after zero-line crossover")
+            elif not (conditions['signal_above_zero'] or conditions['signal_below_zero']):
+                print(f"\n❌ NO SIGNAL: Signal not above/below zero")
+            elif not conditions['significant_change']:
+                print(f"\n❌ NO SIGNAL: Signal change too small")
+            elif not ((conditions['histogram_positive'] and conditions['significant_positive_histogram']) or 
+                     (conditions['histogram_negative'] and conditions['significant_negative_histogram'])):
+                print(f"\n❌ NO SIGNAL: Histogram not significant")
             else:
-                print(f"❌ NO SIGNAL: Conditions don't align for either buy or sell")
+                print(f"\n❌ NO SIGNAL: Missing required conditions")
         
         # Check LONG entry conditions: 
-        # 1. MACD above zero
+        # 1. Signal line (red dotted) above zero
         # 2. Histogram is rising
-        # 3. MACD is above signal line
+        # 3. MACD is above signal line (black above red dotted)
         # 4. We're after a crossover candle (can_enter_after_crossover is True)
-        # 5. MACD slope is sufficient (not too flat)
+        # 5. Signal line change is sufficient (not too flat)
         if buy_signal_ready:
             
-            print("🔼 ENTRY SIGNAL: LONG - MACD above zero with rising histogram and sufficient slope after crossover confirmation")
+            print("🔼 ENTRY SIGNAL: LONG - Signal line above zero with rising histogram and sufficient change after crossover confirmation")
             
             # Calculate price levels for trade
             self._calculate_price_levels(mt5.ORDER_TYPE_BUY)
@@ -472,8 +591,8 @@ class AISlope2Strategy(BaseStrategy):
             self.prev_signal = signal_type
             self.last_trade_direction = "LONG"
             
-            # Set flag to require next MACD zero cross for re-entry
-            self.awaiting_next_macd_zero_cross = True
+            # Set flag to require next Signal line zero cross for re-entry
+            self.awaiting_next_signal_zero_cross = True
             self.candles_since_exit = 0
             self.crossover_candle_time = None
             self.can_enter_after_crossover = False
@@ -485,14 +604,14 @@ class AISlope2Strategy(BaseStrategy):
             return signal_type, entry_price, sl_price, tp_price
             
         # Check SHORT entry conditions:
-        # 1. MACD below zero
+        # 1. Signal line (red dotted) below zero
         # 2. Histogram is falling
-        # 3. MACD is below signal line
+        # 3. MACD is below signal line (black below red dotted)
         # 4. We're after a crossover candle (can_enter_after_crossover is True)
-        # 5. MACD slope is sufficient (not too flat) and negative
+        # 5. Signal line change is sufficient (not too flat) and negative
         if sell_signal_ready:
             
-            print("🔽 ENTRY SIGNAL: SHORT - MACD below zero with falling histogram and sufficient slope after crossover confirmation")
+            print("🔽 ENTRY SIGNAL: SHORT - Signal line below zero with falling histogram and sufficient change after crossover confirmation")
             
             # Calculate price levels for trade
             self._calculate_price_levels(mt5.ORDER_TYPE_SELL)
@@ -507,8 +626,8 @@ class AISlope2Strategy(BaseStrategy):
             self.prev_signal = signal_type
             self.last_trade_direction = "SHORT"
             
-            # Set flag to require next MACD zero cross for re-entry
-            self.awaiting_next_macd_zero_cross = True
+            # Set flag to require next Signal line zero cross for re-entry
+            self.awaiting_next_signal_zero_cross = True
             self.candles_since_exit = 0
             self.crossover_candle_time = None
             self.can_enter_after_crossover = False
@@ -563,18 +682,27 @@ class AISlope2Strategy(BaseStrategy):
         # Get current and previous histogram values
         hist_current = conditions['hist_value']
         hist_previous = conditions['hist_prev']
+        hist_change = hist_current - hist_previous
+        
+        # Create direction indicator
+        if hist_change > 0:
+            hist_direction = "▲"
+        elif hist_change < 0:
+            hist_direction = "▼"
+        else:
+            hist_direction = "◆"
         
         # Only process an exit once per candle
         if self.last_processed_candle_time == current_candle_start:
             # We've already checked this candle for exit signals
             # Print current status for monitoring
             position_type = "LONG" if is_long else "SHORT"
-            print(f"📊 MACD Status ({position_type}): Already checked this candle for exit signals")
+            print(f"📊 Already checked exit for this candle")
             return False
             
         # We're at a new candle - update processed candle time and check exit conditions
         self.last_processed_candle_time = current_candle_start
-        print(f"🔄 Checking exit conditions at start of new candle ({current_candle_start})")
+        print(f"🔄 Checking exit conditions at new candle")
         
         if is_long:
             # For LONG positions: exit when histogram stops increasing (turns downward)
@@ -582,8 +710,7 @@ class AISlope2Strategy(BaseStrategy):
             
             if histogram_decreasing:
                 print(f"🔽 EXIT SIGNAL (LONG): Histogram momentum changed to decreasing")
-                print(f"🔽 Histogram: current={hist_current:.6f}, previous={hist_previous:.6f}")
-                print(f"🔽 MACD={conditions['macd_value']:.6f}, Signal={conditions['signal_value']:.6f}")
+                print(f"🔽 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
                 return True
         
         elif is_short:
@@ -592,19 +719,18 @@ class AISlope2Strategy(BaseStrategy):
             
             if histogram_increasing:
                 print(f"🔼 EXIT SIGNAL (SHORT): Histogram momentum changed to increasing")
-                print(f"🔼 Histogram: current={hist_current:.6f}, previous={hist_previous:.6f}")
-                print(f"🔼 MACD={conditions['macd_value']:.6f}, Signal={conditions['signal_value']:.6f}")
+                print(f"🔼 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
                 return True
         
         # Print current status for monitoring
         position_type = "LONG" if is_long else "SHORT"
-        print(f"📊 MACD Status ({position_type}): MACD={conditions['macd_value']:.6f} Signal={conditions['signal_value']:.6f}")
-        print(f"📊 Histogram: current={hist_current:.6f}, previous={hist_previous:.6f}, delta={hist_current-hist_previous:.6f}")
+        print(f"📊 Position: {position_type} | MACD: {conditions['macd_value']:.2f} | Signal: {conditions['signal_value']:.2f}")
+        print(f"📊 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
         
         if is_long:
-            print(f"📊 Exit condition: Histogram decreasing={'Yes' if hist_current < hist_previous else 'No'}")
+            print(f"📊 Exit condition (decreasing histogram): {'✅' if hist_current < hist_previous else '❌'}")
         else:
-            print(f"📊 Exit condition: Histogram increasing={'Yes' if hist_current > hist_previous else 'No'}")
+            print(f"📊 Exit condition (increasing histogram): {'✅' if hist_current > hist_previous else '❌'}")
         
         return False
         
@@ -614,8 +740,8 @@ class AISlope2Strategy(BaseStrategy):
         self.last_trade_close_time = get_server_time()
         print(f"🕒 Position closed at {self.last_trade_close_time}")
         
-        # Set flag to await next MACD zero cross and reset candle counter
-        self.awaiting_next_macd_zero_cross = True
+        # Set flag to await next Signal line zero cross and reset candle counter
+        self.awaiting_next_signal_zero_cross = True
         self.candles_since_exit = 0
         self.crossover_candle_time = None
         self.can_enter_after_crossover = False
