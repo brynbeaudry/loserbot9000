@@ -485,16 +485,14 @@ class AISlope2Strategy(BaseStrategy):
         
         # Evaluate buy/sell signal criteria
         buy_signal_ready = (conditions['signal_above_zero'] and 
-                           conditions['histogram_rising'] and 
-                           conditions['macd_above_signal'] and 
+                           conditions['macd_above_signal'] and  # MACD above signal (positive histogram)
                            self.can_enter_after_crossover and 
                            conditions['significant_change'] and 
                            conditions['signal_change'] > 0 and
                            conditions['significant_positive_histogram'])
         
         sell_signal_ready = (conditions['signal_below_zero'] and 
-                            conditions['histogram_falling'] and 
-                            conditions['macd_below_signal'] and 
+                            conditions['macd_below_signal'] and  # MACD below signal (negative histogram)
                             self.can_enter_after_crossover and 
                             conditions['significant_change'] and 
                             conditions['signal_change'] < 0 and
@@ -570,13 +568,13 @@ class AISlope2Strategy(BaseStrategy):
         
         # Check LONG entry conditions: 
         # 1. Signal line (red dotted) above zero
-        # 2. Histogram is rising
-        # 3. MACD is above signal line (black above red dotted)
+        # 2. MACD is above signal line (positive histogram)
+        # 3. Histogram is significant (above MIN_HISTOGRAM_VALUE)
         # 4. We're after a crossover candle (can_enter_after_crossover is True)
-        # 5. Signal line change is sufficient (not too flat)
+        # 5. Signal line change is sufficient
         if buy_signal_ready:
             
-            print("🔼 ENTRY SIGNAL: LONG - Signal line above zero with rising histogram and sufficient change after crossover confirmation")
+            print("🔼 ENTRY SIGNAL: LONG - Signal above zero with MACD > Signal and sufficient change")
             
             # Calculate price levels for trade
             self._calculate_price_levels(mt5.ORDER_TYPE_BUY)
@@ -605,13 +603,13 @@ class AISlope2Strategy(BaseStrategy):
             
         # Check SHORT entry conditions:
         # 1. Signal line (red dotted) below zero
-        # 2. Histogram is falling
-        # 3. MACD is below signal line (black below red dotted)
+        # 2. MACD is below signal line (negative histogram)
+        # 3. Histogram is significant (below -MIN_HISTOGRAM_VALUE)
         # 4. We're after a crossover candle (can_enter_after_crossover is True)
-        # 5. Signal line change is sufficient (not too flat) and negative
+        # 5. Signal line change is sufficient and negative
         if sell_signal_ready:
             
-            print("🔽 ENTRY SIGNAL: SHORT - Signal line below zero with falling histogram and sufficient change after crossover confirmation")
+            print("🔽 ENTRY SIGNAL: SHORT - Signal below zero with MACD < Signal and sufficient change")
             
             # Calculate price levels for trade
             self._calculate_price_levels(mt5.ORDER_TYPE_SELL)
@@ -704,23 +702,28 @@ class AISlope2Strategy(BaseStrategy):
         self.last_processed_candle_time = current_candle_start
         print(f"🔄 Checking exit conditions at new candle")
         
+        # First check for histogram momentum change
+        histogram_exit = False
+        
         if is_long:
-            # For LONG positions: exit when histogram stops increasing (turns downward)
-            histogram_decreasing = hist_current < hist_previous
+            # For LONG positions: exit when MACD crosses below signal (histogram becomes negative)
+            histogram_sign_change = hist_current < 0 and hist_previous >= 0
             
-            if histogram_decreasing:
-                print(f"🔽 EXIT SIGNAL (LONG): Histogram momentum changed to decreasing")
-                print(f"🔽 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
-                return True
+            if histogram_sign_change:
+                histogram_exit = True
+                print(f"🔽 EXIT SIGNAL (LONG): MACD crossed below signal line")
+                print(f"🔽 Histogram changed from positive to negative: {hist_previous:.2f} → {hist_current:.2f}")
+                print(f"🔽 MACD: {conditions['macd_value']:.2f} | Signal: {conditions['signal_value']:.2f}")
         
         elif is_short:
-            # For SHORT positions: exit when histogram stops decreasing (turns upward)
-            histogram_increasing = hist_current > hist_previous
+            # For SHORT positions: exit when MACD crosses above signal (histogram becomes positive)
+            histogram_sign_change = hist_current > 0 and hist_previous <= 0
             
-            if histogram_increasing:
-                print(f"🔼 EXIT SIGNAL (SHORT): Histogram momentum changed to increasing")
-                print(f"🔼 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
-                return True
+            if histogram_sign_change:
+                histogram_exit = True
+                print(f"🔼 EXIT SIGNAL (SHORT): MACD crossed above signal line")
+                print(f"🔼 Histogram changed from negative to positive: {hist_previous:.2f} → {hist_current:.2f}")
+                print(f"🔼 MACD: {conditions['macd_value']:.2f} | Signal: {conditions['signal_value']:.2f}")
         
         # Print current status for monitoring
         position_type = "LONG" if is_long else "SHORT"
@@ -728,11 +731,11 @@ class AISlope2Strategy(BaseStrategy):
         print(f"📊 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
         
         if is_long:
-            print(f"📊 Exit condition (decreasing histogram): {'✅' if hist_current < hist_previous else '❌'}")
+            print(f"📊 Exit condition (histogram becomes negative): {'✅' if hist_current < 0 else '❌'}")
         else:
-            print(f"📊 Exit condition (increasing histogram): {'✅' if hist_current > hist_previous else '❌'}")
+            print(f"📊 Exit condition (histogram becomes positive): {'✅' if hist_current > 0 else '❌'}")
         
-        return False
+        return histogram_exit
         
     def reset_signal_state(self):
         """Reset strategy internal state after position closing or failed orders."""
