@@ -39,3 +39,9 @@
 - Know how to do this without the AI
 - Know exactly what kind of data that you have in your data frame history
 - Know difference between live information and your data history
+
+## I call it "Code Taking":
+
+- Search github repos of bots to convert to this system and try out.
+- https://github.com/ryu878/Bybit-BTCUSD-Inverse-Perpetual-Scalp-Trading-Bot/blob/main/inverse_bot_v5.0.py
+--> Make it lame and gay. Turn it into AI slop

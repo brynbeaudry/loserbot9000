@@ -18,8 +18,8 @@ except ImportError:
 MACD_STRATEGY_CONFIG = {
     # Risk and Money Management
     'RISK_PERCENT': 0.01,           # 1% risk per trade
-    'SL_ATR_MULT': 1.0,             # Stop loss multiplier of ATR
-    'TP_ATR_MULT': 2.0,             # Take profit multiplier of ATR (2:1 reward-risk ratio)
+    'SL_ATR_MULT': 3.0,             # Stop loss multiplier of ATR
+    'TP_ATR_MULT': 6.0,             # Take profit multiplier of ATR (2:1 reward-risk ratio)
     
     # MACD Configuration
     'MACD_FAST_LENGTH': 2,          # Fast length for MACD calculation
@@ -35,6 +35,7 @@ MACD_STRATEGY_CONFIG = {
     
     # Trading Behavior
     'WAIT_CANDLES_AFTER_EXIT': 0,   # Candles to wait after exit before re-entry
+    'EXIT_THRESHOLD': 20.0,         # Exit when MACD is this many points above/below signal (in direction against the trade)
 }
 
 # Example command to run with custom MACD parameters:
@@ -65,15 +66,24 @@ class AISlope2Strategy(BaseStrategy):
     #   - Rising histogram with significant positive value
     #   - MACD > Signal (black above red dotted line)
     #   - Sufficient positive Signal line slope (not too flat over the last N candles)
-    # Long Exit: When histogram becomes negative (MACD crosses below signal line)
+    # Long Exit:
+    #   - When MACD crosses below signal (histogram becomes negative), OR
+    #   - When MACD drops EXIT_THRESHOLD points below signal line
     #
     # Short Entry: After Signal line (red dotted) crosses below 0 (current or recent candles), with:
     #   - Falling histogram with significant negative value
     #   - MACD < Signal (black below red dotted line)
     #   - Sufficient negative Signal line slope (not too flat over the last N candles)
-    # Short Exit: When histogram becomes positive (MACD crosses above signal line)
+    # Short Exit:
+    #   - When MACD crosses above signal (histogram becomes positive), OR
+    #   - When MACD rises EXIT_THRESHOLD points above signal line
     #
     # Re-entry: Only after Signal line crosses zero again
+    #
+    # Exit Control:
+    # - EXIT_THRESHOLD: Controls additional exit condition based on MACD vs Signal
+    #   - For LONG: Exit when MACD drops below (Signal - EXIT_THRESHOLD)
+    #   - For SHORT: Exit when MACD rises above (Signal + EXIT_THRESHOLD)
     """
     
     def __init__(self, symbol, timeframe, symbol_info, strategy_config=None):
@@ -641,9 +651,15 @@ class AISlope2Strategy(BaseStrategy):
         
     def generate_exit_signal(self, position):
         """
-        Generate exit signals based on MACD histogram momentum change.
-        Exit when the histogram stops increasing (for longs) or stops decreasing (for shorts).
-        Exits are only triggered at the start of a new candle.
+        Generate exit signals based on MACD and Signal line relationship.
+        
+        For LONG positions:
+        - Exit when MACD crosses below signal (histogram becomes negative), OR
+        - Exit when MACD drops EXIT_THRESHOLD points below signal
+        
+        For SHORT positions:
+        - Exit when MACD crosses above signal (histogram becomes positive), OR
+        - Exit when MACD rises EXIT_THRESHOLD points above signal
         
         Args:
             position (mt5.PositionInfo): The open position object to evaluate
@@ -658,84 +674,86 @@ class AISlope2Strategy(BaseStrategy):
         conditions = self._check_macd_conditions()
         if not conditions:
             return False
-        
-        # Check if this is a new candle
-        server_time = get_server_time()
-        current_candle_start, current_candle_end = get_candle_boundaries(server_time, self.timeframe)
-        
-        # Calculate how far we are into the current candle
-        time_since_candle_open = (server_time - current_candle_start).total_seconds()
-        candle_total_seconds = (current_candle_end - current_candle_start).total_seconds()
-        candle_percent_complete = (time_since_candle_open / candle_total_seconds) * 100
-        
-        # Only consider exits at the beginning of a new candle (first 20% of candle time)
-        if candle_percent_complete > 20:
-            print(f"📊 Not checking exit conditions - {candle_percent_complete:.1f}% into current candle (exits only in first 20% of candle)")
-            return False
             
         # Determine position type (LONG or SHORT)
         is_long = position.type == mt5.POSITION_TYPE_BUY
         is_short = position.type == mt5.POSITION_TYPE_SELL
         
-        # Get current and previous histogram values
-        hist_current = conditions['hist_value']
-        hist_previous = conditions['hist_prev']
-        hist_change = hist_current - hist_previous
+        # Get current MACD values
+        macd_current = conditions['macd_value']
+        signal_current = conditions['signal_value']
         
-        # Create direction indicator
-        if hist_change > 0:
-            hist_direction = "▲"
-        elif hist_change < 0:
-            hist_direction = "▼"
-        else:
-            hist_direction = "◆"
+        # Calculate the histogram (difference between MACD and Signal)
+        macd_signal_diff = macd_current - signal_current
         
-        # Only process an exit once per candle
-        if self.last_processed_candle_time == current_candle_start:
-            # We've already checked this candle for exit signals
-            # Print current status for monitoring
-            position_type = "LONG" if is_long else "SHORT"
-            print(f"📊 Already checked exit for this candle")
-            return False
-            
-        # We're at a new candle - update processed candle time and check exit conditions
-        self.last_processed_candle_time = current_candle_start
-        print(f"🔄 Checking exit conditions at new candle")
+        # Get exit threshold from config
+        exit_threshold = self.config['EXIT_THRESHOLD']
         
-        # First check for histogram momentum change
-        histogram_exit = False
+        # Initialize exit signal and reason
+        exit_signal = False
+        exit_reason = ""
         
+        # Check exit conditions based on position type
         if is_long:
-            # For LONG positions: exit when MACD crosses below signal (histogram becomes negative)
-            histogram_sign_change = hist_current < 0 and hist_previous >= 0
+            # For LONG positions:
+            # 1. Exit when MACD crosses below signal (histogram becomes negative)
+            # 2. Exit when MACD drops EXIT_THRESHOLD points below signal
             
-            if histogram_sign_change:
-                histogram_exit = True
-                print(f"🔽 EXIT SIGNAL (LONG): MACD crossed below signal line")
-                print(f"🔽 Histogram changed from positive to negative: {hist_previous:.2f} → {hist_current:.2f}")
-                print(f"🔽 MACD: {conditions['macd_value']:.2f} | Signal: {conditions['signal_value']:.2f}")
+            # Condition 1: MACD below signal
+            standard_exit = macd_signal_diff < 0
+            
+            # Condition 2: MACD at least EXIT_THRESHOLD points below signal
+            threshold_exit = macd_current < (signal_current - exit_threshold)
+            
+            if standard_exit:
+                exit_signal = True
+                exit_reason = "MACD crossed below signal line (histogram became negative)"
+            elif threshold_exit:
+                exit_signal = True
+                exit_reason = f"MACD ({macd_current:.2f}) dropped {exit_threshold:.2f} points below signal ({signal_current:.2f})"
         
         elif is_short:
-            # For SHORT positions: exit when MACD crosses above signal (histogram becomes positive)
-            histogram_sign_change = hist_current > 0 and hist_previous <= 0
+            # For SHORT positions:
+            # 1. Exit when MACD crosses above signal (histogram becomes positive)
+            # 2. Exit when MACD rises EXIT_THRESHOLD points above signal
             
-            if histogram_sign_change:
-                histogram_exit = True
-                print(f"🔼 EXIT SIGNAL (SHORT): MACD crossed above signal line")
-                print(f"🔼 Histogram changed from negative to positive: {hist_previous:.2f} → {hist_current:.2f}")
-                print(f"🔼 MACD: {conditions['macd_value']:.2f} | Signal: {conditions['signal_value']:.2f}")
+            # Condition 1: MACD above signal
+            standard_exit = macd_signal_diff > 0
+            
+            # Condition 2: MACD at least EXIT_THRESHOLD points above signal
+            threshold_exit = macd_current > (signal_current + exit_threshold)
+            
+            if standard_exit:
+                exit_signal = True
+                exit_reason = "MACD crossed above signal line (histogram became positive)"
+            elif threshold_exit:
+                exit_signal = True
+                exit_reason = f"MACD ({macd_current:.2f}) rose {exit_threshold:.2f} points above signal ({signal_current:.2f})"
         
-        # Print current status for monitoring
-        position_type = "LONG" if is_long else "SHORT"
-        print(f"📊 Position: {position_type} | MACD: {conditions['macd_value']:.2f} | Signal: {conditions['signal_value']:.2f}")
-        print(f"📊 Histogram: {hist_previous:.2f} → {hist_current:.2f} ({hist_direction} {hist_change:.2f})")
-        
-        if is_long:
-            print(f"📊 Exit condition (histogram becomes negative): {'✅' if hist_current < 0 else '❌'}")
+        # Log the exit signal if we're exiting
+        if exit_signal:
+            position_type = "LONG" if is_long else "SHORT"
+            direction = "🔽" if is_long else "🔼"
+            print(f"{direction} EXIT SIGNAL ({position_type}): {exit_reason}")
+            print(f"{direction} MACD: {macd_current:.2f} | Signal: {signal_current:.2f} | Diff: {macd_signal_diff:.2f}")
+            print(f"{direction} Exit threshold: {exit_threshold:.2f}")
         else:
-            print(f"📊 Exit condition (histogram becomes positive): {'✅' if hist_current > 0 else '❌'}")
+            # Print current status for monitoring
+            position_type = "LONG" if is_long else "SHORT"
+            print(f"📊 Position: {position_type} | MACD: {macd_current:.2f} | Signal: {signal_current:.2f} | Diff: {macd_signal_diff:.2f}")
+            
+            if is_long:
+                print(f"📊 Exit conditions:")
+                print(f"  - MACD below Signal: {'✅' if standard_exit else '❌'}")
+                threshold_value = signal_current - exit_threshold
+                print(f"  - MACD below threshold ({threshold_value:.2f}): {'✅' if threshold_exit else '❌'}")
+            else:
+                print(f"📊 Exit conditions:")
+                print(f"  - MACD above Signal: {'✅' if standard_exit else '❌'}")
+                threshold_value = signal_current + exit_threshold
+                print(f"  - MACD above threshold ({threshold_value:.2f}): {'✅' if threshold_exit else '❌'}")
         
-        return histogram_exit
+        return exit_signal
         
     def reset_signal_state(self):
         """Reset strategy internal state after position closing or failed orders."""
