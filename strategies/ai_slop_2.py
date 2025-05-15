@@ -35,7 +35,7 @@ MACD_STRATEGY_CONFIG = {
     
     # Trading Behavior
     'WAIT_CANDLES_AFTER_EXIT': 0,   # Candles to wait after exit before re-entry
-    'EXIT_THRESHOLD': 20.0,         # Exit when MACD is this many points above/below signal (in direction against the trade)
+    'EXIT_THRESHOLD': 10.0,         # Exit when MACD is this many points above/below signal (in direction against the trade)
 }
 
 # Example command to run with custom MACD parameters:

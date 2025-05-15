@@ -23,7 +23,8 @@ STRATEGY_MAPPING = {
     'ema': 'strategies.ema_strategy.EMAStrategy',     # Alternative alias
     'ai_slop_1': 'strategies.ai_slop_1.AISlope1Strategy',  # Full name alias
     'ai_slop_2': 'strategies.ai_slop_2.AISlope2Strategy',  # Full name alias
-    'ai_slop_3': 'strategies.ai_slop_3.AISlope3Strategy'   # Market Structure strategy
+    'ai_slop_3': 'strategies.ai_slop_3.AISlope3Strategy',   # Market Structure strategy
+    'ai_slop_4': 'strategies.ai_slop_4.AISlope4Strategy'   # ADX Breakout strategy
 }
 
 # Core Trader Configuration
@@ -390,22 +391,17 @@ class DataFetcher:
                 count = MAX_SAFE_BARS
             
             # Attempt to get data from MT5
-            try:
-                rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
-                if rates is None or len(rates) == 0:
-                    err_code, err_msg = mt5.last_error()
-                    print(f"❌ Failed to get historical data for {symbol} ({timeframe}): Error {err_code}: {err_msg}")
-                    return None
-            except Exception as e:
-                print(f"❌ MT5 data retrieval error: {e}")
-                print(f"⚠️ Make sure {symbol} is available in your MT5 terminal and has sufficient history")
+            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+            if rates is None or len(rates) == 0:
+                err_code, err_msg = mt5.last_error()
+                print(f"❌ Failed to get historical data for {symbol} ({timeframe}): Error {err_code}: {err_msg}")
                 return None
-            
+
             # Process the data
             df = pd.DataFrame(rates)
             df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             df.set_index('time', inplace=True)
-            
+
             # Add indicators if data is valid
             if not df.empty:
                 for indicator_conf in INDICATOR_CONFIG:
@@ -451,7 +447,7 @@ class DataFetcher:
                             df[output_col_name] = np.nan
             else:
                 print("⚠️ DataFrame is empty, cannot calculate indicators.")
-                
+
             return df
             
         except Exception as e:
@@ -667,23 +663,6 @@ class TradeExecutor:
             print("❌ Failed to get current prices")
             return None
             
-        # Get historical data to calculate ATR (need this for dynamic SL/TP)
-        rates = mt5.copy_rates_from_pos(symbol, CORE_CONFIG['TIMEFRAME'], 0, RISK_CONFIG['ATR_LOOKBACK_CANDLES'])
-        if rates is None or len(rates) == 0:
-            print("❌ Failed to get historical data for ATR calculation")
-            return None
-            
-        df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-        df.set_index('time', inplace=True)
-        
-        # Calculate ATR
-        atr_value = IndicatorCalculator.calculate_atr(df).iloc[-1]
-        if pd.isna(atr_value) or atr_value <= 0:
-            print(f"⚠️ Invalid ATR value: {atr_value}. Using fallback.")
-            # Will use fallback in RiskManager
-            atr_value = None
-            
         # Use current market prices for more reliable execution
         if order_type == mt5.ORDER_TYPE_BUY:
             # For BUY orders, use ask price
@@ -691,30 +670,67 @@ class TradeExecutor:
         else:  # SELL
             # For SELL orders, use bid price
             actual_entry_price = current_tick.bid
-        
-        # Check for strategy-specific SL/TP ATR multipliers
-        sl_multiplier = None
-        tp_multiplier = None
-        
-        if strategy is not None and hasattr(strategy, 'config'):
-            # Check if strategy has its own SL/TP multipliers
-            sl_multiplier = strategy.config.get('SL_ATR_MULT')
-            tp_multiplier = strategy.config.get('TP_ATR_MULT')
             
-            if sl_multiplier is not None and tp_multiplier is not None:
-                print(f"⚙️ Using strategy-specific settings: SL={sl_multiplier}x ATR, TP={tp_multiplier}x ATR")
-        
-        # Calculate dynamic SL/TP based on ATR
-        try:
-            sl_price, tp_price = RiskManager.calculate_dynamic_sltp(
-                symbol_info, order_type, actual_entry_price, atr_value,
-                sl_multiplier, tp_multiplier
-            )
-        except Exception as e:
-            print(f"❌ Error calculating SL/TP levels: {e}")
-            return None
-        
-        print(f"🎯 Calculated prices: Entry={actual_entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
+        # ================== SL/TP CALCULATION ==================
+        # Check if strategy uses custom SL/TP calculation
+        use_custom_sltp = False
+        if strategy is not None and hasattr(strategy, 'use_custom_sltp'):
+            use_custom_sltp = strategy.use_custom_sltp
+            
+        if use_custom_sltp and sl_price is not None and tp_price is not None:
+            print(f"🔧 Using strategy's custom SL/TP calculation")
+            # Use the SL/TP values provided by the strategy
+            # Adjust for the actual entry price vs. the suggested entry price
+            price_diff = actual_entry_price - price
+            sl_price = sl_price + price_diff
+            tp_price = tp_price + price_diff
+            
+            # Round to appropriate digits
+            sl_price = round(sl_price, symbol_info.digits)
+            tp_price = round(tp_price, symbol_info.digits)
+            
+            print(f"🎯 Custom SL/TP: Entry={actual_entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
+        else:
+            # Get historical data to calculate ATR (need this for dynamic SL/TP)
+            rates = mt5.copy_rates_from_pos(symbol, CORE_CONFIG['TIMEFRAME'], 0, RISK_CONFIG['ATR_LOOKBACK_CANDLES'])
+            if rates is None or len(rates) == 0:
+                print("❌ Failed to get historical data for ATR calculation")
+                return None
+                
+            df = pd.DataFrame(rates)
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+            df.set_index('time', inplace=True)
+            
+            # Calculate ATR
+            atr_value = IndicatorCalculator.calculate_atr(df).iloc[-1]
+            if pd.isna(atr_value) or atr_value <= 0:
+                print(f"⚠️ Invalid ATR value: {atr_value}. Using fallback.")
+                # Will use fallback in RiskManager
+                atr_value = None
+            
+            # Check for strategy-specific SL/TP ATR multipliers
+            sl_multiplier = None
+            tp_multiplier = None
+            
+            if strategy is not None and hasattr(strategy, 'config'):
+                # Check if strategy has its own SL/TP multipliers
+                sl_multiplier = strategy.config.get('SL_ATR_MULT')
+                tp_multiplier = strategy.config.get('TP_ATR_MULT')
+                
+                if sl_multiplier is not None and tp_multiplier is not None:
+                    print(f"⚙️ Using strategy-specific settings: SL={sl_multiplier}x ATR, TP={tp_multiplier}x ATR")
+            
+            # Calculate dynamic SL/TP based on ATR
+            try:
+                sl_price, tp_price = RiskManager.calculate_dynamic_sltp(
+                    symbol_info, order_type, actual_entry_price, atr_value,
+                    sl_multiplier, tp_multiplier
+                )
+            except Exception as e:
+                print(f"❌ Error calculating SL/TP levels: {e}")
+                return None
+            
+            print(f"🎯 ATR-based prices: Entry={actual_entry_price:.5f}, SL={sl_price:.5f}, TP={tp_price:.5f}")
         
         # Create the order request with SL/TP included
         request = {
@@ -727,7 +743,7 @@ class TradeExecutor:
             "tp": tp_price,
             "deviation": deviation,
             "magic": magic_number,
-            "comment": "Trade with ATR-based SL/TP",
+            "comment": "Trade with custom SL/TP" if use_custom_sltp else "Trade with ATR-based SL/TP",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -827,6 +843,8 @@ def parse_arguments():
                        help='Fixed volume/lot size to trade (default: 0.01)')
     parser.add_argument('--config', type=str, default=None,
                        help='JSON string with strategy configuration parameters (e.g., \'{"SL_ATR_MULT": 2.0}\')')
+    parser.add_argument('--timeframe', type=str, default="1m",
+                       help='Timeframe to use (e.g., "1m", "5m", "15m", "1h", "4h", "1d")')
     # Add more arguments as needed (e.g., config file path)
     return parser.parse_args()
 
@@ -863,6 +881,30 @@ def main():
         except json.JSONDecodeError as e:
             print(f"❌ Error parsing config JSON: {e}")
             return
+            
+    # Parse timeframe
+    timeframe_map = {
+        "1m": mt5.TIMEFRAME_M1,
+        "5m": mt5.TIMEFRAME_M5,
+        "15m": mt5.TIMEFRAME_M15,
+        "30m": mt5.TIMEFRAME_M30,
+        "1h": mt5.TIMEFRAME_H1,
+        "4h": mt5.TIMEFRAME_H4,
+        "1d": mt5.TIMEFRAME_D1,
+        "1W": mt5.TIMEFRAME_W1,
+        "1M": mt5.TIMEFRAME_MN1
+    }
+    
+    # Default to M1 if invalid timeframe provided
+    if args.timeframe not in timeframe_map:
+        print(f"⚠️ Invalid timeframe '{args.timeframe}', using 1m instead")
+        timeframe = mt5.TIMEFRAME_M1
+    else:
+        timeframe = timeframe_map[args.timeframe]
+        print(f"📊 Using timeframe: {args.timeframe}")
+        
+    # Update the CORE_CONFIG timeframe
+    CORE_CONFIG['TIMEFRAME'] = timeframe
 
     if not MT5Helper.initialize_mt5(): return
     if not MT5Helper.check_autotrading_enabled(): MT5Helper.shutdown(); return
