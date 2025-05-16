@@ -7,51 +7,56 @@
 #property link      "https://www.example.com"
 #property version   "1.01"
 
-// This EA implements Rob Booker's ADX Breakout Strategy
-// It uses a CUSTOM ADX calculation that exactly matches the Python implementation 
-// using Wilder's smoothing method (EMA with alpha=1/period).
+// Strategy Overview:
+// This EA implements Rob Booker's ADX Breakout Strategy, which identifies consolidation
+// periods using ADX and trades breakouts from these periods. The strategy is designed
+// to catch the beginning of new trends after periods of low volatility.
 //
-// Key Features:
-// - Custom ADX calculation to ensure identical results with Python version
-// - Box levels using highest high and lowest low
-// - Trades breakouts when ADX is below threshold (consolidation)
-// - Visual drawing of box levels on chart
-//
-// Strategy Logic:
-// 1. ADX below threshold (18) indicates consolidation
-// 2. Box formed from highest high and lowest low
-// 3. Entry when price breaks out of box while ADX is low
-// 4. Exit with fixed risk:reward based on box width
+// Core Strategy Components:
+// 1. ADX (Average Directional Index) - Used to identify consolidation periods
+//    - Custom implementation using Wilder's smoothing method
+//    - Consolidation identified when ADX is below threshold (default: 18)
+// 2. Breakout Box - Price range formed during consolidation
+//    - Upper level: Highest high over lookback period
+//    - Lower level: Lowest low over lookback period
+//    - Box width used for stop loss and take profit calculations
+// 3. Entry Conditions:
+//    - ADX must be below threshold (indicating consolidation)
+//    - Price must break out of the box (above upper or below lower)
+//    - No existing position
+// 4. Exit Conditions:
+//    - Fixed risk:reward ratio based on box width
+//    - Stop loss: 1x box width
+//    - Take profit: 2x box width (configurable)
 
-// Input Parameters - matching the PineScript
-input int                ADX_SMOOTH_PERIOD = 14;        // ADX Smoothing Period
-input int                ADX_PERIOD = 14;               // ADX Period
-input double             ADX_LOWER_LEVEL = 14;          // ADX Lower Level (must be BELOW this for valid signal)
-input double             PROFIT_TARGET_MULTIPLE = 2.0;  // Profit Target Box Width Multiple
-input double             STOP_LOSS_MULTIPLE = 1;      // Stop Loss Box Width Multiple
-input int                BOX_LOOKBACK = 25;             // Breakout Box Lookback Period (reduced from 20)
-input int                ENABLE_DIRECTION = 0;          // Both(0), Long(1), Short(-1)
-input double             TRADE_VOLUME = 1;              // Trade volume in lots
-input int                MAGIC_NUMBER = 234000;         // Magic Number for order identification
-input bool               VERBOSE_LOGGING = true;        // Enable detailed logging
-input bool               DRAW_BOXES = true;             // Draw box levels on chart
-input bool               SHOW_ADX_VALUES = true;        // Show custom ADX values in chart comments
+// Strategy Parameters
+input int                ADX_SMOOTH_PERIOD = 14;        // ADX Smoothing Period (Wilder's smoothing)
+input int                ADX_PERIOD = 14;               // ADX Calculation Period
+input double             ADX_CONSOLIDATION_THRESHOLD = 14; // ADX Threshold for Consolidation
+input double             PROFIT_TARGET_MULTIPLE = 2.0;  // Take Profit as Multiple of Box Width
+input double             STOP_LOSS_MULTIPLE = 1.0;      // Stop Loss as Multiple of Box Width
+input int                BOX_LOOKBACK_PERIOD = 25;      // Period for Box Level Calculation
+input int                TRADE_DIRECTION = 0;           // Trade Direction: Both(0), Long(1), Short(-1)
+input double             TRADE_VOLUME = 1.0;            // Position Size in Lots
+input int                MAGIC_NUMBER = 234000;         // Unique Identifier for EA Orders
+input bool               ENABLE_LOGGING = true;         // Enable Detailed Logging
+input bool               SHOW_BOX_LEVELS = true;        // Display Box Levels on Chart
+input bool               SHOW_ADX_INFO = true;          // Show ADX Information on Chart
 
-// Global Variables
-int                      adx_handle = INVALID_HANDLE;   // Not used anymore, will calculate manually
-double                   box_upper_level;               // Upper level of the box
-double                   box_lower_level;               // Lower level of the box
-double                   box_width;                     // Width of the box
-bool                     in_position = false;           // Flag for position tracking
-bool                     is_adx_low = false;            // Flag for ADX below threshold
-datetime                 last_bar_time = 0;             // Time of the last processed bar
-double                   position_price = 0;            // Entry price of the current position
-int                      position_type = -1;            // 0 for buy, 1 for sell, -1 for none
-ulong                    position_ticket = 0;           // Ticket of the current position
+// Global State Variables
+double                   box_upper_level;               // Upper Boundary of Breakout Box
+double                   box_lower_level;               // Lower Boundary of Breakout Box
+double                   box_width;                     // Width of Breakout Box
+bool                     is_in_position;                // Current Position Status
+bool                     is_adx_below_threshold;        // ADX Consolidation Status
+datetime                 last_processed_bar_time;       // Last Bar Processing Time
+double                   position_entry_price;          // Current Position Entry Price
+int                      current_position_type;         // Current Position Type (0=Long, 1=Short, -1=None)
+ulong                    current_position_ticket;       // Current Position Ticket
 
-// Objects for visualizing the box levels
-string                   obj_box_upper = "ADX_Box_Upper";
-string                   obj_box_lower = "ADX_Box_Lower";
+// Chart Object Names
+string                   box_upper_line = "ADX_Box_Upper";
+string                   box_lower_line = "ADX_Box_Lower";
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -62,11 +67,11 @@ int OnInit()
    PrintConfig();
    
    // Clear any old objects
-   ObjectDelete(0, obj_box_upper);
-   ObjectDelete(0, obj_box_lower);
+   ObjectDelete(0, box_upper_line);
+   ObjectDelete(0, box_lower_line);
    
    // Calculate ADX statistics for initial insight
-   if(VERBOSE_LOGGING)
+   if(ENABLE_LOGGING)
    {
       CalculateADXStatistics(100);
    }
@@ -80,8 +85,8 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    // Remove objects
-   ObjectDelete(0, obj_box_upper);
-   ObjectDelete(0, obj_box_lower);
+   ObjectDelete(0, box_upper_line);
+   ObjectDelete(0, box_lower_line);
       
    Comment(""); // Clear chart comment
 }
@@ -117,40 +122,40 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Custom ADX Calculation (matching PineScript)                         |
+//| Custom ADX Calculation (Wilder's Smoothing Method)               |
 //+------------------------------------------------------------------+
 double CalculateADX(int period, int smooth_period, double &adx_values[], int required_bars)
 {
-   // Arrays for OHLC data
+   // Price data arrays
    double high[], low[], close[];
    ArraySetAsSeries(high, true);
    ArraySetAsSeries(low, true);
    ArraySetAsSeries(close, true);
    
-   // Get price data
+   // Fetch price data
    if(CopyHigh(_Symbol, _Period, 0, required_bars, high) <= 0 ||
       CopyLow(_Symbol, _Period, 0, required_bars, low) <= 0 ||
       CopyClose(_Symbol, _Period, 0, required_bars, close) <= 0)
    {
-      Print("Error copying price data for ADX calculation: ", GetLastError());
+      Print("Error: Failed to fetch price data for ADX calculation");
       return 0;
    }
    
-   // Arrays for calculations
-   double tr_array[];             // True Range
-   double plus_dm_array[];        // +DM
-   double minus_dm_array[];       // -DM
-   double smoothed_tr[];          // Smoothed TR
-   double smoothed_plus_dm[];     // Smoothed +DM
-   double smoothed_minus_dm[];    // Smoothed -DM
-   double di_plus[];              // DI+
-   double di_minus[];             // DI-
-   double dx[];                   // DX
+   // ADX calculation components
+   double true_range[];           // True Range values
+   double positive_dm[];          // Positive Directional Movement
+   double negative_dm[];          // Negative Directional Movement
+   double smoothed_tr[];          // Smoothed True Range
+   double smoothed_plus_dm[];     // Smoothed Positive DM
+   double smoothed_minus_dm[];    // Smoothed Negative DM
+   double di_plus[];              // Positive Directional Indicator
+   double di_minus[];             // Negative Directional Indicator
+   double dx[];                   // Directional Index
    
    // Initialize arrays
-   ArrayResize(tr_array, required_bars);
-   ArrayResize(plus_dm_array, required_bars);
-   ArrayResize(minus_dm_array, required_bars);
+   ArrayResize(true_range, required_bars);
+   ArrayResize(positive_dm, required_bars);
+   ArrayResize(negative_dm, required_bars);
    ArrayResize(smoothed_tr, required_bars);
    ArrayResize(smoothed_plus_dm, required_bars);
    ArrayResize(smoothed_minus_dm, required_bars);
@@ -159,9 +164,10 @@ double CalculateADX(int period, int smooth_period, double &adx_values[], int req
    ArrayResize(dx, required_bars);
    ArrayResize(adx_values, required_bars);
    
-   ArraySetAsSeries(tr_array, true);
-   ArraySetAsSeries(plus_dm_array, true);
-   ArraySetAsSeries(minus_dm_array, true);
+   // Set arrays as series (newest first)
+   ArraySetAsSeries(true_range, true);
+   ArraySetAsSeries(positive_dm, true);
+   ArraySetAsSeries(negative_dm, true);
    ArraySetAsSeries(smoothed_tr, true);
    ArraySetAsSeries(smoothed_plus_dm, true);
    ArraySetAsSeries(smoothed_minus_dm, true);
@@ -173,57 +179,55 @@ double CalculateADX(int period, int smooth_period, double &adx_values[], int req
    // Calculate True Range and Directional Movement
    for(int i = required_bars - 2; i >= 0; i--)
    {
-      // True Range calculation (max of high-low, |high-prev_close|, |low-prev_close|)
-      double hl = high[i] - low[i];
-      double hpc = MathAbs(high[i] - close[i+1]);
-      double lpc = MathAbs(low[i] - close[i+1]);
-      tr_array[i] = MathMax(hl, MathMax(hpc, lpc));
+      // True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+      double high_low_range = high[i] - low[i];
+      double high_prev_close = MathAbs(high[i] - close[i+1]);
+      double low_prev_close = MathAbs(low[i] - close[i+1]);
+      true_range[i] = MathMax(high_low_range, MathMax(high_prev_close, low_prev_close));
       
       // Calculate Directional Movement
       double up_move = high[i] - high[i+1];
       double down_move = low[i+1] - low[i];
       
-      // Exactly matching PineScript logic:
-      // Where pos_dm > neg_dm and pos_dm > 0, else 0
-      // Where neg_dm > pos_dm and neg_dm > 0, else 0
+      // Positive DM: up_move > down_move and up_move > 0
       if(up_move > down_move && up_move > 0)
-         plus_dm_array[i] = up_move;
+         positive_dm[i] = up_move;
       else
-         plus_dm_array[i] = 0;
+         positive_dm[i] = 0;
          
+      // Negative DM: down_move > up_move and down_move > 0
       if(down_move > up_move && down_move > 0)
-         minus_dm_array[i] = down_move;
+         negative_dm[i] = down_move;
       else
-         minus_dm_array[i] = 0;
+         negative_dm[i] = 0;
    }
    
-   // Apply Wilder's smoothing (exactly matching PineScript's rma() function)
+   // Apply Wilder's smoothing (EMA with alpha=1/period)
    // First value is simple average of first 'period' values
    double sum_tr = 0, sum_plus_dm = 0, sum_minus_dm = 0;
    for(int i = required_bars - 2; i >= required_bars - period - 1 && i >= 0; i--)
    {
-      sum_tr += tr_array[i];
-      sum_plus_dm += plus_dm_array[i];
-      sum_minus_dm += minus_dm_array[i];
+      sum_tr += true_range[i];
+      sum_plus_dm += positive_dm[i];
+      sum_minus_dm += negative_dm[i];
    }
    
    int first_idx = required_bars - period - 1;
    if(first_idx < 0) first_idx = 0;
    
-   // Initialize first smoothed values - EXACTLY matching PineScript's rma()
+   // Initialize first smoothed values
    smoothed_tr[first_idx] = sum_tr / period;
    smoothed_plus_dm[first_idx] = sum_plus_dm / period;
    smoothed_minus_dm[first_idx] = sum_minus_dm / period;
    
-   // Continue Wilder's smoothing - Using exact formula: smoothed = prev_smoothed - (prev_smoothed/period) + current
-   // This matches PineScript's rma() function exactly
+   // Continue Wilder's smoothing: smoothed = prev_smoothed - (prev_smoothed/period) + current
    for(int i = first_idx - 1; i >= 0; i--)
    {
-      smoothed_tr[i] = smoothed_tr[i+1] - (smoothed_tr[i+1] / period) + tr_array[i];
-      smoothed_plus_dm[i] = smoothed_plus_dm[i+1] - (smoothed_plus_dm[i+1] / period) + plus_dm_array[i];
-      smoothed_minus_dm[i] = smoothed_minus_dm[i+1] - (smoothed_minus_dm[i+1] / period) + minus_dm_array[i];
+      smoothed_tr[i] = smoothed_tr[i+1] - (smoothed_tr[i+1] / period) + true_range[i];
+      smoothed_plus_dm[i] = smoothed_plus_dm[i+1] - (smoothed_plus_dm[i+1] / period) + positive_dm[i];
+      smoothed_minus_dm[i] = smoothed_minus_dm[i+1] - (smoothed_minus_dm[i+1] / period) + negative_dm[i];
       
-      // Calculate DI+ and DI-
+      // Calculate Directional Indicators (DI+ and DI-)
       if(smoothed_tr[i] > 0)
       {
          di_plus[i] = 100 * smoothed_plus_dm[i] / smoothed_tr[i];
@@ -235,15 +239,14 @@ double CalculateADX(int period, int smooth_period, double &adx_values[], int req
          di_minus[i] = 0;
       }
       
-      // Calculate DX
+      // Calculate Directional Index (DX)
       if(di_plus[i] + di_minus[i] > 0)
          dx[i] = 100 * MathAbs(di_plus[i] - di_minus[i]) / (di_plus[i] + di_minus[i]);
       else
          dx[i] = 0;
    }
    
-   // Apply Wilder's smoothing to DX to get ADX (matching PineScript's rma())
-   // First, calculate simple average of first smooth_period DX values
+   // Apply Wilder's smoothing to DX to get ADX
    double sum_dx = 0;
    int adx_start = smooth_period;
    if(adx_start >= required_bars) adx_start = required_bars - 1;
@@ -253,37 +256,36 @@ double CalculateADX(int period, int smooth_period, double &adx_values[], int req
       sum_dx += dx[i];
    }
    
-   // First ADX value is average of DX - EXACTLY matching PineScript's rma()
+   // First ADX value is average of DX
    adx_values[adx_start] = sum_dx / smooth_period;
    
-   // Calculate subsequent ADX values using Wilder's smoothing formula
+   // Calculate subsequent ADX values using Wilder's smoothing
    for(int i = adx_start - 1; i >= 0; i--)
    {
-      // This exactly matches PineScript's rma() function
       adx_values[i] = ((adx_values[i+1] * (smooth_period - 1)) + dx[i]) / smooth_period;
    }
    
-   // Return the current ADX value (index 0)
-   double final_adx = adx_values[0];
+   // Return current ADX value
+   double current_adx = adx_values[0];
    
-   // Log additional debug values to help diagnose discrepancies
-   if(VERBOSE_LOGGING)
+   // Log detailed ADX calculation if enabled
+   if(ENABLE_LOGGING)
    {
-      Print("ADX calculation details:");
+      Print("ADX Calculation Details:");
       Print("  Current Close: ", DoubleToString(close[0], _Digits));
-      Print("  TR[0]: ", DoubleToString(tr_array[0], 6));
-      Print("  +DM[0]: ", DoubleToString(plus_dm_array[0], 6));
-      Print("  -DM[0]: ", DoubleToString(minus_dm_array[0], 6));
-      Print("  Smoothed TR[0]: ", DoubleToString(smoothed_tr[0], 6));
-      Print("  Smoothed +DM[0]: ", DoubleToString(smoothed_plus_dm[0], 6));
-      Print("  Smoothed -DM[0]: ", DoubleToString(smoothed_minus_dm[0], 6));
-      Print("  DI+[0]: ", DoubleToString(di_plus[0], 6));
-      Print("  DI-[0]: ", DoubleToString(di_minus[0], 6));
-      Print("  DX[0]: ", DoubleToString(dx[0], 6));
-      Print("  ADX[0]: ", DoubleToString(final_adx, 6));
+      Print("  True Range: ", DoubleToString(true_range[0], 6));
+      Print("  +DM: ", DoubleToString(positive_dm[0], 6));
+      Print("  -DM: ", DoubleToString(negative_dm[0], 6));
+      Print("  Smoothed TR: ", DoubleToString(smoothed_tr[0], 6));
+      Print("  Smoothed +DM: ", DoubleToString(smoothed_plus_dm[0], 6));
+      Print("  Smoothed -DM: ", DoubleToString(smoothed_minus_dm[0], 6));
+      Print("  DI+: ", DoubleToString(di_plus[0], 6));
+      Print("  DI-: ", DoubleToString(di_minus[0], 6));
+      Print("  DX: ", DoubleToString(dx[0], 6));
+      Print("  ADX: ", DoubleToString(current_adx, 6));
    }
    
-   return final_adx;
+   return current_adx;
 }
 
 //+------------------------------------------------------------------+
@@ -293,10 +295,10 @@ bool IsNewBar()
 {
    datetime current_bar_time = iTime(_Symbol, _Period, 0);
    
-   if(current_bar_time == last_bar_time)
+   if(current_bar_time == last_processed_bar_time)
       return false;
       
-   last_bar_time = current_bar_time;
+   last_processed_bar_time = current_bar_time;
    return true;
 }
 
@@ -305,10 +307,10 @@ bool IsNewBar()
 //+------------------------------------------------------------------+
 void UpdatePositionStatus()
 {
-   bool previous_status = in_position;
-   in_position = false;
-   position_ticket = 0;
-   position_type = -1;
+   bool previous_status = is_in_position;
+   is_in_position = false;
+   current_position_ticket = 0;
+   current_position_type = -1;
    
    // Check for open positions with our magic number
    for(int i = 0; i < PositionsTotal(); i++)
@@ -324,10 +326,10 @@ void UpdatePositionStatus()
                PositionGetString(POSITION_SYMBOL) == _Symbol)
             {
                // Found our position
-               in_position = true;
-               position_ticket = ticket;
-               position_type = (int)PositionGetInteger(POSITION_TYPE); // 0 for buy, 1 for sell
-               position_price = PositionGetDouble(POSITION_PRICE_OPEN);
+               is_in_position = true;
+               current_position_ticket = ticket;
+               current_position_type = (int)PositionGetInteger(POSITION_TYPE); // 0 for buy, 1 for sell
+               position_entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
                break;
             }
          }
@@ -335,13 +337,13 @@ void UpdatePositionStatus()
    }
    
    // Log position status change if needed
-   if(previous_status != in_position || VERBOSE_LOGGING)
+   if(previous_status != is_in_position || ENABLE_LOGGING)
    {
-      if(in_position)
+      if(is_in_position)
       {
-         string pos_type_str = (position_type == 0) ? "LONG" : "SHORT";
-         Print("Position status: IN POSITION (", pos_type_str, ") - Ticket: ", position_ticket);
-         Print("Entry price: ", DoubleToString(position_price, _Digits));
+         string pos_type_str = (current_position_type == 0) ? "LONG" : "SHORT";
+         Print("Position status: IN POSITION (", pos_type_str, ") - Ticket: ", current_position_ticket);
+         Print("Entry price: ", DoubleToString(position_entry_price, _Digits));
       }
       else
       {
@@ -355,23 +357,23 @@ void UpdatePositionStatus()
 //+------------------------------------------------------------------+
 void DrawBoxLevels()
 {
-   if(!DRAW_BOXES) return;
+   if(!SHOW_BOX_LEVELS) return;
    
    // Set line properties for upper box level
-   ObjectDelete(0, obj_box_upper);
-   ObjectCreate(0, obj_box_upper, OBJ_HLINE, 0, 0, box_upper_level);
-   ObjectSetInteger(0, obj_box_upper, OBJPROP_COLOR, clrBlue);
-   ObjectSetInteger(0, obj_box_upper, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, obj_box_upper, OBJPROP_WIDTH, 1);
-   ObjectSetString(0, obj_box_upper, OBJPROP_TEXT, "Box Upper: " + DoubleToString(box_upper_level, _Digits));
+   ObjectDelete(0, box_upper_line);
+   ObjectCreate(0, box_upper_line, OBJ_HLINE, 0, 0, box_upper_level);
+   ObjectSetInteger(0, box_upper_line, OBJPROP_COLOR, clrBlue);
+   ObjectSetInteger(0, box_upper_line, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, box_upper_line, OBJPROP_WIDTH, 1);
+   ObjectSetString(0, box_upper_line, OBJPROP_TEXT, "Box Upper: " + DoubleToString(box_upper_level, _Digits));
    
    // Set line properties for lower box level
-   ObjectDelete(0, obj_box_lower);
-   ObjectCreate(0, obj_box_lower, OBJ_HLINE, 0, 0, box_lower_level);
-   ObjectSetInteger(0, obj_box_lower, OBJPROP_COLOR, clrRed);
-   ObjectSetInteger(0, obj_box_lower, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, obj_box_lower, OBJPROP_WIDTH, 1);
-   ObjectSetString(0, obj_box_lower, OBJPROP_TEXT, "Box Lower: " + DoubleToString(box_lower_level, _Digits));
+   ObjectDelete(0, box_lower_line);
+   ObjectCreate(0, box_lower_line, OBJ_HLINE, 0, 0, box_lower_level);
+   ObjectSetInteger(0, box_lower_line, OBJPROP_COLOR, clrRed);
+   ObjectSetInteger(0, box_lower_line, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, box_lower_line, OBJPROP_WIDTH, 1);
+   ObjectSetString(0, box_lower_line, OBJPROP_TEXT, "Box Lower: " + DoubleToString(box_lower_level, _Digits));
 }
 
 //+------------------------------------------------------------------+
@@ -379,10 +381,10 @@ void DrawBoxLevels()
 //+------------------------------------------------------------------+
 void DisplayADXInformation(double adx_value)
 {
-   if(!SHOW_ADX_VALUES) return;
+   if(!SHOW_ADX_INFO) return;
    
    // Change background color to visually indicate when ADX is below threshold
-   if(adx_value < ADX_LOWER_LEVEL)
+   if(adx_value < ADX_CONSOLIDATION_THRESHOLD)
    {
       // Highlight the background when we're in a consolidation phase
       ChartSetInteger(0, CHART_COLOR_BACKGROUND, clrLavender);
@@ -400,7 +402,7 @@ void DisplayADXInformation(double adx_value)
 bool CalculateIndicators()
 {
    // Define how many bars we need
-   int required_bars = MathMax(100, ADX_PERIOD + ADX_SMOOTH_PERIOD + BOX_LOOKBACK + 20);
+   int required_bars = MathMax(100, ADX_PERIOD + ADX_SMOOTH_PERIOD + BOX_LOOKBACK_PERIOD + 20);
    
    // Make sure we have enough bars
    if(Bars(_Symbol, _Period) < required_bars)
@@ -413,7 +415,7 @@ bool CalculateIndicators()
    static datetime last_adx_analysis_time = 0;
    
    // Run ADX analysis every 24 hours (for daily tracking)
-   if(VERBOSE_LOGGING && TimeCurrent() - last_adx_analysis_time > PeriodSeconds(PERIOD_D1))
+   if(ENABLE_LOGGING && TimeCurrent() - last_adx_analysis_time > PeriodSeconds(PERIOD_D1))
    {
       CalculateADXStatistics(100);
       last_adx_analysis_time = TimeCurrent();
@@ -438,9 +440,9 @@ bool CalculateIndicators()
    
    // Check if ADX is below the lower level (consolidation)
    // Use previous bar's ADX value for signal generation (index 1)
-   is_adx_low = adx_values[1] < ADX_LOWER_LEVEL;
-   Print("ADX Value (prev bar):", DoubleToString(adx_values[1], 2), " threshold:", DoubleToString(ADX_LOWER_LEVEL, 2),
-         " => ADX is ", is_adx_low ? "BELOW threshold (good for signal)" : "ABOVE threshold (no signal)");
+   is_adx_below_threshold = adx_values[1] < ADX_CONSOLIDATION_THRESHOLD;
+   Print("ADX Value (prev bar):", DoubleToString(adx_values[1], 2), " threshold:", DoubleToString(ADX_CONSOLIDATION_THRESHOLD, 2),
+         " => ADX is ", is_adx_below_threshold ? "BELOW threshold (good for signal)" : "ABOVE threshold (no signal)");
    
    double old_upper = box_upper_level;
    double old_lower = box_lower_level;
@@ -451,7 +453,7 @@ bool CalculateIndicators()
    // boxLowerLevel = strategy.position_size == 0 ? lowest(low, boxLookBack)[1] : boxLowerLevel[1]
    
    // Only update box levels when NOT in a position
-   if(!in_position)
+   if(!is_in_position)
    {
       // Arrays for price data
       double high[];
@@ -466,10 +468,10 @@ bool CalculateIndicators()
       ArraySetAsSeries(high, true);
       ArraySetAsSeries(low, true);
       
-      // Get price data starting from bar index 1 (previous bar) for BOX_LOOKBACK bars
+      // Get price data starting from bar index 1 (previous bar) for BOX_LOOKBACK_PERIOD bars
       // This exactly matches highest(high, boxLookBack)[1] and lowest(low, boxLookBack)[1]
-      if(CopyHigh(_Symbol, _Period, 1, BOX_LOOKBACK, high) <= 0 ||
-         CopyLow(_Symbol, _Period, 1, BOX_LOOKBACK, low) <= 0)
+      if(CopyHigh(_Symbol, _Period, 1, BOX_LOOKBACK_PERIOD, high) <= 0 ||
+         CopyLow(_Symbol, _Period, 1, BOX_LOOKBACK_PERIOD, low) <= 0)
       {
          Print("Error copying price data: ", GetLastError());
          return false;
@@ -483,7 +485,7 @@ bool CalculateIndicators()
       int high_idx = 1;
       int low_idx = 1;
       
-      for(int i = 1; i < BOX_LOOKBACK; i++)
+      for(int i = 1; i < BOX_LOOKBACK_PERIOD; i++)
       {
          if(high[i] > highest_high)
          {
@@ -502,8 +504,8 @@ bool CalculateIndicators()
       box_width = box_upper_level - box_lower_level;
       
       // Log all bars used in the box calculation
-      Print("Box calculation from bars 1 to ", BOX_LOOKBACK, " (0 is current bar, not included):");
-      for(int i = 0; i < MathMin(BOX_LOOKBACK, ArraySize(high)); i++)
+      Print("Box calculation from bars 1 to ", BOX_LOOKBACK_PERIOD, " (0 is current bar, not included):");
+      for(int i = 0; i < MathMin(BOX_LOOKBACK_PERIOD, ArraySize(high)); i++)
       {
          Print("  Bar[", i + 1, "] High:", DoubleToString(high[i], _Digits), 
                " Low:", DoubleToString(low[i], _Digits));
@@ -540,8 +542,8 @@ bool CalculateIndicators()
    double previous_close = close_prices[1];
    
    // Log box and ADX details
-   string adx_status = is_adx_low ? "LOW ✓" : "HIGH ✗";
-   string position_status = in_position ? (position_type == 0 ? "IN LONG" : "IN SHORT") : "NO POSITION";
+   string adx_status = is_adx_below_threshold ? "LOW ✓" : "HIGH ✗";
+   string position_status = is_in_position ? (current_position_type == 0 ? "IN LONG" : "IN SHORT") : "NO POSITION";
    
    // Check for crosses - EXACTLY matching PineScript cross() function
    // In PineScript, cross(close, boxUpperLevel) only checks if current > upper
@@ -559,7 +561,7 @@ bool CalculateIndicators()
          ", Cross Down: ", cross_below_lower ? "YES" : "No");
    
    Comment("ADX Breakout EA\n",
-           "ADX=", DoubleToString(current_adx, 2), "/", DoubleToString(ADX_LOWER_LEVEL, 2),
+           "ADX=", DoubleToString(current_adx, 2), "/", DoubleToString(ADX_CONSOLIDATION_THRESHOLD, 2),
            " (", adx_status, ") | ", position_status, "\n",
            "Upper=", DoubleToString(box_upper_level, _Digits), 
            ", Lower=", DoubleToString(box_lower_level, _Digits), "\n",
@@ -571,135 +573,143 @@ bool CalculateIndicators()
 }
 
 //+------------------------------------------------------------------+
-//| Process trade signals - match PineScript cross() function exactly |
+//| Process trade signals and execute trades                          |
 //+------------------------------------------------------------------+
 void ProcessTradeSignals()
 {
-   // Get the last 2 closes - current and previous bar
+   // Get current and previous bar close prices
    double close_prices[];
    ArraySetAsSeries(close_prices, true);
    
    if(CopyClose(_Symbol, _Period, 0, 2, close_prices) <= 0)
    {
-      Print("Failed to get close prices for signal processing");
+      Print("Error: Failed to fetch close prices for signal processing");
       return;
    }
    
    double current_close = close_prices[0];
    double previous_close = close_prices[1];
        
-   // Check for crosses - EXACTLY matching PineScript cross() function
-   // In PineScript, cross(close, boxUpperLevel) only checks if current > upper
-   bool cross_above_upper = (current_close > box_upper_level);
+   // Check for breakout signals
+   bool breakout_above = (current_close > box_upper_level);
+   bool breakout_below = (current_close < box_lower_level);
    
-   // In PineScript, crossunder(close, boxLowerLevel) only checks if current < lower
-   bool cross_below_lower = (current_close < box_lower_level);
-   
-   // Always log the cross check for debugging
-   Print("Cross check: Current=", DoubleToString(current_close, _Digits),
-         ", Previous=", DoubleToString(previous_close, _Digits),
-         ", Upper=", DoubleToString(box_upper_level, _Digits),
-         ", Lower=", DoubleToString(box_lower_level, _Digits),
-         ", ADX Low=", is_adx_low ? "Yes" : "No");
+   // Log breakout check details
+   if(ENABLE_LOGGING)
+   {
+      Print("Breakout Check:");
+      Print("  Current Close: ", DoubleToString(current_close, _Digits));
+      Print("  Previous Close: ", DoubleToString(previous_close, _Digits));
+      Print("  Box Upper: ", DoubleToString(box_upper_level, _Digits));
+      Print("  Box Lower: ", DoubleToString(box_lower_level, _Digits));
+      Print("  ADX Below Threshold: ", is_adx_below_threshold ? "Yes" : "No");
+   }
       
-   if(cross_above_upper)
+   if(breakout_above)
    {
-      Print("⚠️ DETECTED CROSS ABOVE: ", DoubleToString(current_close, _Digits), " > ", 
-            DoubleToString(box_upper_level, _Digits), " (prev: ", DoubleToString(previous_close, _Digits), ")");
+      Print("⚠️ Breakout Above Box: ", DoubleToString(current_close, _Digits), " > ", 
+            DoubleToString(box_upper_level, _Digits));
    }
    
-   if(cross_below_lower)
+   if(breakout_below)
    {
-      Print("⚠️ DETECTED CROSS BELOW: ", DoubleToString(current_close, _Digits), " < ", 
-            DoubleToString(box_lower_level, _Digits), " (prev: ", DoubleToString(previous_close, _Digits), ")");
+      Print("⚠️ Breakout Below Box: ", DoubleToString(current_close, _Digits), " < ", 
+            DoubleToString(box_lower_level, _Digits));
    }
    
-   // In PineScript:
-   // isBuyValid = strategy.position_size == 0 and cross(close, boxUpperLevel) and isADXLow
-   // isSellValid = strategy.position_size == 0 and cross(boxLowerLevel, close) and isADXLow
+   // Check trade direction settings
+   bool can_trade_long = (TRADE_DIRECTION == 0 || TRADE_DIRECTION == 1);
+   bool can_trade_short = (TRADE_DIRECTION == 0 || TRADE_DIRECTION == -1);
    
-   // Check direction settings
-   bool can_go_long = (ENABLE_DIRECTION == 0 || ENABLE_DIRECTION == 1);
-   bool can_go_short = (ENABLE_DIRECTION == 0 || ENABLE_DIRECTION == -1);
+   // Validate entry conditions
+   bool long_entry_valid = !is_in_position && breakout_above && is_adx_below_threshold && can_trade_long;
+   bool short_entry_valid = !is_in_position && breakout_below && is_adx_below_threshold && can_trade_short;
    
-   // Long entry condition exactly matching PineScript
-   bool is_buy_valid = !in_position && cross_above_upper && is_adx_low && can_go_long;
-   
-   // Short entry condition exactly matching PineScript
-   bool is_sell_valid = !in_position && cross_below_lower && is_adx_low && can_go_short;
-   
-   // Detailed signal analysis
-   if(cross_above_upper)
+   // Analyze and log entry signals
+   if(breakout_above)
    {
-      string signal_status = is_buy_valid ? "✅ VALID!" : "❌ INVALID because:";
+      string signal_status = long_entry_valid ? "✅ VALID!" : "❌ INVALID because:";
       string reason = "";
       
-      if(!can_go_long) reason += " Direction not allowed.";
-      if(in_position) reason += " Already in position.";
-      if(!is_adx_low) reason += " ADX not below threshold.";
+      if(!can_trade_long) reason += " Long trades not allowed.";
+      if(is_in_position) reason += " Already in position.";
+      if(!is_adx_below_threshold) reason += " ADX not below threshold.";
       
-      Print("🔍 LONG SIGNAL ANALYSIS: ", signal_status, reason);
+      Print("🔍 Long Entry Analysis: ", signal_status, reason);
       
-      // Log signal components for debugging
-      Print("  - Not in position: ", !in_position ? "✓" : "✗");
-      Print("  - Cross above upper: ", cross_above_upper ? "✓" : "✗");
-      Print("  - ADX below threshold: ", is_adx_low ? "✓" : "✗");
-      Print("  - Can go long: ", can_go_long ? "✓" : "✗");
+      if(ENABLE_LOGGING)
+      {
+         Print("  - No existing position: ", !is_in_position ? "✓" : "✗");
+         Print("  - Breakout above box: ", breakout_above ? "✓" : "✗");
+         Print("  - ADX below threshold: ", is_adx_below_threshold ? "✓" : "✗");
+         Print("  - Long trades allowed: ", can_trade_long ? "✓" : "✗");
+      }
    }
    
-   if(cross_below_lower)
+   if(breakout_below)
    {
-      string signal_status = is_sell_valid ? "✅ VALID!" : "❌ INVALID because:";
+      string signal_status = short_entry_valid ? "✅ VALID!" : "❌ INVALID because:";
       string reason = "";
       
-      if(!can_go_short) reason += " Direction not allowed.";
-      if(in_position) reason += " Already in position.";
-      if(!is_adx_low) reason += " ADX not below threshold.";
+      if(!can_trade_short) reason += " Short trades not allowed.";
+      if(is_in_position) reason += " Already in position.";
+      if(!is_adx_below_threshold) reason += " ADX not below threshold.";
       
-      Print("🔍 SHORT SIGNAL ANALYSIS: ", signal_status, reason);
+      Print("🔍 Short Entry Analysis: ", signal_status, reason);
       
-      // Log signal components for debugging
-      Print("  - Not in position: ", !in_position ? "✓" : "✗");
-      Print("  - Cross below lower: ", cross_below_lower ? "✓" : "✗");
-      Print("  - ADX below threshold: ", is_adx_low ? "✓" : "✗");
-      Print("  - Can go short: ", can_go_short ? "✓" : "✗");
+      if(ENABLE_LOGGING)
+      {
+         Print("  - No existing position: ", !is_in_position ? "✓" : "✗");
+         Print("  - Breakout below box: ", breakout_below ? "✓" : "✗");
+         Print("  - ADX below threshold: ", is_adx_below_threshold ? "✓" : "✗");
+         Print("  - Short trades allowed: ", can_trade_short ? "✓" : "✗");
+      }
    }
    
-   if(is_buy_valid)
+   // Execute valid trades
+   if(long_entry_valid)
    {
-      Print("⬆️ LONG SIGNAL: Price ", DoubleToString(current_close, _Digits), " crossed above box upper ",
-            DoubleToString(box_upper_level, _Digits), " with ADX low");
+      Print("⬆️ Long Entry Signal: Price ", DoubleToString(current_close, _Digits), 
+            " broke above box upper ", DoubleToString(box_upper_level, _Digits), 
+            " with ADX below threshold");
       
-      // Calculate price levels for the trade
+      // Calculate trade levels
       double entry_price = current_close;
-      double sl_price = entry_price - STOP_LOSS_MULTIPLE * box_width;
-      double tp_price = entry_price + PROFIT_TARGET_MULTIPLE * box_width;
+      double stop_loss = entry_price - STOP_LOSS_MULTIPLE * box_width;
+      double take_profit = entry_price + PROFIT_TARGET_MULTIPLE * box_width;
       
-      // Log price levels
-      Print("Entry=", DoubleToString(entry_price, _Digits), 
-            ", SL=", DoubleToString(sl_price, _Digits), " (", DoubleToString(STOP_LOSS_MULTIPLE, 2), "x box width)", 
-            ", TP=", DoubleToString(tp_price, _Digits), " (", DoubleToString(PROFIT_TARGET_MULTIPLE, 2), "x box width)");
+      // Log trade details
+      Print("Trade Levels:");
+      Print("  Entry: ", DoubleToString(entry_price, _Digits));
+      Print("  Stop Loss: ", DoubleToString(stop_loss, _Digits), 
+            " (", DoubleToString(STOP_LOSS_MULTIPLE, 2), "x box width)");
+      Print("  Take Profit: ", DoubleToString(take_profit, _Digits), 
+            " (", DoubleToString(PROFIT_TARGET_MULTIPLE, 2), "x box width)");
             
-      // Execute the long trade
-      ExecuteTrade(ORDER_TYPE_BUY, sl_price, tp_price);
+      // Execute long trade
+      ExecuteTrade(ORDER_TYPE_BUY, stop_loss, take_profit);
    }
-   else if(is_sell_valid)
+   else if(short_entry_valid)
    {
-      Print("⬇️ SHORT SIGNAL: Price ", DoubleToString(current_close, _Digits), " crossed below box lower ",
-            DoubleToString(box_lower_level, _Digits), " with ADX low");
+      Print("⬇️ Short Entry Signal: Price ", DoubleToString(current_close, _Digits), 
+            " broke below box lower ", DoubleToString(box_lower_level, _Digits), 
+            " with ADX below threshold");
       
-      // Calculate price levels for the trade
+      // Calculate trade levels
       double entry_price = current_close;
-      double sl_price = entry_price + STOP_LOSS_MULTIPLE * box_width;
-      double tp_price = entry_price - PROFIT_TARGET_MULTIPLE * box_width;
+      double stop_loss = entry_price + STOP_LOSS_MULTIPLE * box_width;
+      double take_profit = entry_price - PROFIT_TARGET_MULTIPLE * box_width;
       
-      // Log price levels
-      Print("Entry=", DoubleToString(entry_price, _Digits), 
-            ", SL=", DoubleToString(sl_price, _Digits), " (", DoubleToString(STOP_LOSS_MULTIPLE, 2), "x box width)", 
-            ", TP=", DoubleToString(tp_price, _Digits), " (", DoubleToString(PROFIT_TARGET_MULTIPLE, 2), "x box width)");
+      // Log trade details
+      Print("Trade Levels:");
+      Print("  Entry: ", DoubleToString(entry_price, _Digits));
+      Print("  Stop Loss: ", DoubleToString(stop_loss, _Digits), 
+            " (", DoubleToString(STOP_LOSS_MULTIPLE, 2), "x box width)");
+      Print("  Take Profit: ", DoubleToString(take_profit, _Digits), 
+            " (", DoubleToString(PROFIT_TARGET_MULTIPLE, 2), "x box width)");
             
-      // Execute the short trade
-      ExecuteTrade(ORDER_TYPE_SELL, sl_price, tp_price);
+      // Execute short trade
+      ExecuteTrade(ORDER_TYPE_SELL, stop_loss, take_profit);
    }
 }
 
@@ -777,10 +787,10 @@ void ExecuteTrade(ENUM_ORDER_TYPE order_type, double sl_price, double tp_price)
    {
       Print("✅ Trade executed successfully. Ticket: ", result.order);
       // Update position tracking
-      in_position = true;
-      position_type = (order_type == ORDER_TYPE_BUY) ? 0 : 1;
-      position_price = price;
-      position_ticket = result.order;
+      is_in_position = true;
+      current_position_type = (order_type == ORDER_TYPE_BUY) ? 0 : 1;
+      position_entry_price = price;
+      current_position_ticket = result.order;
    }
    else
    {
@@ -798,14 +808,14 @@ void PrintConfig()
    Print("Timeframe: ", EnumToString(Period()));
    Print("ADX Smooth Period: ", ADX_SMOOTH_PERIOD);
    Print("ADX Period: ", ADX_PERIOD);
-   Print("ADX Lower Level: ", ADX_LOWER_LEVEL);
-   Print("Box Lookback: ", BOX_LOOKBACK);
+   Print("ADX Lower Level: ", ADX_CONSOLIDATION_THRESHOLD);
+   Print("Box Lookback: ", BOX_LOOKBACK_PERIOD);
    Print("Profit Target Multiple: ", PROFIT_TARGET_MULTIPLE);
    Print("Stop Loss Multiple: ", STOP_LOSS_MULTIPLE);
    
    string direction = "Both";
-   if(ENABLE_DIRECTION == 1) direction = "Long Only";
-   if(ENABLE_DIRECTION == -1) direction = "Short Only";
+   if(TRADE_DIRECTION == 1) direction = "Long Only";
+   if(TRADE_DIRECTION == -1) direction = "Short Only";
    Print("Direction: ", direction);
    Print("===========================================");
 }
@@ -836,10 +846,10 @@ void CalculateADXStatistics(int bars_to_analyze)
    
    for(int i = 0; i < bars_to_analyze && i < ArraySize(adx_values); i++)
    {
-      if(adx_values[i] < ADX_LOWER_LEVEL)
+      if(adx_values[i] < ADX_CONSOLIDATION_THRESHOLD)
          custom_below_count++;
          
-      if(i < ArraySize(builtin_adx) && builtin_adx[i] < ADX_LOWER_LEVEL)
+      if(i < ArraySize(builtin_adx) && builtin_adx[i] < ADX_CONSOLIDATION_THRESHOLD)
          builtin_below_count++;
          
       // Calculate differences between custom and built-in ADX
@@ -861,8 +871,8 @@ void CalculateADXStatistics(int bars_to_analyze)
    
    // Log statistics
    Print("=== ADX STATISTICS OVER LAST ", bars_to_analyze, " BARS ===");
-   Print("Custom ADX < ", ADX_LOWER_LEVEL, ": ", custom_below_count, " bars (", DoubleToString(custom_below_pct, 1), "%)");
-   Print("Built-in ADX < ", ADX_LOWER_LEVEL, ": ", builtin_below_count, " bars (", DoubleToString(builtin_below_pct, 1), "%)");
+   Print("Custom ADX < ", ADX_CONSOLIDATION_THRESHOLD, ": ", custom_below_count, " bars (", DoubleToString(custom_below_pct, 1), "%)");
+   Print("Built-in ADX < ", ADX_CONSOLIDATION_THRESHOLD, ": ", builtin_below_count, " bars (", DoubleToString(builtin_below_pct, 1), "%)");
    Print("ADX Difference - Max: ", DoubleToString(max_diff, 2), ", Avg: ", DoubleToString(avg_diff, 2));
    Print("=== END ADX STATISTICS ===");
 } 
