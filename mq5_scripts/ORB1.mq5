@@ -1,46 +1,81 @@
 //+------------------------------------------------------------------+
-//|           New-York ORB EA - auto-DST version (15-minute)         |
-//|   Handles PU Prime server UTC+2/UTC+3 and NY EST/EDT shift       |
-//|               Copyright 2025 - free to use / modify              |
+//|               NY Cash Session ORB EA (30-minute)                  |
+//|     Handles PU Prime server UTC+2/UTC+3 and NY EST/EDT shift      |
+//|               Copyright 2025 - free to use / modify               |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
-#property version   "1.10"
+#property version   "2.00"
 #property strict
 
 //---------------  USER-TWEAKABLE INPUTS  ---------------------------//
-// 1) Session - NYT 08:00 to 15:00 (SRV 15:00 to 22:00)
-input int      SESSION_OR_MINUTES   = 15;    // Opening-range length (15 minutes)
-input int      SESSION_TOTAL_HOURS  = 7;     // Session duration (default 7h = 15:00-22:00 SRV)
+// 1) Session times
+enum SessionType { 
+   CLASSIC_NYSE = 0,     // Classic NYSE (09:30 - 10:00 NY)
+   EARLY_US = 1          // Early US (08:00 - 08:30 NY)
+};
+input SessionType  SESSION_TYPE        = CLASSIC_NYSE;  // Session window to use
+input int          SESSION_OR_MINUTES  = 30;            // Opening-range length (minutes)
+input int          SESSION_CLOSE_HOUR  = 16;            // NY Close hour (default 16:00 NY)
 
 // 2) Breakout / risk
-input double   BREAK_BUFFER_PIPS    = 2.0;   // Confirm break beyond box (1-5 pips)
-input double   SL_ATR_MULT          = 0.5;   // 0 = opposite side of box, >0 = ATR×mult
-input double   TP_RR_MULT           = 2.0;   // Take-profit multiple (SL×this)
+input double       ATR_BUFFER_MULT     = 0.2;           // Buffer as ATR multiple
 
 // 3) Money-management
-input double   RISK_PER_TRADE_PCT   = 1.0;   // % equity risk
-input int      MAX_TRADES_PER_DAY   = 1;     // Safety cap (default = 1 trade/day)
-input double   LOT_MIN              = 0.01;  // Minimum lot size
-input double   LOT_STEP             = 0.01;  // Lot step size
+input double       RISK_PER_TRADE_PCT  = 1.0;           // % equity risk
+input int          MAX_TRADES_PER_DAY  = 2;             // Max trades per day
+input double       LOT_MIN             = 0.01;          // Minimum lot size
+input double       LOT_STEP            = 0.01;          // Lot step size
+input int          MAX_DEVIATION_POINTS = 20;           // Maximum allowed slippage in points
 
-// 4) Visuals
-input color    BOX_COLOR            = 0x0000FF;  // Blue
-input uchar    BOX_OPACITY          = 20;        // Box opacity (0-255)
-input bool     LABEL_STATS          = true;      // Show info label
+// 4) Volatility filter
+input bool         USE_VOLATILITY_FILTER = true;        // Enable volatility filter
+input double       ATR_THRESHOLD_PCT   = 80.0;          // ATR Threshold Percentage - Keep 80% for balanced trading; lower to 70% for more signals; raise to 90% for stronger breakouts only
+input int          ATR_PERIOD          = 14;            // ATR Period - Keep 14 for standard volatility; lower to 7 for faster response; raise to 21 for smoother readings
+input int          ATR_MEDIAN_DAYS     = 120;           // ATR Median Days - Keep 120 days (6 months) for stable markets; lower to 60-90 days for adapting to changing regimes
+
+// 5) Range Multiple Target
+// This multiplies the opening range size (high-low) to determine TP distance from entry:
+// For buy orders: TP = entry + (range_size × RANGE_MULT) 
+// For sell orders: TP = entry - (range_size × RANGE_MULT)
+// 
+input double       RANGE_MULT          = 1.0;           // Keep 1.0 for balanced risk:reward; lower to 0.5-0.8 for faster but smaller profits; raise to 1.5-2.0 for larger but slower profits
+input int          CONFIRMATION_CANDLES = 1;            // Candles required to confirm breakout (1=immediate, 2+=more conservative)
+input bool         ALLOW_TP_AFTER_HOURS = false;        // Allow positions to reach TP after session close (will close before next session)
+
+// 6) Visuals
+input color        BOX_COLOR           = 0x0000FF;      // Box color (Blue)
+input uchar        BOX_OPACITY         = 20;            // Box opacity (0-255)
+input bool         LABEL_STATS         = true;          // Show info label
 
 //---------------  INTERNAL STATE  ---------------------------//
 enum TradeState { STATE_IDLE, STATE_BUILDING_RANGE, STATE_RANGE_LOCKED, STATE_IN_POSITION };
 TradeState      trade_state    = STATE_IDLE;
 
 datetime        session_start, session_end;
+datetime        range_end_time;  // End of OR window
 double          range_high     = -DBL_MAX;
 double          range_low      =  DBL_MAX;
+double          range_size     = 0;
+double          atr_value      = 0;  // Current ATR value
+double          atr_median     = 0;  // 6-month ATR median
+bool            volatility_ok  = false; // Volatility filter passed
 bool            box_drawn      = false;
 string          box_name       = "ORB_BOX", hl_name="ORB_HI", ll_name="ORB_LO";
 
+// Position tracking
 ulong           ticket         = 0;
 int             trades_today   = 0;
 int             stored_day     = -1;
+
+// Breakout confirmation tracking
+int             bull_breakout_count = 0;  // Count of consecutive bullish breakout candles
+int             bear_breakout_count = 0;  // Count of consecutive bearish breakout candles
+
+// ATR history for median calculation
+double          atr_history[];
+
+// For debugging/logging
+int             debug_level    = 2;  // 0=none, 1=basic, 2=detailed
 
 //+------------------------------------------------------------------+
 //| Helper: midnight of a date                                       |
@@ -93,13 +128,39 @@ bool IsNYDST(datetime ts)
 void ComputeSession()
 {
    // PU Prime server is always 7 hours ahead of NY time, regardless of DST
-   // NY 08:00 = Server 15:00
-   // NY 15:00 = Server 22:00
+   // Calculate NY time offsets for selected session
+   int ny_offset_hours = 7; // Fixed offset between server and NY
    
-   // Calculate session times using fixed 7-hour offset
-   datetime today_mid = DateOfDay(TimeCurrent());        // Midnight today
-   session_start = today_mid + 15 * 3600;                // 15:00 server time (8:00 NY)
-   session_end   = today_mid + 22 * 3600;                // 22:00 server time (15:00 NY)
+   // Calculate session start time based on session type
+   datetime today_mid = DateOfDay(TimeCurrent());  // Midnight today
+   
+   // CLASSIC_NYSE: 09:30 - 10:00 NY = 16:30 - 17:00 server
+   // EARLY_US:     08:00 - 08:30 NY = 15:00 - 15:30 server
+   int start_hour, start_minute;
+   
+   if(SESSION_TYPE == CLASSIC_NYSE)
+   {
+      start_hour = 9;
+      start_minute = 30;
+   }
+   else // EARLY_US
+   {
+      start_hour = 8;
+      start_minute = 0;
+   }
+   
+   // Convert NY time to server time
+   int server_start_hour = start_hour + ny_offset_hours;
+   int server_start_minute = start_minute;
+   
+   // Calculate session end time 
+   int ny_close_hour = SESSION_CLOSE_HOUR;
+   int server_close_hour = ny_close_hour + ny_offset_hours;
+   
+   // Calculate full timestamps
+   session_start = today_mid + server_start_hour * 3600 + server_start_minute * 60;
+   range_end_time = session_start + SESSION_OR_MINUTES * 60; // End of opening range
+   session_end = today_mid + server_close_hour * 3600;       // End of trading day
    
    datetime now = TimeCurrent();
    
@@ -110,28 +171,23 @@ void ComputeSession()
       Print("Current time ", TimeToString(now), " is past today's session end ", 
             TimeToString(session_end), ". Setting up for tomorrow's session.");
       session_start += 86400;  // Add one day
-      session_end   += 86400;
-   }
-   // If current time is more than 1 hour before session start,
-   // keep the session for today (this is fine even if it's early morning)
-   else if(now < session_start - 3600)
-   {
-      Print("Current time ", TimeToString(now), " is more than 1 hour before session start ", 
-            TimeToString(session_start), ". Using today's session window.");
-   }
-   else
-   {
-      Print("Current time ", TimeToString(now), " is within reasonable range of session window ", 
-            TimeToString(session_start), " to ", TimeToString(session_end));
+      range_end_time += 86400;
+      session_end += 86400;
    }
    
    // For logging only - calculate the actual offsets
-   int ny_offset = IsNYDST(TimeCurrent()) ? -4 : -5;   // EDT(-4) in summer, EST(-5) in winter
+   int ny_time_offset = IsNYDST(TimeCurrent()) ? -4 : -5;   // EDT(-4) in summer, EST(-5) in winter
    int srv_offset = (int)((TimeCurrent() - TimeGMT()) / 3600);  // Current server offset
    
-   Print("Session window calculated: ", TimeToString(session_start), " to ", 
-         TimeToString(session_end), " (current server UTC offset: ", srv_offset, 
-         ", NY offset: ", ny_offset, ", using fixed 7h gap)");
+   string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
+   
+   Print("Session window calculated: ", session_type_str);
+   Print("  Opening Range: ", TimeToString(session_start), " to ", 
+         TimeToString(range_end_time), " (", SESSION_OR_MINUTES, " minutes)");
+   Print("  Trading Hours: ", TimeToString(session_start), " to ", 
+         TimeToString(session_end), " (server time)");
+   Print("  Current server UTC offset: ", srv_offset, 
+         ", NY offset: ", ny_time_offset, ", using fixed ", ny_offset_hours, "h gap");
 }
 
 //+------------------------------------------------------------------+
@@ -139,19 +195,44 @@ void ComputeSession()
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // Verify timeframe
    if(_Period != PERIOD_M15)
    {
-      Print("Attach to a 15-minute chart.");
-      return(INIT_FAILED);
+      Print("Attach to a 15-minute chart for optimal performance.");
+      // We'll continue but warn the user
    }
    
    // Reset for new trading day
    ResetDay();
    
-   Print("ORB Strategy initialized. Looking for breakouts during NY session.");
-   Print("Session time: 08:00-15:00 NYT (15:00-22:00 server time)");
-   Print("Range formation: First ", SESSION_OR_MINUTES, " minutes after session open");
-   Print("Only ", MAX_TRADES_PER_DAY, " trade(s) per day will be taken");
+   // Display strategy information
+   string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
+   Print("=== NY ORB Strategy Initialized ===");
+   Print("Session: ", session_type_str);
+   Print("Opening Range: ", SESSION_OR_MINUTES, " minutes");
+   Print("Max Trades: ", MAX_TRADES_PER_DAY, " per day");
+   Print("Buffer: ATR × ", DoubleToString(ATR_BUFFER_MULT, 1));
+   Print("Take Profit Type: Range Multiple");
+   Print("Volatility Filter: ", USE_VOLATILITY_FILTER ? "Enabled" : "Disabled");
+   Print("=================================");
+   
+   // Calculate ATR
+   UpdateATR();
+   
+   // Add volume indicator to chart
+   int volume_indicator = iVolumes(_Symbol, PERIOD_CURRENT, VOLUME_TICK);
+   if(volume_indicator != INVALID_HANDLE)
+   {
+      // Add to separate window below main chart
+      if(!ChartIndicatorAdd(0, 1, volume_indicator))
+      {
+         Print("Failed to add volume indicator to chart. Error: ", GetLastError());
+      }
+      else
+      {
+         Print("Volume indicator added to chart successfully");
+      }
+   }
    
    // Verify test data is available during session hours
    ValidateTestData();
@@ -247,29 +328,16 @@ void OnTick()
    // Current time for session checks
    datetime current_time = TimeCurrent();
    
-   // EXTREME DEBUG OUTPUT - Check if we're in between midnight and session start
+   // Debug output for session tracking - log once an hour
    static datetime last_tick_debug = 0;
-   if(current_time - last_tick_debug > 3600) // Log once an hour
+   if(current_time - last_tick_debug > 3600)
    {
-      Print("DEBUG Tick received at ", TimeToString(current_time), 
-            " | Day: ", dt.day, 
+      Print("DEBUG [", TimeToString(current_time), "] Day: ", dt.day, 
             " | Session window: ", TimeToString(session_start), " to ", 
             TimeToString(session_end),
+            " | Range window: ", TimeToString(session_start), " to ",
+            TimeToString(range_end_time),
             " | State: ", GetStateString(trade_state));
-      
-      // Print next 24 hours of session windows for debugging
-      datetime test_time = current_time;
-      for (int i = 0; i < 3; i++)
-      {
-         test_time += 86400; // Add one day
-         MqlDateTime test_dt;
-         TimeToStruct(test_time, test_dt);
-         datetime test_midnight = DateOfDay(test_time);
-         datetime test_session_start = test_midnight + 15 * 3600;  
-         datetime test_session_end = test_midnight + 22 * 3600;
-         Print("Future session window ", i+1, ": ", TimeToString(test_session_start), 
-               " to ", TimeToString(test_session_end));
-      }
       last_tick_debug = current_time;
    }
    
@@ -284,12 +352,14 @@ void OnTick()
       last_session_day = today;
    }
 
-   // Ignore ticks outside trading window (15:00-22:00 SRV time)
+   // Update ATR on each tick
+   UpdateATR();
+
+   // Ignore ticks outside trading window
    if(current_time < session_start || current_time > session_end)
    {
-      // No need to spam the logs with this message
-      if(trade_state != STATE_IDLE && 
-         (last_tick_debug == current_time || trade_state == STATE_BUILDING_RANGE || trade_state == STATE_RANGE_LOCKED))
+      // Only log state changes to avoid spamming the log
+      if(trade_state != STATE_IDLE && current_time - last_tick_debug <= 3600)
       {
          Print("Outside of session window now. Going idle. Time: ", 
                TimeToString(current_time), ", Session: ", 
@@ -299,38 +369,18 @@ void OnTick()
       }
       return;
    }
-   else
-   {
-      // Log when we detect we're inside the session window
-      static datetime last_in_session_log = 0;
-      if(current_time - last_in_session_log > 3600) // Once per hour
-      {
-         Print("INSIDE SESSION WINDOW at ", TimeToString(current_time), 
-               ", Session: ", TimeToString(session_start), " - ", 
-               TimeToString(session_end),
-               ", Current state: ", GetStateString(trade_state));
-         last_in_session_log = current_time;
-         
-         // Debug print current prices
-         double close[1];
-         if(CopyClose(_Symbol, PERIOD_M15, 1, 1, close) > 0)
-         {
-            Print("Current close price: ", DoubleToString(close[0], _Digits));
-         }
-      }
-   }
-      
+
    // State machine for ORB strategy
    switch(trade_state)
    {
       case STATE_IDLE:
-         // Check if within the opening range formation time (first 15 min)
-         if(current_time >= session_start && current_time < session_start + SESSION_OR_MINUTES*60)
+         // Check if within the opening range formation time
+         if(current_time >= session_start && current_time < range_end_time)
          {
             trade_state = STATE_BUILDING_RANGE;
             Print("BUILDING RANGE STARTED at ", TimeToString(current_time), 
                   ", Window: ", TimeToString(session_start), " to ", 
-                  TimeToString(session_start + SESSION_OR_MINUTES*60));
+                  TimeToString(range_end_time));
             
             // Initial range reset
             range_high = -1000000;
@@ -346,15 +396,39 @@ void OnTick()
          UpdateRange();
          
          // When opening range period ends, lock the range
-         if(current_time >= session_start + SESSION_OR_MINUTES*60)
+         if(current_time >= range_end_time)
          {
             trade_state = STATE_RANGE_LOCKED;
+            
+            // Calculate range size for TP calculations
+            range_size = range_high - range_low;
+            
+            // Check ATR volatility filter if enabled
+            volatility_ok = true;
+            if(USE_VOLATILITY_FILTER)
+            {
+               volatility_ok = (atr_value >= atr_median * ATR_THRESHOLD_PCT / 100.0);
+               
+               if(!volatility_ok)
+               {
+                  Print("⚠️ VOLATILITY FILTER: ATR(", ATR_PERIOD, ")=", DoubleToString(atr_value, _Digits),
+                        " is below threshold (", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
+                        "). No trades will be taken.");
+               }
+               else
+               {
+                  Print("✅ VOLATILITY FILTER: ATR(", ATR_PERIOD, ")=", DoubleToString(atr_value, _Digits),
+                        " passed threshold (", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
+                        ")");
+               }
+            }
+            
             DrawBox();
             PrintFormat("Range locked at %s. High=%s, Low=%s, Width=%s points", 
                        TimeToString(current_time),
                        DoubleToString(range_high, _Digits), 
                        DoubleToString(range_low, _Digits),
-                       DoubleToString((range_high-range_low)/_Point, 0));
+                       DoubleToString(range_size/_Point, 0));
                        
             // Check for breakout immediately after range is locked
             if(IsNewBar())
@@ -369,7 +443,7 @@ void OnTick()
          // to avoid false signals from intra-bar wicks
          if(IsNewBar())
          {
-            CheckBreakout();
+         CheckBreakout();
          }
          break;
 
@@ -433,6 +507,10 @@ void ResetDay()
    range_high   = -1000000;
    range_low    = 1000000;
    
+   // Reset breakout confirmation counters
+   bull_breakout_count = 0;
+   bear_breakout_count = 0;
+   
    box_drawn    = false;
    ObjectsDeleteAll(0, box_name);
    ObjectsDeleteAll(0, hl_name);
@@ -477,9 +555,9 @@ void DrawBox()
 {
    if(box_drawn) return;
    
-   long chart_id=0;
+   long chart_id = 0;
    datetime t0 = session_start;
-   datetime t1 = session_start + SESSION_OR_MINUTES*60;
+   datetime t1 = range_end_time;
    
    // Draw the rectangle for the opening range
    ObjectCreate(chart_id, box_name, OBJ_RECTANGLE, 0, t0, range_high, t1, range_low);
@@ -498,22 +576,45 @@ void DrawBox()
    // Draw horizontal lines for range high and low
    ObjectCreate(chart_id, hl_name, OBJ_HLINE, 0, TimeCurrent(), range_high);
    ObjectSetInteger(chart_id, hl_name, OBJPROP_COLOR, 0x00FF00);  // Green
+   ObjectSetInteger(chart_id, hl_name, OBJPROP_WIDTH, 2);
+   ObjectSetString(chart_id, hl_name, OBJPROP_TEXT, "OR High: " + DoubleToString(range_high, _Digits));
+   
    ObjectCreate(chart_id, ll_name, OBJ_HLINE, 0, TimeCurrent(), range_low);
    ObjectSetInteger(chart_id, ll_name, OBJPROP_COLOR, 0xFF0000);  // Red
+   ObjectSetInteger(chart_id, ll_name, OBJPROP_WIDTH, 2);
+   ObjectSetString(chart_id, ll_name, OBJPROP_TEXT, "OR Low: " + DoubleToString(range_low, _Digits));
 
    // Add buffer zones to the chart to show entry thresholds
    string up_buffer_name = "ORB_UP_BUFFER";
    string dn_buffer_name = "ORB_DN_BUFFER";
-   double buffer_points = BREAK_BUFFER_PIPS*_Point*10;
+   
+   // Calculate buffer using ATR
+   double buffer_points = atr_value * ATR_BUFFER_MULT;
    
    ObjectCreate(chart_id, up_buffer_name, OBJ_HLINE, 0, TimeCurrent(), range_high + buffer_points);
    ObjectSetInteger(chart_id, up_buffer_name, OBJPROP_COLOR, 0x00AAFF);  // Light Blue
    ObjectSetInteger(chart_id, up_buffer_name, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetString(chart_id, up_buffer_name, OBJPROP_TEXT, "Buy Entry: " + DoubleToString(range_high + buffer_points, _Digits));
    
    ObjectCreate(chart_id, dn_buffer_name, OBJ_HLINE, 0, TimeCurrent(), range_low - buffer_points);
    ObjectSetInteger(chart_id, dn_buffer_name, OBJPROP_COLOR, 0xFFAA00);  // Light Red
    ObjectSetInteger(chart_id, dn_buffer_name, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetString(chart_id, dn_buffer_name, OBJPROP_TEXT, "Sell Entry: " + DoubleToString(range_low - buffer_points, _Digits));
    
+   // Add vertical lines to mark OR start/end
+   string start_vline = "ORB_START";
+   string end_vline = "ORB_END";
+   
+   ObjectCreate(chart_id, start_vline, OBJ_VLINE, 0, session_start, 0);
+   ObjectSetInteger(chart_id, start_vline, OBJPROP_COLOR, 0x0000FF);  // Blue
+   ObjectSetInteger(chart_id, start_vline, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetString(chart_id, start_vline, OBJPROP_TEXT, "ORB Start");
+   
+   ObjectCreate(chart_id, end_vline, OBJ_VLINE, 0, range_end_time, 0);
+   ObjectSetInteger(chart_id, end_vline, OBJPROP_COLOR, 0x0000FF);  // Blue
+   ObjectSetInteger(chart_id, end_vline, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetString(chart_id, end_vline, OBJPROP_TEXT, "ORB End");
+
    box_drawn = true;
 }
 
@@ -522,7 +623,7 @@ void DrawBox()
 //+------------------------------------------------------------------+
 void CheckBreakout()
 {
-   // Only allow specified number of trades per day (default=1)
+   // Only allow specified number of trades per day 
    if(trades_today >= MAX_TRADES_PER_DAY)
    {
       Print("Max trades per day reached: ", trades_today);
@@ -530,6 +631,16 @@ void CheckBreakout()
    }
    
    if(ticket != 0) return;  // already in a position
+   
+   // Skip if volatility filter is enabled and not passed
+   if(USE_VOLATILITY_FILTER && !volatility_ok)
+   {
+      if(debug_level >= 1)
+      {
+         Print("Skipping breakout check - volatility filter not passed");
+      }
+      return;
+   }
    
    // Get current price data
    double close[1];
@@ -543,8 +654,11 @@ void CheckBreakout()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
-   // Breakout threshold with buffer (configured in pips)
-   double buffer_points = BREAK_BUFFER_PIPS*_Point*10;
+   // Calculate breakout buffer using ATR   
+   double buffer_points = atr_value * ATR_BUFFER_MULT;
+   Print("Using ATR buffer: ", DoubleToString(buffer_points, _Digits),
+         " (ATR=", DoubleToString(atr_value, _Digits), 
+         " x ", DoubleToString(ATR_BUFFER_MULT, 2), ")");
    
    // Detailed breakout analysis
    Print("BREAKOUT CHECK at ", TimeToString(TimeCurrent()));
@@ -552,25 +666,57 @@ void CheckBreakout()
    Print("  Range high: ", DoubleToString(range_high, _Digits), ", with buffer: ", DoubleToString(range_high + buffer_points, _Digits));
    Print("  Range low: ", DoubleToString(range_low, _Digits), ", with buffer: ", DoubleToString(range_low - buffer_points, _Digits));
    
-   // Long entry: previous bar closed above the range high + buffer
+   // Check for bullish breakout
    if(close[0] >= range_high + buffer_points)
    {
-      Print("BREAKOUT UP: Close ", DoubleToString(close[0], _Digits), 
+      bull_breakout_count++;
+      bear_breakout_count = 0; // Reset bear count on bullish candle
+      
+      Print("BULLISH BREAKOUT CANDLE: ", bull_breakout_count, "/", CONFIRMATION_CANDLES, 
+            " | Close ", DoubleToString(close[0], _Digits), 
             " > Range high ", DoubleToString(range_high, _Digits), 
             " + Buffer ", DoubleToString(buffer_points, _Digits));
-      SendOrder(ORDER_TYPE_BUY);
+      
+      // Only execute trade after enough confirmation candles
+      if(bull_breakout_count >= CONFIRMATION_CANDLES)
+      {
+         Print("CONFIRMED BULL BREAKOUT AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY");
+         SendOrder(ORDER_TYPE_BUY);
+         bull_breakout_count = 0; // Reset counter after trade
+      }
    }
-   // Short entry: previous bar closed below the range low - buffer
+   // Check for bearish breakout
    else if(close[0] <= range_low - buffer_points)
    {
-      Print("BREAKOUT DOWN: Close ", DoubleToString(close[0], _Digits), 
+      bear_breakout_count++;
+      bull_breakout_count = 0; // Reset bull count on bearish candle
+      
+      Print("BEARISH BREAKOUT CANDLE: ", bear_breakout_count, "/", CONFIRMATION_CANDLES,
+            " | Close ", DoubleToString(close[0], _Digits), 
             " < Range low ", DoubleToString(range_low, _Digits), 
             " - Buffer ", DoubleToString(buffer_points, _Digits));
-      SendOrder(ORDER_TYPE_SELL);
+      
+      // Only execute trade after enough confirmation candles
+      if(bear_breakout_count >= CONFIRMATION_CANDLES)
+      {
+         Print("CONFIRMED BEAR BREAKOUT AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL");
+         SendOrder(ORDER_TYPE_SELL);
+         bear_breakout_count = 0; // Reset counter after trade
+      }
    }
    else
    {
-      Print("No breakout detected - price within range");
+      // No breakout - reset both counters
+      if(bull_breakout_count > 0 || bear_breakout_count > 0)
+      {
+         Print("No breakout continuation - resetting confirmation counters");
+         bull_breakout_count = 0;
+         bear_breakout_count = 0;
+      }
+      else
+      {
+         Print("No breakout detected - price within range");
+      }
    }
 }
 
@@ -579,59 +725,37 @@ void CheckBreakout()
 //+------------------------------------------------------------------+
 void SendOrder(ENUM_ORDER_TYPE type)
 {
-   // Calculate ATR for dynamic SL option
-   int atr_handle = iATR(_Symbol, PERIOD_M15, 14);
-   double atr_buff[];
-   if(CopyBuffer(atr_handle, 0, 1, 1, atr_buff) <= 0)
-   { 
-      Print("ATR error"); 
-      return; 
-   }
-   double atr = atr_buff[0];
-   
    // Entry price
    double entry = (type==ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                          : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
-   // Stop Loss calculation - either based on ATR or opposite side of box
-   double sl = 0.0;
-   double buffer_points = BREAK_BUFFER_PIPS*_Point*10;
+   // Calculate buffer using ATR
+   double buffer_points = atr_value * ATR_BUFFER_MULT;
    
-   if(SL_ATR_MULT > 0.0)
-   {
-      // ATR-based stop loss
-      sl = (type==ORDER_TYPE_BUY) ? entry - atr*SL_ATR_MULT
-                                  : entry + atr*SL_ATR_MULT;
-      Print("Using ATR-based SL: ", DoubleToString(sl, _Digits), 
-            " (ATR=", DoubleToString(atr, _Digits), 
-            ", mult=", DoubleToString(SL_ATR_MULT, 2), ")");
-   }
-   else
-   {
-      // Box-based stop loss (default ORB method)
-      sl = (type==ORDER_TYPE_BUY) ? range_low - buffer_points
-                                  : range_high + buffer_points;
-      Print("Using box-based SL: ", DoubleToString(sl, _Digits));
-   }
-
-   // Calculate SL distance and Take Profit level
-   double sl_dist = MathAbs(entry - sl);
-   double tp = (TP_RR_MULT > 0.0) ? (type==ORDER_TYPE_BUY ? entry + sl_dist*TP_RR_MULT
-                                                          : entry - sl_dist*TP_RR_MULT)
-                                  : 0.0;
-
+   // Stop Loss calculation - opposite side of the box + buffer
+   double sl = (type==ORDER_TYPE_BUY) ? range_low - buffer_points
+                                      : range_high + buffer_points;
+   
+   // Range multiple - Use range size * multiplier
+   double tp = (type==ORDER_TYPE_BUY) ? entry + range_size * RANGE_MULT
+                                      : entry - range_size * RANGE_MULT;
+   Print("Using range multiple take profit: ", DoubleToString(tp, _Digits), 
+         " (", DoubleToString(RANGE_MULT, 1), "x range size)");
+   
    // Lot sizing based on risk percentage
    double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tick_size= SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double risk_amt = AccountInfoDouble(ACCOUNT_EQUITY)*RISK_PER_TRADE_PCT/100.0;
-   double lots = risk_amt / ((sl_dist/tick_size)*tick_val);
-   lots = NormalizeDouble(lots/LOT_STEP, 0)*LOT_STEP;
+   double risk_amt = AccountInfoDouble(ACCOUNT_EQUITY) * RISK_PER_TRADE_PCT / 100.0;
+   double sl_dist_pts = MathAbs(entry - sl) / _Point;
+   double lots = risk_amt / ((sl_dist_pts * _Point / tick_size) * tick_val);
+   
+   lots = NormalizeDouble(lots/LOT_STEP, 0) * LOT_STEP;
    lots = MathMax(LOT_MIN, lots);
 
    // Get the available filling modes for this symbol
    int filling_mode = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    Print("Symbol filling modes: ", filling_mode);
-   
+
    // Trade request
    MqlTradeRequest req = {}; 
    MqlTradeResult res = {};
@@ -642,7 +766,7 @@ void SendOrder(ENUM_ORDER_TYPE type)
    req.price = entry;
    req.sl = sl;
    req.tp = tp;
-   req.deviation = 20;
+   req.deviation = MAX_DEVIATION_POINTS;
    req.magic = 777777;
    req.comment = "NY_ORB";
    
@@ -731,15 +855,74 @@ void ManagePos()
    if(!PositionSelectByTicket(ticket))
    { 
       trade_state = STATE_RANGE_LOCKED; 
-      ticket=0; 
+      ticket = 0; 
       return; 
    }
 
-   // Force close at session end (15:00 NY / 22:00 SRV)
-   if(TimeCurrent() >= session_end)
+   // Get position properties
+   ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double sl = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP);
+   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+   
+   // Get current time
+   datetime current_time = TimeCurrent();
+   
+   // Only force close position if:
+   // 1. We're after session end AND
+   // 2. Either ALLOW_TP_AFTER_HOURS is false OR we're approaching next session start
+   
+   bool force_close = false;
+   
+   if(current_time >= session_end)
+   {
+      if(!ALLOW_TP_AFTER_HOURS)
+      {
+         // Standard behavior - close at session end
+         force_close = true;
+         Print("Position being closed at session end - after-hours TP not enabled");
+      }
+      else
+      {
+         // After-hours TP is enabled - check if we're approaching next session
+         // Calculate time until next session
+         datetime next_session = session_start;
+         
+         // If current session is tomorrow's session already (due to ComputeSession logic)
+         if(current_time < session_start)
+         {
+            // We're good, next_session is already correct
+            Print("Current time: ", TimeToString(current_time), 
+                  ", Next session: ", TimeToString(next_session));
+         }
+         else
+         {
+            // Current time is after session_start, so next session is tomorrow
+            next_session = session_start + 86400; // Add 24 hours
+            Print("Current time: ", TimeToString(current_time), 
+                  ", Next session: ", TimeToString(next_session), " (tomorrow)");
+         }
+         
+         // Close 15 minutes before next session
+         if(current_time >= next_session - 900)
+         {
+            force_close = true;
+            Print("Position will be closed now as we're within 15 minutes of next session");
+         }
+         else
+         {
+            // Still allowed to run to TP
+            Print("Position allowed to continue after hours (until TP or next session)");
+         }
+      }
+   }
+   
+   // Force close if needed
+   if(force_close)
    {
       ClosePos();
-      Print("Position closed at session end (15:00 NYT / 22:00 SRV)");
+      string close_reason = ALLOW_TP_AFTER_HOURS ? "before next session start" : "at session end";
+      Print("Position closed ", close_reason, " (", TimeToString(current_time), ")");
    }
 }
 
@@ -760,7 +943,7 @@ void ClosePos()
    req.type = (ptype == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
    req.price = (req.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                            : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   req.deviation = 20;
+   req.deviation = MAX_DEVIATION_POINTS;
    req.magic = 777777;
    
    // Get the available filling modes for this symbol
@@ -823,19 +1006,100 @@ void ShowLabel()
          status = "Unknown state";
    }
    
+   // Get session details based on session type
+   string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
+   
+   // Format buffer info
+   string buffer_info = "ATR(" + IntegerToString(ATR_PERIOD) + ") × " + DoubleToString(ATR_BUFFER_MULT, 1);
+   
+   // Format take profit info
+   string tp_info = "Range " + DoubleToString(RANGE_MULT, 1) + "×Size";
+   
+   // Format volatility filter info
+   string vol_filter = USE_VOLATILITY_FILTER ? 
+                     (volatility_ok ? "Passed ✓" : "Failed ✗") : 
+                     "Disabled";
+   
    string txt = StringFormat(
-      "NY ORB EA | Trades: %d/%d | State: %s\n"
-      "NY Time: 08:00-15:00 | Server Time: 15:00-22:00\n"
-      "Session: %s - %s | Range: %s - %s",
-      trades_today, 
+      "NY ORB EA | Session: %s | Trades: %d/%d\n"
+      "Status: %s | Volatility: %s\n"
+      "Range: %s - %s (width: %s pips)\n"
+      "Buffer: %s | Target: %s",
+      session_type_str,
+                 trades_today,
       MAX_TRADES_PER_DAY,
       status,
-      TimeToString(session_start, TIME_MINUTES),
-      TimeToString(session_end, TIME_MINUTES),
+      vol_filter,
       DoubleToString(range_low, _Digits),
-      DoubleToString(range_high, _Digits)
+      DoubleToString(range_high, _Digits),
+      DoubleToString(range_size / _Point / 10, 1),
+      buffer_info,
+      tp_info
    );
    
    Comment(txt);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate ATR and median ATR                                     |
+//+------------------------------------------------------------------+
+void UpdateATR()
+{
+   // Calculate current ATR value
+   int atr_handle = iATR(_Symbol, _Period, ATR_PERIOD);
+   double atr_buff[];
+   
+   if(CopyBuffer(atr_handle, 0, 0, 2, atr_buff) <= 0)
+   { 
+      Print("ATR error: ", GetLastError()); 
+      return; 
+   }
+   
+   // Get current ATR value (from previous completed bar)
+   atr_value = atr_buff[1];
+   
+   // Calculate median ATR if we don't have it yet
+   if(atr_median <= 0 && USE_VOLATILITY_FILTER)
+   {
+      // For median calculation we need a longer ATR history
+      int bars_needed = ATR_MEDIAN_DAYS * 24;  // Approximately ATR_MEDIAN_DAYS days of data
+      
+      // Make sure we don't request more bars than available
+      int available_bars = Bars(_Symbol, _Period);
+      if(bars_needed > available_bars)
+         bars_needed = available_bars;
+         
+      // Get ATR values for the period
+      ArrayResize(atr_history, bars_needed);
+      
+      if(CopyBuffer(atr_handle, 0, 0, bars_needed, atr_history) <= 0)
+      { 
+         Print("Error getting ATR history: ", GetLastError()); 
+         return; 
+      }
+      
+      // Sort the array to find median
+      ArraySort(atr_history);
+      
+      // Median is the middle value (or average of the two middle values)
+      int middle = bars_needed / 2;
+      if(bars_needed % 2 == 0) // Even number of elements
+         atr_median = (atr_history[middle-1] + atr_history[middle]) / 2.0;
+      else // Odd number of elements
+         atr_median = atr_history[middle];
+      
+      Print("ATR Median calculated from ", bars_needed, " bars: ", 
+            DoubleToString(atr_median, _Digits));
+      Print("ATR Threshold (", ATR_THRESHOLD_PCT, "%): ", 
+            DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits));
+   }
+   
+   if(debug_level >= 2 && MathMod(TimeCurrent(), 60) < 10) // Log every minute
+   {
+      Print("ATR(", ATR_PERIOD, "): ", DoubleToString(atr_value, _Digits),
+            ", Median: ", DoubleToString(atr_median, _Digits),
+            ", Threshold: ", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
+            ", Filter passed: ", volatility_ok ? "Yes" : "No");
+   }
 }
 //+------------------------------------------------------------------+
