@@ -20,6 +20,14 @@ input int          SESSION_CLOSE_HOUR  = 16;            // NY Close hour (defaul
 // 2) Breakout / risk
 input double       ATR_BUFFER_MULT     = 0.2;           // Buffer as ATR multiple
 
+// Stop loss placement strategy
+enum SLPlacement {
+   SL_OUTER = 0,      // Opposite boundary (safest, largest SL)
+   SL_MIDDLE = 1,     // Middle of the range (moderate)
+   SL_CLOSE = 2       // Close to breakout point (tight, aggressive)
+};
+input SLPlacement   STOP_LOSS_STRATEGY = SL_OUTER;     // Stop loss placement strategy
+
 // 3) Money-management
 input double       RISK_PER_TRADE_PCT  = 1.0;           // % equity risk
 input int          MAX_TRADES_PER_DAY  = 2;             // Max trades per day
@@ -213,6 +221,17 @@ int OnInit()
    Print("Max Trades: ", MAX_TRADES_PER_DAY, " per day");
    Print("Buffer: ATR × ", DoubleToString(ATR_BUFFER_MULT, 1));
    Print("Take Profit Type: Range Multiple");
+   
+   // Show stop loss strategy
+   string sl_strategy = "";
+   switch(STOP_LOSS_STRATEGY) {
+      case SL_OUTER: sl_strategy = "Outer (Conservative)"; break;
+      case SL_MIDDLE: sl_strategy = "Middle (Moderate)"; break;
+      case SL_CLOSE: sl_strategy = "Close (Aggressive)"; break;
+      default: sl_strategy = "Unknown";
+   }
+   Print("Stop Loss Strategy: ", sl_strategy);
+   
    Print("Volatility Filter: ", USE_VOLATILITY_FILTER ? "Enabled" : "Disabled");
    Print("=================================");
    
@@ -327,6 +346,17 @@ void OnTick()
 
    // Current time for session checks
    datetime current_time = TimeCurrent();
+   
+   // Skip trading on NYSE holidays
+   if (IsNYSEHoliday(TimeCurrent()))
+   {
+      if (trade_state != STATE_IDLE)
+      {
+         Print("NYSE holiday or early close detected, skipping trading for today.");
+         trade_state = STATE_IDLE;
+      }
+      return;
+   }
    
    // Debug output for session tracking - log once an hour
    static datetime last_tick_debug = 0;
@@ -732,9 +762,34 @@ void SendOrder(ENUM_ORDER_TYPE type)
    // Calculate buffer using ATR
    double buffer_points = atr_value * ATR_BUFFER_MULT;
    
-   // Stop Loss calculation - opposite side of the box + buffer
-   double sl = (type==ORDER_TYPE_BUY) ? range_low - buffer_points
-                                      : range_high + buffer_points;
+   // Stop Loss calculation based on selected strategy
+   double sl = 0;
+   
+   switch(STOP_LOSS_STRATEGY)
+   {
+      case SL_OUTER: // Opposite side of the range (original behavior)
+         sl = (type==ORDER_TYPE_BUY) ? range_low
+                                     : range_high;
+         Print("Using OUTER stop loss strategy - SL at opposite boundary");
+         break;
+         
+      case SL_MIDDLE: // Middle of the range
+         sl = (type==ORDER_TYPE_BUY) ? range_low + (range_size * 0.5)
+                                     : range_high - (range_size * 0.5);
+         Print("Using MIDDLE stop loss strategy - SL at mid-range");
+         break;
+         
+      case SL_CLOSE: // Close to breakout point
+         sl = (type==ORDER_TYPE_BUY) ? range_high
+                                     : range_low;
+         Print("Using CLOSE stop loss strategy - SL near breakout point");
+         break;
+         
+      default: // Fallback to outer (safest)
+         sl = (type==ORDER_TYPE_BUY) ? range_low
+                                     : range_high;
+         Print("Using default (OUTER) stop loss strategy");
+   }
    
    // Range multiple - Use range size * multiplier
    double tp = (type==ORDER_TYPE_BUY) ? entry + range_size * RANGE_MULT
@@ -1102,4 +1157,47 @@ void UpdateATR()
             ", Filter passed: ", volatility_ok ? "Yes" : "No");
    }
 }
+
+//+------------------------------------------------------------------+
+//| Check if today is a NYSE holiday or early close                  |
+//+------------------------------------------------------------------+
+bool IsNYSEHoliday(datetime t)
+{
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   int y = dt.year, m = dt.mon, d = dt.day;
+   int wd = dt.day_of_week; // 0=Sunday, 1=Monday, ...
+
+   // Always skip weekends
+   if (wd == 0 || wd == 6) return true;
+
+   // 2025 NYSE Full Closures
+   if (y == 2025)
+   {
+      if ((m==1 && d==1)   // New Year's Day (Wed)
+       || (m==1 && d==20)  // MLK Jr. Day (Mon)
+       || (m==2 && d==17)  // Presidents' Day (Mon)
+       || (m==4 && d==18)  // Good Friday (Fri)
+       || (m==5 && d==26)  // Memorial Day (Mon)
+       || (m==6 && d==19)  // Juneteenth (Thu)
+       || (m==7 && d==4)   // Independence Day (Fri)
+       || (m==9 && d==1)   // Labor Day (Mon)
+       || (m==11 && d==27) // Thanksgiving (Thu)
+       || (m==12 && d==25) // Christmas (Thu)
+      ) return true;
+
+      // Early Closures (1:00 p.m. ET)
+      if ((m==7 && d==3)   // Day before Independence Day (Thu)
+       || (m==11 && d==28) // Day after Thanksgiving (Fri)
+       || (m==12 && d==24) // Christmas Eve (Wed)
+      )
+      {
+         // You may want to skip trading or close positions early on these days
+         // For now, treat as full holiday (no trading)
+         return true;
+      }
+   }
+   return false;
+}
+
 //+------------------------------------------------------------------+
