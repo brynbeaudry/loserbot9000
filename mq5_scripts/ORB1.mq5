@@ -59,20 +59,30 @@ input uchar        BOX_OPACITY         = 20;            // Box opacity (0-255)
 input bool         LABEL_STATS         = true;          // Show info label
 
 //---------------  INTERNAL STATE  ---------------------------//
-enum TradeState { STATE_IDLE, STATE_BUILDING_RANGE, STATE_RANGE_LOCKED, STATE_IN_POSITION };
+enum TradeState { 
+   STATE_IDLE, 
+   STATE_BUILDING_RANGE, 
+   STATE_RANGE_LOCKED, 
+   STATE_IN_POSITION,
+   STATE_AFTER_HOURS_POSITION  // Special state for positions held after session hours
+};
 TradeState      trade_state    = STATE_IDLE;
 
 //---------------  TIME VARIABLES  ---------------------------//
 // Fixed time offset between server and NY (always 7 hours)
 const int       NY_TIME_OFFSET = 7;       // Server is 7 hours ahead of NY
 
+// Constants for range initialization
+const double    RANGE_HIGH_INIT = -1000000;  // Initial high value (will be replaced with actual prices)
+const double    RANGE_LOW_INIT = 1000000;    // Initial low value (will be replaced with actual prices)
+
 // Session timing variables
 datetime        current_session_start;    // Start of current trading session (server time)
 datetime        current_session_end;      // End of current trading session (server time)
 datetime        current_range_end;        // End of opening range period (server time)
 datetime        next_session_start;       // Start of next trading session (server time)
-double          range_high     = -DBL_MAX;
-double          range_low      =  DBL_MAX;
+double          range_high     = RANGE_HIGH_INIT;
+double          range_low      = RANGE_LOW_INIT;
 double          range_size     = 0;
 double          atr_value      = 0;  // Current ATR value
 double          atr_median     = 0;  // 6-month ATR median
@@ -209,10 +219,10 @@ void ComputeSession()
    datetime current_time = TimeCurrent();
    
    // Calculate today's session times
-   CalculateSessionTimes(current_time, false);
+   CalculateSessionTimes(current_time, false); // false = today
    
    // Calculate tomorrow's session start
-   CalculateSessionTimes(current_time + 86400, true);
+   CalculateSessionTimes(current_time + 86400, true); // true = tomorrow
    
    // Check if today's session is over, use tomorrow's times instead
    if(current_time > current_session_end) {
@@ -329,25 +339,25 @@ int OnInit()
 //+------------------------------------------------------------------+
 void ValidateTestData()
 {
-   // Get current time and calculate today's session window
+   // Use current time and our already calculated session times
    datetime current_time = TimeCurrent();
-   datetime today_midnight = DateOfDay(current_time);
-   datetime today_session_start = today_midnight + 15 * 3600;  // 15:00 server time
    
-   // Check if we're past the session start time
-   if(current_time < today_session_start)
+   // Ensure session times are calculated
+   ComputeSession();
+   
+   // Check if we're before the current session start
+   if(current_time < current_session_start)
    {
-      Print("Validation: Current time is before today's session start. Will check next session.");
-      today_session_start += 86400; // Check tomorrow's session
+      Print("Validation: Current time is before today's session start. Will check this session.");
    }
    
    // Try to read some bars around the session start
-   Print("VALIDATING DATA around session start: ", TimeToString(today_session_start));
+   Print("VALIDATING DATA around session start: ", TimeToString(current_session_start));
    
    // Check bars before, at, and after session start
    for(int offset = -2; offset <= 2; offset++)
    {
-      datetime check_time = today_session_start + offset * 900; // 15-minute bars
+      datetime check_time = current_session_start + offset * 900; // 15-minute bars
       int bar_index = iBarShift(_Symbol, PERIOD_M15, check_time, false);
       
       if(bar_index >= 0)
@@ -372,7 +382,7 @@ void ValidateTestData()
    }
    
    // Specifically check the first 15-minute bar of the session
-   datetime first_bar_time = today_session_start;
+   datetime first_bar_time = current_session_start;
    int first_bar_index = iBarShift(_Symbol, PERIOD_M15, first_bar_time, false);
    
    if(first_bar_index >= 0)
@@ -450,19 +460,34 @@ void OnTick()
    // Update ATR on each tick
    UpdateATR();
 
-   // Ignore ticks outside trading window
-   if(!IsWithinSessionHours(current_time))
+   // Check if we're outside trading window
+   bool outside_session = !IsWithinSessionHours(current_time);
+   
+   // Handle different states depending on session hours
+   if(outside_session)
    {
-      // Only log state changes to avoid spamming the log
-      if(trade_state != STATE_IDLE && current_time - last_tick_debug <= 3600)
+      // If we have a position and after-hours TP is enabled, transition to after-hours state
+      if(trade_state == STATE_IN_POSITION && ALLOW_TP_AFTER_HOURS && ticket != 0)
       {
-         Print("Outside of session window now. Going idle. Time: ", 
-               TimeToString(current_time), ", Session: ", 
-               TimeToString(current_session_start), " - ", TimeToString(current_session_end), 
-               ", Current state: ", GetStateString(trade_state));
+         if(trade_state != STATE_AFTER_HOURS_POSITION)
+         {
+            Print("Transitioning to AFTER_HOURS_POSITION state at ", TimeToString(current_time));
+            trade_state = STATE_AFTER_HOURS_POSITION;
+         }
+      }
+      // Otherwise go idle if we're not already in after-hours position state
+      else if(trade_state != STATE_AFTER_HOURS_POSITION && trade_state != STATE_IDLE)
+      {
+         // Only log state changes to avoid spamming the log
+         if(current_time - last_tick_debug <= 3600)
+         {
+            Print("Outside of session window now. Going idle. Time: ", 
+                  TimeToString(current_time), ", Session: ", 
+                  TimeToString(current_session_start), " - ", TimeToString(current_session_end), 
+                  ", Current state: ", GetStateString(trade_state));
+         }
          trade_state = STATE_IDLE;
       }
-      return;
    }
 
    // State machine for ORB strategy
@@ -487,6 +512,10 @@ void OnTick()
       case STATE_IN_POSITION:
          ManagePos();
          break;
+         
+      case STATE_AFTER_HOURS_POSITION:
+         ManageAfterHoursPos();
+         break;
    }
 
    if(LABEL_STATS) ShowLabel();
@@ -498,18 +527,40 @@ void OnTick()
 void UpdateSessionState(datetime current_time)
 {
    // Check if within opening range formation time
-   if(IsWithinRangeFormationPeriod(current_time) && trade_state == STATE_IDLE)
+   if(IsWithinRangeFormationPeriod(current_time))
    {
-      trade_state = STATE_BUILDING_RANGE;
-      Print("BUILDING RANGE STARTED at ", TimeToString(current_time), 
-            ", Window: ", TimeToString(current_session_start), " to ", 
-            TimeToString(current_range_end));
+      // First, ensure any lingering position from previous session is closed
+      if(trade_state == STATE_AFTER_HOURS_POSITION)
+      {
+         // Force close any after-hours position before starting new session
+         if(ticket != 0 && PositionSelectByTicket(ticket))
+         {
+            Print("Detected lingering after-hours position at new session start. Forcing close.");
+            ClosePos();
+            
+            // If position couldn't be closed, don't proceed with state transition
+            if(ticket != 0)
+            {
+               Print("WARNING: Failed to close position before new session. Will retry.");
+               return;
+            }
+         }
+      }
       
-      // Initialize range values
-      InitializeRangeValues();
-      
-      // Process the first bar immediately
-      UpdateRange();
+      // Only transition to BUILDING_RANGE if we're IDLE (or coming from AFTER_HOURS with no position)
+      if(trade_state == STATE_IDLE || (trade_state == STATE_AFTER_HOURS_POSITION && ticket == 0))
+      {
+         trade_state = STATE_BUILDING_RANGE;
+         Print("BUILDING RANGE STARTED at ", TimeToString(current_time), 
+               ", Window: ", TimeToString(current_session_start), " to ", 
+               TimeToString(current_range_end));
+         
+         // Initialize range values
+         InitializeRangeValues();
+         
+         // Process the first bar immediately
+         UpdateRange();
+      }
    }
    // Check if range formation period has ended
    else if(current_time >= current_range_end && trade_state == STATE_BUILDING_RANGE)
@@ -544,10 +595,21 @@ void UpdateSessionState(datetime current_time)
 //+------------------------------------------------------------------+
 void InitializeRangeValues()
 {
-   range_high = -1000000;
-   range_low = 1000000;
+   // Reset range boundaries to their initial values
+   range_high = RANGE_HIGH_INIT;
+   range_low = RANGE_LOW_INIT;
+   
+   // Reset range size
+   range_size = 0;
+   
+   // Reset breakout confirmation counters
    bull_breakout_count = 0;
    bear_breakout_count = 0;
+   
+   // Reset box drawing flag
+   box_drawn = false;
+   
+   Print("Range values initialized for new session");
 }
 
 //+------------------------------------------------------------------+
@@ -606,6 +668,7 @@ string GetStateString(TradeState state)
       case STATE_BUILDING_RANGE: return "BUILDING_RANGE";
       case STATE_RANGE_LOCKED: return "RANGE_LOCKED";
       case STATE_IN_POSITION: return "IN_POSITION";
+      case STATE_AFTER_HOURS_POSITION: return "AFTER_HOURS_POSITION";
       default: return "UNKNOWN";
    }
 }
@@ -624,8 +687,8 @@ void ResetDay()
    
    // Initialize range values to ensure they will be updated properly
    // Using very large but finite values to avoid potential issues with DBL_MAX
-   range_high   = -1000000;
-   range_low    = 1000000;
+   range_high   = RANGE_HIGH_INIT;
+   range_low    = RANGE_LOW_INIT;
    
    // Reset breakout confirmation counters
    bull_breakout_count = 0;
@@ -671,6 +734,14 @@ void UpdateRange()
 }
 
 //+------------------------------------------------------------------+
+//| Calculate ATR-based buffer points                                |
+//+------------------------------------------------------------------+
+double CalculateATRBuffer()
+{
+   return atr_value * ATR_BUFFER_MULT;
+}
+
+//+------------------------------------------------------------------+
 //| Draw OR rectangle and reference lines                            |
 //+------------------------------------------------------------------+
 void DrawBox()
@@ -711,7 +782,7 @@ void DrawBox()
    string dn_buffer_name = "ORB_DN_BUFFER";
    
    // Calculate buffer using ATR
-   double buffer_points = atr_value * ATR_BUFFER_MULT;
+   double buffer_points = CalculateATRBuffer();
    
    ObjectCreate(chart_id, up_buffer_name, OBJ_HLINE, 0, TimeCurrent(), range_high + buffer_points);
    ObjectSetInteger(chart_id, up_buffer_name, OBJPROP_COLOR, 0x00AAFF);  // Light Blue
@@ -738,6 +809,22 @@ void DrawBox()
    ObjectSetString(chart_id, end_vline, OBJPROP_TEXT, "ORB End");
 
    box_drawn = true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate bullish breakout level                                  |
+//+------------------------------------------------------------------+
+double CalculateBullBreakoutLevel()
+{
+   return range_high + CalculateATRBuffer();
+}
+
+//+------------------------------------------------------------------+
+//| Calculate bearish breakout level                                 |
+//+------------------------------------------------------------------+
+double CalculateBearBreakoutLevel()
+{
+   return range_low - CalculateATRBuffer();
 }
 
 //+------------------------------------------------------------------+
@@ -768,10 +855,10 @@ void CheckBreakout()
    double close = GetLastBarClose();
    if(close == 0) return; // Error getting price data
    
-   // Calculate breakout levels
-   double buffer_points = atr_value * ATR_BUFFER_MULT;
-   double bull_breakout_level = range_high + buffer_points;
-   double bear_breakout_level = range_low - buffer_points;
+   // Calculate breakout levels using utility functions
+   double bull_breakout_level = CalculateBullBreakoutLevel();
+   double bear_breakout_level = CalculateBearBreakoutLevel();
+   double buffer_points = CalculateATRBuffer();
    
    LogBreakoutLevels(close, buffer_points, bull_breakout_level, bear_breakout_level);
    
@@ -892,9 +979,6 @@ void SendOrder(ENUM_ORDER_TYPE type)
    // Entry price
    double entry = (type==ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                                          : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   
-   // Calculate buffer using ATR
-   double buffer_points = atr_value * ATR_BUFFER_MULT;
    
    // Stop Loss calculation based on selected strategy
    double sl = CalculateStopLoss(type);
@@ -1081,7 +1165,7 @@ void ManagePos()
    // Check if position still exists
    if(!PositionSelectByTicket(ticket))
    { 
-      trade_state = STATE_RANGE_LOCKED; 
+      trade_state = STATE_IDLE; 
       ticket = 0; 
       return; 
    }
@@ -1095,48 +1179,24 @@ void ManagePos()
    // Get current time
    datetime current_time = TimeCurrent();
    
-   // Only force close position if:
-   // 1. We're after session end AND
-   // 2. Either ALLOW_TP_AFTER_HOURS is false OR we're approaching next session start
-   
-   bool force_close = false;
-   
+   // Check if we're after session end
    if(current_time >= current_session_end)
    {
       if(!ALLOW_TP_AFTER_HOURS)
       {
          // Standard behavior - close at session end
-         force_close = true;
-         Print("Position being closed at session end - after-hours TP not enabled");
+         ClosePos();
+         Print("Position closed at session end - after-hours TP not enabled (", TimeToString(current_time), ")");
       }
       else
       {
-         // After-hours TP is enabled - check if we're approaching next session
-         // Simple and clear check using the explicit next_session_start variable
-         if(current_time >= next_session_start - 1800) // Within 30 minutes of next session
-         {
-            force_close = true;
-            Print("Position will be closed now as we're within 15 minutes of next session (",
-                  TimeToString(next_session_start), "), remaining time: ", 
-                  (int)((next_session_start - current_time) / 60), " minutes");
-         }
-         else
-         {
-            // Still allowed to run to TP
-            int hours_until_next = (int)((next_session_start - current_time) / 3600);
-            int mins_until_next = (int)(((next_session_start - current_time) % 3600) / 60);
-            Print("Position allowed to continue after hours (until TP or next session in ", 
-                  hours_until_next, "h ", mins_until_next, "m)");
-         }
+         // Transition to the after-hours state for clearer management
+         trade_state = STATE_AFTER_HOURS_POSITION;
+         Print("Position continued after hours - transitioning to AFTER_HOURS_POSITION state");
+         
+         // Call after-hours management immediately
+         ManageAfterHoursPos();
       }
-   }
-   
-   // Force close if needed
-   if(force_close)
-   {
-      ClosePos();
-      string close_reason = ALLOW_TP_AFTER_HOURS ? "before next session start" : "at session end";
-      Print("Position closed ", close_reason, " (", TimeToString(current_time), ")");
    }
 }
 
@@ -1180,7 +1240,7 @@ void ClosePos()
    }
    
    ticket = 0;
-   trade_state = STATE_RANGE_LOCKED;
+   trade_state = STATE_IDLE; // Always go to IDLE after closing a position
    Print("Position closed at ", TimeToString(TimeCurrent()));
 }
 
@@ -1216,6 +1276,9 @@ void ShowLabel()
             }
             break;
          }
+      case STATE_AFTER_HOURS_POSITION:
+         status = "In after-hours position";
+         break;
       default:
          status = "Unknown state";
    }
@@ -1362,6 +1425,59 @@ bool IsNYSEHoliday(datetime t)
       }
    }
    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Manage position held after hours                                 |
+//+------------------------------------------------------------------+
+void ManageAfterHoursPos()
+{
+   // Check if position still exists
+   if(!PositionSelectByTicket(ticket))
+   { 
+      trade_state = STATE_IDLE; 
+      ticket = 0; 
+      return; 
+   }
+
+   // Get current time
+   datetime current_time = TimeCurrent();
+   
+   // Force close position if:
+   // 1. We're approaching next session start, OR
+   // 2. We're already within a new session's range formation period
+   
+   bool force_close = false;
+   
+   // Check if we're approaching next session start (within 30 minutes)
+   if(current_time >= next_session_start - 1800)
+   {
+      force_close = true;
+      Print("After-hours position will be closed as we're within 30 minutes of next session (",
+            TimeToString(next_session_start), "), remaining time: ", 
+            (int)((next_session_start - current_time) / 60), " minutes");
+   }
+   // Also close if we're already within the new session period
+   else if(IsWithinRangeFormationPeriod(current_time))
+   {
+      force_close = true;
+      Print("After-hours position will be closed immediately - new session has already started");
+   }
+   // Log position status every hour
+   else if(current_time % 3600 < 10)
+   {
+      int hours_until_next = (int)((next_session_start - current_time) / 3600);
+      int mins_until_next = (int)(((next_session_start - current_time) % 3600) / 60);
+      Print("After-hours position continuing (until TP or next session in ", 
+            hours_until_next, "h ", mins_until_next, "m)");
+   }
+   
+   // Force close if needed
+   if(force_close)
+   {
+      ClosePos();
+      Print("After-hours position closed before next session (", TimeToString(current_time), ")");
+   }
 }
 
 //+------------------------------------------------------------------+
