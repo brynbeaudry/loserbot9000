@@ -98,7 +98,7 @@ int             debug_level    = 2;  // 0=none, 1=basic, 2=detailed
 // Time variables are now defined in the TIME VARIABLES section
 
 //+------------------------------------------------------------------+
-//| Helper: midnight of a date                                       |
+//| Time utility functions                                           |
 //+------------------------------------------------------------------+
 datetime DateOfDay(datetime t)
 {
@@ -110,9 +110,6 @@ datetime DateOfDay(datetime t)
    return StructToTime(dt);
 }
 
-//+------------------------------------------------------------------+
-//| Helper: is this timestamp within US/NY DST?                      |
-//+------------------------------------------------------------------+
 bool IsNYDST(datetime ts)
 {
    MqlDateTime dt;
@@ -143,13 +140,17 @@ bool IsNYDST(datetime ts)
 }
 
 //+------------------------------------------------------------------+
-//| Build today's NY session window (server time)                    |
+//| Calculate session time boundaries                                |
 //+------------------------------------------------------------------+
-void ComputeSession()
+void CalculateSessionTimes(datetime reference_time, bool is_tomorrow = false)
 {
-   // Calculate session start time based on session type
-   datetime today_midnight = DateOfDay(TimeCurrent());  // Midnight today
+   // Get midnight of reference day
+   datetime midnight = DateOfDay(reference_time);
    
+   // If calculating for tomorrow, add a day
+   if(is_tomorrow)
+      midnight += 86400;
+      
    // Define NY session hours based on session type
    int ny_start_hour, ny_start_minute;
    
@@ -169,40 +170,77 @@ void ComputeSession()
    int server_start_minute = ny_start_minute;
    int server_close_hour = NY_SESSION_CLOSE_HOUR + NY_TIME_OFFSET;
    
-   // Calculate today's session timestamps
-   datetime today_session_start = today_midnight + server_start_hour * 3600 + server_start_minute * 60;
-   datetime today_session_end = today_midnight + server_close_hour * 3600;
-   datetime today_range_end = today_session_start + SESSION_OR_MINUTES * 60;
+   // Calculate session timestamps
+   datetime session_start = midnight + server_start_hour * 3600 + server_start_minute * 60;
+   datetime session_end = midnight + server_close_hour * 3600;
+   datetime range_end = session_start + SESSION_OR_MINUTES * 60;
    
-   // Calculate tomorrow's session timestamps
-   datetime tomorrow_midnight = today_midnight + 86400; // Add one day
-   datetime tomorrow_session_start = tomorrow_midnight + server_start_hour * 3600 + server_start_minute * 60;
-   
+   // Update global session variables
+   if (!is_tomorrow) {
+      current_session_start = session_start;
+      current_session_end = session_end;
+      current_range_end = range_end;
+   } else {
+      next_session_start = session_start;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if within session hours                                    |
+//+------------------------------------------------------------------+
+bool IsWithinSessionHours(datetime time_to_check)
+{
+   return (time_to_check >= current_session_start && time_to_check <= current_session_end);
+}
+
+//+------------------------------------------------------------------+
+//| Check if within range formation period                           |
+//+------------------------------------------------------------------+
+bool IsWithinRangeFormationPeriod(datetime time_to_check)
+{
+   return (time_to_check >= current_session_start && time_to_check < current_range_end);
+}
+
+//+------------------------------------------------------------------+
+//| Build today's NY session window (server time)                    |
+//+------------------------------------------------------------------+
+void ComputeSession()
+{
    datetime current_time = TimeCurrent();
    
-   // Determine which session we're currently in
-   if(current_time > today_session_end)
-   {
-      // Today's session is over, set up for tomorrow
-      current_session_start = tomorrow_session_start;
+   // Calculate today's session times
+   CalculateSessionTimes(current_time, false);
+   
+   // Calculate tomorrow's session start
+   CalculateSessionTimes(current_time + 86400, true);
+   
+   // Check if today's session is over, use tomorrow's times instead
+   if(current_time > current_session_end) {
+      // Copy tomorrow's start to today's session variables
+      current_session_start = next_session_start;
       current_range_end = current_session_start + SESSION_OR_MINUTES * 60;
-      current_session_end = tomorrow_midnight + server_close_hour * 3600;
-      next_session_start = current_session_start + 86400; // Day after tomorrow
       
-      Print("Current time ", TimeToString(current_time), " is past today's session end ", 
-            TimeToString(today_session_end), ". Setting up for tomorrow's session.");
-   }
-   else
-   {
-      // Today's session is current
-      current_session_start = today_session_start;
-      current_range_end = today_range_end;
-      current_session_end = today_session_end;
-      next_session_start = tomorrow_session_start;
+      // Calculate day after tomorrow for next_session_start
+      CalculateSessionTimes(current_time + 2*86400, true);
+      
+      // Recalculate session end time
+      datetime tomorrow_midnight = DateOfDay(current_time) + 86400;
+      current_session_end = tomorrow_midnight + (NY_SESSION_CLOSE_HOUR + NY_TIME_OFFSET) * 3600;
+      
+      Print("Current time ", TimeToString(current_time), " is past today's session end. Setting up for tomorrow's session.");
    }
    
-   // For logging only - calculate the actual offsets
-   int ny_time_offset = IsNYDST(TimeCurrent()) ? -4 : -5;   // EDT(-4) in summer, EST(-5) in winter
+   // Log session details
+   LogSessionDetails();
+}
+
+//+------------------------------------------------------------------+
+//| Log session details                                              |
+//+------------------------------------------------------------------+
+void LogSessionDetails()
+{
+   // Calculate offsets for logging only
+   int ny_time_offset = IsNYDST(TimeCurrent()) ? -4 : -5;  // EDT(-4) in summer, EST(-5) in winter
    int srv_offset = (int)((TimeCurrent() - TimeGMT()) / 3600);  // Current server offset
    
    string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
@@ -401,11 +439,11 @@ void OnTick()
    // Debug output at the start of each trading session
    static datetime last_session_day = 0;
    datetime today = DateOfDay(current_time);
-       if(today != last_session_day && current_time >= current_session_start && current_time <= current_session_end)
-    {
-       Print("TRADING SESSION STARTED: ", TimeToString(current_time), 
-             " is within session window (", TimeToString(current_session_start), 
-             " to ", TimeToString(current_session_end), ")");
+   if(today != last_session_day && IsWithinSessionHours(current_time))
+   {
+      Print("TRADING SESSION STARTED: ", TimeToString(current_time), 
+            " is within session window (", TimeToString(current_session_start), 
+            " to ", TimeToString(current_session_end), ")");
       last_session_day = today;
    }
 
@@ -413,7 +451,7 @@ void OnTick()
    UpdateATR();
 
    // Ignore ticks outside trading window
-   if(current_time < current_session_start || current_time > current_session_end)
+   if(!IsWithinSessionHours(current_time))
    {
       // Only log state changes to avoid spamming the log
       if(trade_state != STATE_IDLE && current_time - last_tick_debug <= 3600)
@@ -428,88 +466,113 @@ void OnTick()
    }
 
    // State machine for ORB strategy
+   UpdateSessionState(current_time);
+   
+   // Handle each state's logic based on current state
    switch(trade_state)
    {
-      case STATE_IDLE:
-         // Check if within the opening range formation time
-         if(current_time >= current_session_start && current_time < current_range_end)
-         {
-            trade_state = STATE_BUILDING_RANGE;
-            Print("BUILDING RANGE STARTED at ", TimeToString(current_time), 
-                  ", Window: ", TimeToString(current_session_start), " to ", 
-                  TimeToString(current_range_end));
-            
-            // Initial range reset
-            range_high = -1000000;
-            range_low = 1000000;
-            
-            // Process the first bar immediately
-            UpdateRange();
-         }
-         break;
-
       case STATE_BUILDING_RANGE:
          // Track high/low during opening range period
          UpdateRange();
-         
-         // When opening range period ends, lock the range
-         if(current_time >= current_range_end)
-         {
-            trade_state = STATE_RANGE_LOCKED;
-            
-            // Calculate range size for TP calculations
-            range_size = range_high - range_low;
-            
-            // Check ATR volatility filter if enabled
-            volatility_ok = true;
-            if(USE_VOLATILITY_FILTER)
-            {
-               volatility_ok = (atr_value >= atr_median * ATR_THRESHOLD_PCT / 100.0);
-               
-               if(!volatility_ok)
-               {
-                  Print("⚠️ VOLATILITY FILTER: ATR(", ATR_PERIOD, ")=", DoubleToString(atr_value, _Digits),
-                        " is below threshold (", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
-                        "). No trades will be taken.");
-               }
-               else
-               {
-                  Print("✅ VOLATILITY FILTER: ATR(", ATR_PERIOD, ")=", DoubleToString(atr_value, _Digits),
-                        " passed threshold (", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
-                        ")");
-               }
-            }
-            
-            DrawBox();
-            PrintFormat("Range locked at %s. High=%s, Low=%s, Width=%s points", 
-                       TimeToString(current_time),
-                       DoubleToString(range_high, _Digits), 
-                       DoubleToString(range_low, _Digits),
-                       DoubleToString(range_size/_Point, 0));
-                       
-            // Check for breakout immediately after range is locked
-            if(IsNewBar())
-            {
-               CheckBreakout();
-            }
-         }
          break;
-
+         
       case STATE_RANGE_LOCKED:
          // Only check for breakouts after the bar closes
-         // to avoid false signals from intra-bar wicks
          if(IsNewBar())
          {
-         CheckBreakout();
+            CheckBreakout();
          }
          break;
-
+         
       case STATE_IN_POSITION:
          ManagePos();
          break;
    }
 
    if(LABEL_STATS) ShowLabel();
+}
+
+//+------------------------------------------------------------------+
+//| Check and handle state transitions                               |
+//+------------------------------------------------------------------+
+void UpdateSessionState(datetime current_time)
+{
+   // Check if within opening range formation time
+   if(IsWithinRangeFormationPeriod(current_time) && trade_state == STATE_IDLE)
+   {
+      trade_state = STATE_BUILDING_RANGE;
+      Print("BUILDING RANGE STARTED at ", TimeToString(current_time), 
+            ", Window: ", TimeToString(current_session_start), " to ", 
+            TimeToString(current_range_end));
+      
+      // Initialize range values
+      InitializeRangeValues();
+      
+      // Process the first bar immediately
+      UpdateRange();
+   }
+   // Check if range formation period has ended
+   else if(current_time >= current_range_end && trade_state == STATE_BUILDING_RANGE)
+   {
+      trade_state = STATE_RANGE_LOCKED;
+      
+      // Calculate range size for TP calculations
+      range_size = range_high - range_low;
+      
+      // Check volatility filter
+      CheckVolatilityFilter();
+      
+      // Draw range visualization
+      DrawBox();
+      
+      PrintFormat("Range locked at %s. High=%s, Low=%s, Width=%s points", 
+                 TimeToString(current_time),
+                 DoubleToString(range_high, _Digits), 
+                 DoubleToString(range_low, _Digits),
+                 DoubleToString(range_size/_Point, 0));
+                 
+      // Check for breakout immediately after range is locked
+      if(IsNewBar())
+      {
+         CheckBreakout();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Initialize range values for a new session                        |
+//+------------------------------------------------------------------+
+void InitializeRangeValues()
+{
+   range_high = -1000000;
+   range_low = 1000000;
+   bull_breakout_count = 0;
+   bear_breakout_count = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check if current volatility passes filter                        |
+//+------------------------------------------------------------------+
+void CheckVolatilityFilter()
+{
+   volatility_ok = true;
+   if(USE_VOLATILITY_FILTER)
+   {
+      volatility_ok = (atr_value >= atr_median * ATR_THRESHOLD_PCT / 100.0);
+      
+      if(!volatility_ok)
+      {
+         Print("⚠️ VOLATILITY FILTER: ATR(", ATR_PERIOD, ")=", DoubleToString(atr_value, _Digits),
+               " is below threshold (", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
+               "). No trades will be taken.");
+      }
+      else
+      {
+         Print("✅ VOLATILITY FILTER: ATR(", ATR_PERIOD, ")=", DoubleToString(atr_value, _Digits),
+               " passed threshold (", DoubleToString(atr_median * ATR_THRESHOLD_PCT / 100.0, _Digits),
+               ")");
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -702,80 +765,122 @@ void CheckBreakout()
    }
    
    // Get current price data
+   double close = GetLastBarClose();
+   if(close == 0) return; // Error getting price data
+   
+   // Calculate breakout levels
+   double buffer_points = atr_value * ATR_BUFFER_MULT;
+   double bull_breakout_level = range_high + buffer_points;
+   double bear_breakout_level = range_low - buffer_points;
+   
+   LogBreakoutLevels(close, buffer_points, bull_breakout_level, bear_breakout_level);
+   
+   // Check for bullish breakout
+   if(close >= bull_breakout_level)
+   {
+      ProcessBullishBreakout(close, buffer_points);
+   }
+   // Check for bearish breakout
+   else if(close <= bear_breakout_level)
+   {
+      ProcessBearishBreakout(close, buffer_points);
+   }
+   else
+   {
+      ResetBreakoutCounters();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get the close price of the last completed bar                    |
+//+------------------------------------------------------------------+
+double GetLastBarClose()
+{
    double close[1];
    if(CopyClose(_Symbol, PERIOD_M15, 1, 1, close) <= 0)
    {
       Print("Error getting close price for breakout check");
-      return;
+      return 0;
    }
-   
-   // Current market prices
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   
-   // Calculate breakout buffer using ATR   
-   double buffer_points = atr_value * ATR_BUFFER_MULT;
+   return close[0];
+}
+
+//+------------------------------------------------------------------+
+//| Log breakout levels and current price                            |
+//+------------------------------------------------------------------+
+void LogBreakoutLevels(double close, double buffer_points, double bull_level, double bear_level)
+{
    Print("Using ATR buffer: ", DoubleToString(buffer_points, _Digits),
          " (ATR=", DoubleToString(atr_value, _Digits), 
          " x ", DoubleToString(ATR_BUFFER_MULT, 2), ")");
    
-   // Detailed breakout analysis
    Print("BREAKOUT CHECK at ", TimeToString(TimeCurrent()));
-   Print("  Bar close: ", DoubleToString(close[0], _Digits));
-   Print("  Range high: ", DoubleToString(range_high, _Digits), ", with buffer: ", DoubleToString(range_high + buffer_points, _Digits));
-   Print("  Range low: ", DoubleToString(range_low, _Digits), ", with buffer: ", DoubleToString(range_low - buffer_points, _Digits));
+   Print("  Bar close: ", DoubleToString(close, _Digits));
+   Print("  Range high: ", DoubleToString(range_high, _Digits), 
+         ", with buffer: ", DoubleToString(bull_level, _Digits));
+   Print("  Range low: ", DoubleToString(range_low, _Digits), 
+         ", with buffer: ", DoubleToString(bear_level, _Digits));
+}
+
+//+------------------------------------------------------------------+
+//| Process bullish breakout                                         |
+//+------------------------------------------------------------------+
+void ProcessBullishBreakout(double close, double buffer_points)
+{
+   bull_breakout_count++;
+   bear_breakout_count = 0; // Reset bear count on bullish candle
    
-   // Check for bullish breakout
-   if(close[0] >= range_high + buffer_points)
+   Print("BULLISH BREAKOUT CANDLE: ", bull_breakout_count, "/", CONFIRMATION_CANDLES, 
+         " | Close ", DoubleToString(close, _Digits), 
+         " > Range high ", DoubleToString(range_high, _Digits), 
+         " + Buffer ", DoubleToString(buffer_points, _Digits));
+   
+   // Only execute trade after enough confirmation candles
+   if(bull_breakout_count >= CONFIRMATION_CANDLES)
    {
-      bull_breakout_count++;
-      bear_breakout_count = 0; // Reset bear count on bullish candle
-      
-      Print("BULLISH BREAKOUT CANDLE: ", bull_breakout_count, "/", CONFIRMATION_CANDLES, 
-            " | Close ", DoubleToString(close[0], _Digits), 
-            " > Range high ", DoubleToString(range_high, _Digits), 
-            " + Buffer ", DoubleToString(buffer_points, _Digits));
-      
-      // Only execute trade after enough confirmation candles
-      if(bull_breakout_count >= CONFIRMATION_CANDLES)
-      {
-         Print("CONFIRMED BULL BREAKOUT AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY");
-         SendOrder(ORDER_TYPE_BUY);
-         bull_breakout_count = 0; // Reset counter after trade
-      }
+      Print("CONFIRMED BULL BREAKOUT AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY");
+      SendOrder(ORDER_TYPE_BUY);
+      bull_breakout_count = 0; // Reset counter after trade
    }
-   // Check for bearish breakout
-   else if(close[0] <= range_low - buffer_points)
+}
+
+//+------------------------------------------------------------------+
+//| Process bearish breakout                                         |
+//+------------------------------------------------------------------+
+void ProcessBearishBreakout(double close, double buffer_points)
+{
+   bear_breakout_count++;
+   bull_breakout_count = 0; // Reset bull count on bearish candle
+   
+   Print("BEARISH BREAKOUT CANDLE: ", bear_breakout_count, "/", CONFIRMATION_CANDLES,
+         " | Close ", DoubleToString(close, _Digits), 
+         " < Range low ", DoubleToString(range_low, _Digits), 
+         " - Buffer ", DoubleToString(buffer_points, _Digits));
+   
+   // Only execute trade after enough confirmation candles
+   if(bear_breakout_count >= CONFIRMATION_CANDLES)
    {
-      bear_breakout_count++;
-      bull_breakout_count = 0; // Reset bull count on bearish candle
-      
-      Print("BEARISH BREAKOUT CANDLE: ", bear_breakout_count, "/", CONFIRMATION_CANDLES,
-            " | Close ", DoubleToString(close[0], _Digits), 
-            " < Range low ", DoubleToString(range_low, _Digits), 
-            " - Buffer ", DoubleToString(buffer_points, _Digits));
-      
-      // Only execute trade after enough confirmation candles
-      if(bear_breakout_count >= CONFIRMATION_CANDLES)
-      {
-         Print("CONFIRMED BEAR BREAKOUT AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL");
-         SendOrder(ORDER_TYPE_SELL);
-         bear_breakout_count = 0; // Reset counter after trade
-      }
+      Print("CONFIRMED BEAR BREAKOUT AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL");
+      SendOrder(ORDER_TYPE_SELL);
+      bear_breakout_count = 0; // Reset counter after trade
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset breakout counters when no breakout is detected             |
+//+------------------------------------------------------------------+
+void ResetBreakoutCounters()
+{
+   // No breakout - reset both counters
+   if(bull_breakout_count > 0 || bear_breakout_count > 0)
+   {
+      Print("No breakout continuation - resetting confirmation counters");
+      bull_breakout_count = 0;
+      bear_breakout_count = 0;
    }
    else
    {
-      // No breakout - reset both counters
-      if(bull_breakout_count > 0 || bear_breakout_count > 0)
-      {
-         Print("No breakout continuation - resetting confirmation counters");
-         bull_breakout_count = 0;
-         bear_breakout_count = 0;
-      }
-      else
-      {
-         Print("No breakout detected - price within range");
-      }
+      Print("No breakout detected - price within range");
    }
 }
 
@@ -792,58 +897,14 @@ void SendOrder(ENUM_ORDER_TYPE type)
    double buffer_points = atr_value * ATR_BUFFER_MULT;
    
    // Stop Loss calculation based on selected strategy
-   double sl = 0;
-   
-   switch(STOP_LOSS_STRATEGY)
-   {
-      case SL_OUTER: // Opposite side of the range (original behavior)
-         sl = (type==ORDER_TYPE_BUY) ? range_low
-                                     : range_high;
-         Print("Using OUTER stop loss strategy - SL at opposite boundary");
-         break;
-         
-      case SL_MIDDLE: // Middle of the range
-         sl = (type==ORDER_TYPE_BUY) ? range_low + (range_size * 0.5)
-                                     : range_high - (range_size * 0.5);
-         Print("Using MIDDLE stop loss strategy - SL at mid-range");
-         break;
-         
-      case SL_CLOSE: // Close to breakout point
-         sl = (type==ORDER_TYPE_BUY) ? range_high
-                                     : range_low;
-         Print("Using CLOSE stop loss strategy - SL near breakout point");
-         break;
-         
-      default: // Fallback to outer (safest)
-         sl = (type==ORDER_TYPE_BUY) ? range_low
-                                     : range_high;
-         Print("Using default (OUTER) stop loss strategy");
-   }
+   double sl = CalculateStopLoss(type);
    
    // Range multiple - Use range size * multiplier
-   double tp = (type==ORDER_TYPE_BUY) ? entry + range_size * RANGE_MULT
-                                      : entry - range_size * RANGE_MULT;
-   Print("Using range multiple take profit: ", DoubleToString(tp, _Digits), 
-         " (", DoubleToString(RANGE_MULT, 1), "x range size)");
+   double tp = CalculateTakeProfit(type, entry);
    
    // Lot sizing based on risk percentage
-   double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tick_size= SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double risk_amt = AccountInfoDouble(ACCOUNT_EQUITY) * RISK_PER_TRADE_PCT / 100.0;
-   double sl_dist_pts = MathAbs(entry - sl) / _Point;
-   double lots = risk_amt / ((sl_dist_pts * _Point / tick_size) * tick_val);
+   double lots = CalculateLotSize(entry, sl);
    
-   // Normalize to broker's lot step
-   lots = NormalizeDouble(lots/lot_step, 0) * lot_step;
-   // Ensure minimum lot size
-   lots = MathMax(lot_min, lots);
-   
-   Print("Lot size calculation:");
-   Print("  Account equity: ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
-   Print("  Risk amount: ", DoubleToString(risk_amt, 2));
-   Print("  Stop loss distance: ", DoubleToString(sl_dist_pts, 1), " points");
-   Print("  Calculated lots: ", DoubleToString(lots, 2));
-
    // Get the available filling modes for this symbol
    int filling_mode = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    Print("Symbol filling modes: ", filling_mode);
@@ -895,6 +956,80 @@ void SendOrder(ENUM_ORDER_TYPE type)
          ", lots=", DoubleToString(lots, 2),
          ", SL=", DoubleToString(sl, _Digits), 
          ", TP=", DoubleToString(tp, _Digits));
+}
+
+//+------------------------------------------------------------------+
+//| Calculate stop loss based on strategy                            |
+//+------------------------------------------------------------------+
+double CalculateStopLoss(ENUM_ORDER_TYPE type)
+{
+   double sl = 0;
+   
+   switch(STOP_LOSS_STRATEGY)
+   {
+      case SL_OUTER: // Opposite side of the range
+         sl = (type==ORDER_TYPE_BUY) ? range_low : range_high;
+         Print("Using OUTER stop loss strategy - SL at opposite boundary");
+         break;
+         
+      case SL_MIDDLE: // Middle of the range
+         sl = (type==ORDER_TYPE_BUY) ? range_low + (range_size * 0.5)
+                                     : range_high - (range_size * 0.5);
+         Print("Using MIDDLE stop loss strategy - SL at mid-range");
+         break;
+         
+      case SL_CLOSE: // Close to breakout point
+         sl = (type==ORDER_TYPE_BUY) ? range_high : range_low;
+         Print("Using CLOSE stop loss strategy - SL near breakout point");
+         break;
+         
+      default: // Fallback to outer (safest)
+         sl = (type==ORDER_TYPE_BUY) ? range_low : range_high;
+         Print("Using default (OUTER) stop loss strategy");
+   }
+   
+   return sl;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate take profit based on range size                        |
+//+------------------------------------------------------------------+
+double CalculateTakeProfit(ENUM_ORDER_TYPE type, double entry_price)
+{
+   // Range multiple - Use range size * multiplier
+   double tp = (type==ORDER_TYPE_BUY) ? entry_price + range_size * RANGE_MULT
+                                      : entry_price - range_size * RANGE_MULT;
+   
+   Print("Using range multiple take profit: ", DoubleToString(tp, _Digits), 
+         " (", DoubleToString(RANGE_MULT, 1), "x range size)");
+         
+   return tp;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate position size based on risk                            |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double entry_price, double stop_loss)
+{
+   // Lot sizing based on risk percentage
+   double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double risk_amt = AccountInfoDouble(ACCOUNT_EQUITY) * RISK_PER_TRADE_PCT / 100.0;
+   double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
+   double lots = risk_amt / ((sl_dist_pts * _Point / tick_size) * tick_val);
+   
+   // Normalize to broker's lot step
+   lots = NormalizeDouble(lots/lot_step, 0) * lot_step;
+   // Ensure minimum lot size
+   lots = MathMax(lot_min, lots);
+   
+   Print("Lot size calculation:");
+   Print("  Account equity: ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
+   Print("  Risk amount: ", DoubleToString(risk_amt, 2));
+   Print("  Stop loss distance: ", DoubleToString(sl_dist_pts, 1), " points");
+   Print("  Calculated lots: ", DoubleToString(lots, 2));
+   
+   return lots;
 }
 
 //+------------------------------------------------------------------+
