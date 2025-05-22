@@ -15,7 +15,7 @@ enum SessionType {
 };
 input SessionType  SESSION_TYPE        = CLASSIC_NYSE;  // Session window to use
 input int          SESSION_OR_MINUTES  = 30;            // Opening-range length (minutes)
-input int          SESSION_CLOSE_HOUR  = 16;            // NY Close hour (default 16:00 NY)
+input int          NY_SESSION_CLOSE_HOUR = 16;          // NY Close hour (default 16:00 NY)
 
 // 2) Breakout / risk
 input double       ATR_BUFFER_MULT     = 0.2;           // Buffer as ATR multiple
@@ -62,8 +62,15 @@ input bool         LABEL_STATS         = true;          // Show info label
 enum TradeState { STATE_IDLE, STATE_BUILDING_RANGE, STATE_RANGE_LOCKED, STATE_IN_POSITION };
 TradeState      trade_state    = STATE_IDLE;
 
-datetime        session_start, session_end;
-datetime        range_end_time;  // End of OR window
+//---------------  TIME VARIABLES  ---------------------------//
+// Fixed time offset between server and NY (always 7 hours)
+const int       NY_TIME_OFFSET = 7;       // Server is 7 hours ahead of NY
+
+// Session timing variables
+datetime        current_session_start;    // Start of current trading session (server time)
+datetime        current_session_end;      // End of current trading session (server time)
+datetime        current_range_end;        // End of opening range period (server time)
+datetime        next_session_start;       // Start of next trading session (server time)
 double          range_high     = -DBL_MAX;
 double          range_low      =  DBL_MAX;
 double          range_size     = 0;
@@ -88,8 +95,7 @@ double          atr_history[];
 // For debugging/logging
 int             debug_level    = 2;  // 0=none, 1=basic, 2=detailed
 
-// First, let's add a new global variable to track the next session start
-datetime        next_session_start;  // Start of the next trading session
+// Time variables are now defined in the TIME VARIABLES section
 
 //+------------------------------------------------------------------+
 //| Helper: midnight of a date                                       |
@@ -141,65 +147,57 @@ bool IsNYDST(datetime ts)
 //+------------------------------------------------------------------+
 void ComputeSession()
 {
-   // PU Prime server is always 7 hours ahead of NY time, regardless of DST
-   // Calculate NY time offsets for selected session
-   int ny_offset_hours = 7; // Fixed offset between server and NY
-   
    // Calculate session start time based on session type
-   datetime today_mid = DateOfDay(TimeCurrent());  // Midnight today
+   datetime today_midnight = DateOfDay(TimeCurrent());  // Midnight today
    
-   // CLASSIC_NYSE: 09:30 - 10:00 NY = 16:30 - 17:00 server
-   // EARLY_US:     08:00 - 08:30 NY = 15:00 - 15:30 server
-   int start_hour, start_minute;
+   // Define NY session hours based on session type
+   int ny_start_hour, ny_start_minute;
    
    if(SESSION_TYPE == CLASSIC_NYSE)
    {
-      start_hour = 9;
-      start_minute = 30;
+      ny_start_hour = 9;
+      ny_start_minute = 30;
    }
    else // EARLY_US
    {
-      start_hour = 8;
-      start_minute = 0;
+      ny_start_hour = 8;
+      ny_start_minute = 0;
    }
    
-   // Convert NY time to server time
-   int server_start_hour = start_hour + ny_offset_hours;
-   int server_start_minute = start_minute;
-   
-   // Calculate session end time 
-   int ny_close_hour = SESSION_CLOSE_HOUR;
-   int server_close_hour = ny_close_hour + ny_offset_hours;
+   // Convert NY time to server time using fixed offset
+   int server_start_hour = ny_start_hour + NY_TIME_OFFSET;
+   int server_start_minute = ny_start_minute;
+   int server_close_hour = NY_SESSION_CLOSE_HOUR + NY_TIME_OFFSET;
    
    // Calculate today's session timestamps
-   datetime today_session_start = today_mid + server_start_hour * 3600 + server_start_minute * 60;
-   datetime today_session_end = today_mid + server_close_hour * 3600;
+   datetime today_session_start = today_midnight + server_start_hour * 3600 + server_start_minute * 60;
+   datetime today_session_end = today_midnight + server_close_hour * 3600;
    datetime today_range_end = today_session_start + SESSION_OR_MINUTES * 60;
    
    // Calculate tomorrow's session timestamps
-   datetime tomorrow_mid = today_mid + 86400; // Add one day
-   datetime tomorrow_session_start = tomorrow_mid + server_start_hour * 3600 + server_start_minute * 60;
+   datetime tomorrow_midnight = today_midnight + 86400; // Add one day
+   datetime tomorrow_session_start = tomorrow_midnight + server_start_hour * 3600 + server_start_minute * 60;
    
-   datetime now = TimeCurrent();
+   datetime current_time = TimeCurrent();
    
    // Determine which session we're currently in
-   if(now > today_session_end)
+   if(current_time > today_session_end)
    {
       // Today's session is over, set up for tomorrow
-      session_start = tomorrow_session_start;
-      range_end_time = session_start + SESSION_OR_MINUTES * 60;
-      session_end = tomorrow_mid + server_close_hour * 3600;
-      next_session_start = session_start + 86400; // Day after tomorrow
+      current_session_start = tomorrow_session_start;
+      current_range_end = current_session_start + SESSION_OR_MINUTES * 60;
+      current_session_end = tomorrow_midnight + server_close_hour * 3600;
+      next_session_start = current_session_start + 86400; // Day after tomorrow
       
-      Print("Current time ", TimeToString(now), " is past today's session end ", 
+      Print("Current time ", TimeToString(current_time), " is past today's session end ", 
             TimeToString(today_session_end), ". Setting up for tomorrow's session.");
    }
    else
    {
       // Today's session is current
-      session_start = today_session_start;
-      range_end_time = today_range_end;
-      session_end = today_session_end;
+      current_session_start = today_session_start;
+      current_range_end = today_range_end;
+      current_session_end = today_session_end;
       next_session_start = tomorrow_session_start;
    }
    
@@ -210,13 +208,13 @@ void ComputeSession()
    string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
    
    Print("Session window calculated: ", session_type_str);
-   Print("  Opening Range: ", TimeToString(session_start), " to ", 
-         TimeToString(range_end_time), " (", SESSION_OR_MINUTES, " minutes)");
-   Print("  Trading Hours: ", TimeToString(session_start), " to ", 
-         TimeToString(session_end), " (server time)");
+   Print("  Opening Range: ", TimeToString(current_session_start), " to ", 
+         TimeToString(current_range_end), " (", SESSION_OR_MINUTES, " minutes)");
+   Print("  Trading Hours: ", TimeToString(current_session_start), " to ", 
+         TimeToString(current_session_end), " (server time)");
    Print("  Next session starts: ", TimeToString(next_session_start));
    Print("  Current server UTC offset: ", srv_offset, 
-         ", NY offset: ", ny_time_offset, ", using fixed ", ny_offset_hours, "h gap");
+         ", NY offset: ", ny_time_offset, ", using fixed ", NY_TIME_OFFSET, "h gap");
 }
 
 //+------------------------------------------------------------------+
@@ -295,8 +293,8 @@ void ValidateTestData()
 {
    // Get current time and calculate today's session window
    datetime current_time = TimeCurrent();
-   datetime today_mid = DateOfDay(current_time);
-   datetime today_session_start = today_mid + 15 * 3600;  // 15:00 server time
+   datetime today_midnight = DateOfDay(current_time);
+   datetime today_session_start = today_midnight + 15 * 3600;  // 15:00 server time
    
    // Check if we're past the session start time
    if(current_time < today_session_start)
@@ -392,10 +390,10 @@ void OnTick()
    if(current_time - last_tick_debug > 3600)
    {
       Print("DEBUG [", TimeToString(current_time), "] Day: ", dt.day, 
-            " | Session window: ", TimeToString(session_start), " to ", 
-            TimeToString(session_end),
-            " | Range window: ", TimeToString(session_start), " to ",
-            TimeToString(range_end_time),
+            " | Session window: ", TimeToString(current_session_start), " to ", 
+            TimeToString(current_session_end),
+            " | Range window: ", TimeToString(current_session_start), " to ",
+            TimeToString(current_range_end),
             " | State: ", GetStateString(trade_state));
       last_tick_debug = current_time;
    }
@@ -403,11 +401,11 @@ void OnTick()
    // Debug output at the start of each trading session
    static datetime last_session_day = 0;
    datetime today = DateOfDay(current_time);
-   if(today != last_session_day && current_time >= session_start && current_time <= session_end)
-   {
-      Print("TRADING SESSION STARTED: ", TimeToString(current_time), 
-            " is within session window (", TimeToString(session_start), 
-            " to ", TimeToString(session_end), ")");
+       if(today != last_session_day && current_time >= current_session_start && current_time <= current_session_end)
+    {
+       Print("TRADING SESSION STARTED: ", TimeToString(current_time), 
+             " is within session window (", TimeToString(current_session_start), 
+             " to ", TimeToString(current_session_end), ")");
       last_session_day = today;
    }
 
@@ -415,14 +413,14 @@ void OnTick()
    UpdateATR();
 
    // Ignore ticks outside trading window
-   if(current_time < session_start || current_time > session_end)
+   if(current_time < current_session_start || current_time > current_session_end)
    {
       // Only log state changes to avoid spamming the log
       if(trade_state != STATE_IDLE && current_time - last_tick_debug <= 3600)
       {
          Print("Outside of session window now. Going idle. Time: ", 
                TimeToString(current_time), ", Session: ", 
-               TimeToString(session_start), " - ", TimeToString(session_end), 
+               TimeToString(current_session_start), " - ", TimeToString(current_session_end), 
                ", Current state: ", GetStateString(trade_state));
          trade_state = STATE_IDLE;
       }
@@ -434,12 +432,12 @@ void OnTick()
    {
       case STATE_IDLE:
          // Check if within the opening range formation time
-         if(current_time >= session_start && current_time < range_end_time)
+         if(current_time >= current_session_start && current_time < current_range_end)
          {
             trade_state = STATE_BUILDING_RANGE;
             Print("BUILDING RANGE STARTED at ", TimeToString(current_time), 
-                  ", Window: ", TimeToString(session_start), " to ", 
-                  TimeToString(range_end_time));
+                  ", Window: ", TimeToString(current_session_start), " to ", 
+                  TimeToString(current_range_end));
             
             // Initial range reset
             range_high = -1000000;
@@ -455,7 +453,7 @@ void OnTick()
          UpdateRange();
          
          // When opening range period ends, lock the range
-         if(current_time >= range_end_time)
+         if(current_time >= current_range_end)
          {
             trade_state = STATE_RANGE_LOCKED;
             
@@ -526,7 +524,7 @@ bool IsNewBar()
    {
       last_bar_time = current_bar_time;
       Print("NEW BAR DETECTED at ", TimeToString(current_bar_time), 
-            ", session window: ", TimeToString(session_start), " to ", TimeToString(session_end),
+            ", session window: ", TimeToString(current_session_start), " to ", TimeToString(current_session_end),
             ", state: ", GetStateString(trade_state));
       return true;
    }
@@ -617,8 +615,8 @@ void DrawBox()
    if(box_drawn) return;
    
    long chart_id = 0;
-   datetime t0 = session_start;
-   datetime t1 = range_end_time;
+   datetime t0 = current_session_start;
+   datetime t1 = current_range_end;
    
    // Draw the rectangle for the opening range
    ObjectCreate(chart_id, box_name, OBJ_RECTANGLE, 0, t0, range_high, t1, range_low);
@@ -666,12 +664,12 @@ void DrawBox()
    string start_vline = "ORB_START";
    string end_vline = "ORB_END";
    
-   ObjectCreate(chart_id, start_vline, OBJ_VLINE, 0, session_start, 0);
+   ObjectCreate(chart_id, start_vline, OBJ_VLINE, 0, current_session_start, 0);
    ObjectSetInteger(chart_id, start_vline, OBJPROP_COLOR, 0x0000FF);  // Blue
    ObjectSetInteger(chart_id, start_vline, OBJPROP_STYLE, STYLE_DOT);
    ObjectSetString(chart_id, start_vline, OBJPROP_TEXT, "ORB Start");
    
-   ObjectCreate(chart_id, end_vline, OBJ_VLINE, 0, range_end_time, 0);
+   ObjectCreate(chart_id, end_vline, OBJ_VLINE, 0, current_range_end, 0);
    ObjectSetInteger(chart_id, end_vline, OBJPROP_COLOR, 0x0000FF);  // Blue
    ObjectSetInteger(chart_id, end_vline, OBJPROP_STYLE, STYLE_DOT);
    ObjectSetString(chart_id, end_vline, OBJPROP_TEXT, "ORB End");
@@ -968,7 +966,7 @@ void ManagePos()
    
    bool force_close = false;
    
-   if(current_time >= session_end)
+   if(current_time >= current_session_end)
    {
       if(!ALLOW_TP_AFTER_HOURS)
       {
@@ -1096,6 +1094,10 @@ void ShowLabel()
    // Format take profit info
    string tp_info = "Range " + DoubleToString(RANGE_MULT, 1) + "×Size";
    
+   // Format session time info
+   string session_time_info = TimeToString(current_session_start, TIME_MINUTES) + 
+                             " - " + TimeToString(current_session_end, TIME_MINUTES);
+   
    // Format volatility filter info
    string vol_filter = USE_VOLATILITY_FILTER ? 
                      (volatility_ok ? "Passed ✓" : "Failed ✗") : 
@@ -1103,19 +1105,20 @@ void ShowLabel()
    
    string txt = StringFormat(
       "NY ORB EA | Session: %s | Trades: %d/%d\n"
-      "Status: %s | Volatility: %s\n"
+      "Status: %s | Session Time: %s\n"
       "Range: %s - %s (width: %s pips)\n"
-      "Buffer: %s | Target: %s",
+      "Buffer: %s | Target: %s | Volatility: %s",
       session_type_str,
                  trades_today,
       MAX_TRADES_PER_DAY,
       status,
-      vol_filter,
+      session_time_info,
       DoubleToString(range_low, _Digits),
       DoubleToString(range_high, _Digits),
       DoubleToString(range_size / _Point / 10, 1),
       buffer_info,
-      tp_info
+      tp_info,
+      vol_filter
    );
    
    Comment(txt);
