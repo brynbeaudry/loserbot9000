@@ -31,9 +31,12 @@ input SLPlacement   STOP_LOSS_STRATEGY = SL_OUTER;     // Stop loss placement st
 // 3) Money-management
 input double       RISK_PER_TRADE_PCT  = 1.0;           // % equity risk
 input int          MAX_TRADES_PER_DAY  = 2;             // Max trades per day
-input double       LOT_MIN             = 0.01;          // Minimum lot size
-input double       LOT_STEP            = 0.01;          // Lot step size
 input int          MAX_DEVIATION_POINTS = 20;           // Maximum allowed slippage in points
+
+// Add back the global variables for broker lot constraints
+// Broker lot size constraints
+double          lot_min        = 0;  // Will be set from broker
+double          lot_step       = 0;  // Will be set from broker
 
 // 4) Volatility filter
 input bool         USE_VOLATILITY_FILTER = true;        // Enable volatility filter
@@ -84,6 +87,9 @@ double          atr_history[];
 
 // For debugging/logging
 int             debug_level    = 2;  // 0=none, 1=basic, 2=detailed
+
+// First, let's add a new global variable to track the next session start
+datetime        next_session_start;  // Start of the next trading session
 
 //+------------------------------------------------------------------+
 //| Helper: midnight of a date                                       |
@@ -165,22 +171,36 @@ void ComputeSession()
    int ny_close_hour = SESSION_CLOSE_HOUR;
    int server_close_hour = ny_close_hour + ny_offset_hours;
    
-   // Calculate full timestamps
-   session_start = today_mid + server_start_hour * 3600 + server_start_minute * 60;
-   range_end_time = session_start + SESSION_OR_MINUTES * 60; // End of opening range
-   session_end = today_mid + server_close_hour * 3600;       // End of trading day
+   // Calculate today's session timestamps
+   datetime today_session_start = today_mid + server_start_hour * 3600 + server_start_minute * 60;
+   datetime today_session_end = today_mid + server_close_hour * 3600;
+   datetime today_range_end = today_session_start + SESSION_OR_MINUTES * 60;
+   
+   // Calculate tomorrow's session timestamps
+   datetime tomorrow_mid = today_mid + 86400; // Add one day
+   datetime tomorrow_session_start = tomorrow_mid + server_start_hour * 3600 + server_start_minute * 60;
    
    datetime now = TimeCurrent();
    
-   // Check if today's session is already past
-   if(now > session_end)
+   // Determine which session we're currently in
+   if(now > today_session_end)
    {
-      // If it's already past today's session, set up for tomorrow
+      // Today's session is over, set up for tomorrow
+      session_start = tomorrow_session_start;
+      range_end_time = session_start + SESSION_OR_MINUTES * 60;
+      session_end = tomorrow_mid + server_close_hour * 3600;
+      next_session_start = session_start + 86400; // Day after tomorrow
+      
       Print("Current time ", TimeToString(now), " is past today's session end ", 
-            TimeToString(session_end), ". Setting up for tomorrow's session.");
-      session_start += 86400;  // Add one day
-      range_end_time += 86400;
-      session_end += 86400;
+            TimeToString(today_session_end), ". Setting up for tomorrow's session.");
+   }
+   else
+   {
+      // Today's session is current
+      session_start = today_session_start;
+      range_end_time = today_range_end;
+      session_end = today_session_end;
+      next_session_start = tomorrow_session_start;
    }
    
    // For logging only - calculate the actual offsets
@@ -194,6 +214,7 @@ void ComputeSession()
          TimeToString(range_end_time), " (", SESSION_OR_MINUTES, " minutes)");
    Print("  Trading Hours: ", TimeToString(session_start), " to ", 
          TimeToString(session_end), " (server time)");
+   Print("  Next session starts: ", TimeToString(next_session_start));
    Print("  Current server UTC offset: ", srv_offset, 
          ", NY offset: ", ny_time_offset, ", using fixed ", ny_offset_hours, "h gap");
 }
@@ -203,6 +224,14 @@ void ComputeSession()
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // Get broker's lot size constraints
+   lot_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   Print("Broker lot size constraints for ", _Symbol, ":");
+   Print("  Minimum lot size: ", DoubleToString(lot_min, 2));
+   Print("  Lot step size: ", DoubleToString(lot_step, 2));
+   
    // Verify timeframe
    if(_Period != PERIOD_M15)
    {
@@ -547,6 +576,8 @@ void ResetDay()
    ObjectsDeleteAll(0, ll_name);
    
    Print("New day reset: ", TimeToString(TimeCurrent()));
+   
+   // Recalculate session timing values including next_session_start
    ComputeSession();
 }
 
@@ -804,8 +835,16 @@ void SendOrder(ENUM_ORDER_TYPE type)
    double sl_dist_pts = MathAbs(entry - sl) / _Point;
    double lots = risk_amt / ((sl_dist_pts * _Point / tick_size) * tick_val);
    
-   lots = NormalizeDouble(lots/LOT_STEP, 0) * LOT_STEP;
-   lots = MathMax(LOT_MIN, lots);
+   // Normalize to broker's lot step
+   lots = NormalizeDouble(lots/lot_step, 0) * lot_step;
+   // Ensure minimum lot size
+   lots = MathMax(lot_min, lots);
+   
+   Print("Lot size calculation:");
+   Print("  Account equity: ", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
+   Print("  Risk amount: ", DoubleToString(risk_amt, 2));
+   Print("  Stop loss distance: ", DoubleToString(sl_dist_pts, 1), " points");
+   Print("  Calculated lots: ", DoubleToString(lots, 2));
 
    // Get the available filling modes for this symbol
    int filling_mode = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
@@ -940,34 +979,21 @@ void ManagePos()
       else
       {
          // After-hours TP is enabled - check if we're approaching next session
-         // Calculate time until next session
-         datetime next_session = session_start;
-         
-         // If current session is tomorrow's session already (due to ComputeSession logic)
-         if(current_time < session_start)
-         {
-            // We're good, next_session is already correct
-            Print("Current time: ", TimeToString(current_time), 
-                  ", Next session: ", TimeToString(next_session));
-         }
-         else
-         {
-            // Current time is after session_start, so next session is tomorrow
-            next_session = session_start + 86400; // Add 24 hours
-            Print("Current time: ", TimeToString(current_time), 
-                  ", Next session: ", TimeToString(next_session), " (tomorrow)");
-         }
-         
-         // Close 15 minutes before next session
-         if(current_time >= next_session - 900)
+         // Simple and clear check using the explicit next_session_start variable
+         if(current_time >= next_session_start - 1800) // Within 30 minutes of next session
          {
             force_close = true;
-            Print("Position will be closed now as we're within 15 minutes of next session");
+            Print("Position will be closed now as we're within 15 minutes of next session (",
+                  TimeToString(next_session_start), "), remaining time: ", 
+                  (int)((next_session_start - current_time) / 60), " minutes");
          }
          else
          {
             // Still allowed to run to TP
-            Print("Position allowed to continue after hours (until TP or next session)");
+            int hours_until_next = (int)((next_session_start - current_time) / 3600);
+            int mins_until_next = (int)(((next_session_start - current_time) % 3600) / 60);
+            Print("Position allowed to continue after hours (until TP or next session in ", 
+                  hours_until_next, "h ", mins_until_next, "m)");
          }
       }
    }
