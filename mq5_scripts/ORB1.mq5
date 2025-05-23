@@ -534,10 +534,10 @@ void OnTick()
       else
       {
          // Then transition to idle state if needed
-         if (trade_state != STATE_IDLE)
-         {
+      if (trade_state != STATE_IDLE)
+      {
             Print("NYSE holiday detected - skipping trading today");
-            trade_state = STATE_IDLE;
+         trade_state = STATE_IDLE;
             if(LABEL_STATS) ShowLabel(); // Update display immediately
          }
       }
@@ -654,7 +654,7 @@ void UpdateSessionState(datetime current_time)
          if(!closed && ticket != 0)
          {
             Print("WARNING: Failed to close position before new session. Will retry.");
-            return;
+      return;
          }
       }
    }
@@ -765,16 +765,16 @@ bool IsNewBar()
    static datetime last_bar_time = 0;
    datetime current_bar_time = iTime(_Symbol, PERIOD_M15, 0);
    
-       if(current_bar_time != last_bar_time)
+   if(current_bar_time != last_bar_time)
    {
       last_bar_time = current_bar_time;
       
       // Only log new bar if debug level is high enough or during key periods
       if(debug_level >= 2 || trade_state == STATE_BUILDING_RANGE || trade_state == STATE_RANGE_LOCKED)
       {
-         Print("NEW BAR DETECTED at ", TimeToString(current_bar_time), 
+      Print("NEW BAR DETECTED at ", TimeToString(current_bar_time), 
                ", session window: ", TimeToString(current_session_start), " to ", TimeToString(current_session_end),
-               ", state: ", GetStateString(trade_state));
+            ", state: ", GetStateString(trade_state));
       }
       return true;
    }
@@ -1318,9 +1318,9 @@ void ManagePos()
          {
             Print("Failed to close position at session end. Will retry.");
          }
-      }
-      else
-      {
+         }
+         else
+         {
                // Transition to the after-hours state for clearer management
       trade_state = STATE_AFTER_HOURS_POSITION;
       Print("POSITION CONTINUED AFTER HOURS - Transitioning to AFTER_HOURS_POSITION state at ", TimeToString(current_time));
@@ -1373,8 +1373,8 @@ bool ClosePos()
       if(cur_time - last_close_error_log > 300) // Log errors max once per 5 minutes
       {
          last_close_error_log = cur_time;
-         string direction = (req.type == ORDER_TYPE_BUY) ? "buy" : "sell";
-         Print("Close position failed: ", res.retcode, " [", GetErrorDescription(res.retcode), "]");
+      string direction = (req.type == ORDER_TYPE_BUY) ? "buy" : "sell";
+      Print("Close position failed: ", res.retcode, " [", GetErrorDescription(res.retcode), "]");
       }
       return false; // Failed to close
    }
@@ -1638,6 +1638,56 @@ void ManageAfterHoursPos()
    
    // NOTE: Session transition logic (closing position before next session)
    // is now handled in UpdateSessionState() for more reliability
+}
+
+//+------------------------------------------------------------------+
+//| Tester function for optimization                                 |
+//+------------------------------------------------------------------+
+double OnTester()
+{
+   // Get basic trading statistics
+   double profit = TesterStatistics(STAT_PROFIT);
+   double drawdown = TesterStatistics(STAT_BALANCE_DD);
+   double max_drawdown_pct = TesterStatistics(STAT_BALANCE_DDREL_PERCENT); // Max drawdown as percentage
+   double trades = TesterStatistics(STAT_TRADES);
+   double profit_factor = TesterStatistics(STAT_PROFIT_FACTOR);
+   double sharpe_ratio = TesterStatistics(STAT_SHARPE_RATIO);
+   
+   // If no trades or negative profit, return worst possible value
+   if(trades == 0 || profit <= 0)
+      return 0;
+   
+   // If drawdown is zero, adjust to small value to avoid division by zero
+   if(drawdown == 0)
+      drawdown = 0.01;
+   
+   // Heavily penalize high drawdowns (>50%)
+   double drawdown_multiplier = 1.0;
+   if(max_drawdown_pct > 50)
+      drawdown_multiplier = 0.1;  // Severe penalty but not complete rejection
+   
+   // Profit is the dominant factor - use a much higher power to emphasize it
+   double profit_weight = 4.0;  // Extremely high weight for profit
+   
+   // Drawdown is minor factor - use very small penalty
+   double drawdown_penalty = 1;  // Minimal impact from drawdown
+   
+   // Core formula: Massively prioritize profit, with minimal drawdown impact
+   // Profit^4 makes profit extremely dominant
+   double custom_criterion = MathPow(profit, profit_weight) / MathPow(drawdown, drawdown_penalty);
+   
+   // Profit factor enhances profit emphasis
+   if(profit_factor > 1.0)
+      custom_criterion *= profit_factor;
+   
+   // For similar profit strategies, give minimal consideration to other factors
+   double min_trades_target = 300;  // Lower minimum for statistical significance
+   
+   // Trade count multiplier - reaches 1.0 at min_trades_target
+   double trade_multiplier = MathMin(1.0, trades / min_trades_target);
+   
+   // Final score - completely dominated by profit with minimal consideration for drawdown
+   return custom_criterion * trade_multiplier * drawdown_multiplier;
 }
 
 //+------------------------------------------------------------------+
