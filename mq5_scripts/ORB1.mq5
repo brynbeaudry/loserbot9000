@@ -107,6 +107,9 @@ int bear_breakout_count = 0; // Count of consecutive bearish breakout candles
 // ATR history for median calculation
 double atr_history[];
 
+// ATR handle for efficient indicator access
+int atr_handle = INVALID_HANDLE;
+
 // Time variables are now defined in the TIME VARIABLES section
 
 //+------------------------------------------------------------------+
@@ -152,55 +155,6 @@ bool IsNYDST(datetime ts)
 }
 
 //+------------------------------------------------------------------+
-//| Calculate session time boundaries                                |
-//+------------------------------------------------------------------+
-void CalculateSessionTimes(datetime reference_time, bool is_tomorrow = false)
-{
-   // Get midnight of reference day
-   datetime midnight = DateOfDay(reference_time);
-
-   // If calculating for tomorrow, add a day
-   if (is_tomorrow)
-      midnight += 86400;
-
-   // Define NY session hours based on session type
-   int ny_start_hour, ny_start_minute;
-
-   if (SESSION_TYPE == CLASSIC_NYSE)
-   {
-      ny_start_hour = 9;
-      ny_start_minute = 30;
-   }
-   else // EARLY_US
-   {
-      ny_start_hour = 8;
-      ny_start_minute = 0;
-   }
-
-   // Convert NY time to server time using fixed offset
-   int server_start_hour = ny_start_hour + NY_TIME_OFFSET;
-   int server_start_minute = ny_start_minute;
-   int server_close_hour = NY_SESSION_CLOSE_HOUR + NY_TIME_OFFSET;
-
-   // Calculate session timestamps
-   datetime session_start = midnight + server_start_hour * 3600 + server_start_minute * 60;
-   datetime session_end = midnight + server_close_hour * 3600;
-   datetime range_end = session_start + SESSION_OR_MINUTES * 60;
-
-   // Update global session variables
-   if (!is_tomorrow)
-   {
-      current_session_start = session_start;
-      current_session_end = session_end;
-      current_range_end = range_end;
-   }
-   else
-   {
-      next_session_start = session_start;
-   }
-}
-
-//+------------------------------------------------------------------+
 //| Check if within session hours                                    |
 //+------------------------------------------------------------------+
 bool IsWithinSessionHours(datetime time_to_check)
@@ -223,77 +177,97 @@ void ComputeSession()
 {
    datetime current_time = TimeCurrent();
 
-   // Get midnight of current day and tomorrow
+   // Define NY session hours based on session type
+   int ny_start_hour = (SESSION_TYPE == CLASSIC_NYSE) ? 9 : 8;
+   int ny_start_minute = (SESSION_TYPE == CLASSIC_NYSE) ? 30 : 0;
+
+   // Convert NY time to server time
+   int server_ny_start_hour = ny_start_hour + NY_TIME_OFFSET;
+   int server_ny_start_minute = ny_start_minute;
+   int server_ny_close_hour = NY_SESSION_CLOSE_HOUR + NY_TIME_OFFSET;
+
+   // Calculate the most recent session start (could be today or yesterday in server time)
+   // We need to find the session that either:
+   // 1. Started today and hasn't ended yet, OR
+   // 2. Started yesterday and we're in the after-hours period
+   
    MqlDateTime dt;
    TimeToStruct(current_time, dt);
    dt.hour = 0;
    dt.min = 0;
    dt.sec = 0;
    datetime today_midnight = StructToTime(dt);
+   datetime yesterday_midnight = today_midnight - 86400;
    datetime tomorrow_midnight = today_midnight + 86400;
 
-   // Define NY session hours based on session type
-   int ny_start_hour = (SESSION_TYPE == CLASSIC_NYSE) ? 9 : 8;
-   int ny_start_minute = (SESSION_TYPE == CLASSIC_NYSE) ? 30 : 0;
+   // Calculate session times for yesterday, today, and tomorrow (server time)
+   datetime yesterday_session_start = yesterday_midnight + server_ny_start_hour * 3600 + server_ny_start_minute * 60;
+   datetime yesterday_session_end = yesterday_midnight + server_ny_close_hour * 3600;
+   
+   datetime today_session_start = today_midnight + server_ny_start_hour * 3600 + server_ny_start_minute * 60;
+   datetime today_session_end = today_midnight + server_ny_close_hour * 3600;
+   
+   datetime tomorrow_session_start = tomorrow_midnight + server_ny_start_hour * 3600 + server_ny_start_minute * 60;
 
-   // Convert NY time to server time
-   int server_start_hour = ny_start_hour + NY_TIME_OFFSET;
-   int server_start_minute = ny_start_minute;
-   int server_close_hour = NY_SESSION_CLOSE_HOUR + NY_TIME_OFFSET;
-
-   // Calculate today's session times
-   datetime today_session_start = today_midnight + server_start_hour * 3600 + server_start_minute * 60;
-   datetime today_session_end = today_midnight + server_close_hour * 3600;
-   datetime today_range_end = today_session_start + SESSION_OR_MINUTES * 60;
-
-   // Calculate tomorrow's session start (needed for after-hours position management)
-   datetime tomorrow_session_start = tomorrow_midnight + server_start_hour * 3600 + server_start_minute * 60;
-
-   // Determine if we should use today's or tomorrow's session
-   if (current_time > today_session_end)
+   // Determine which session we're currently in or closest to
+   if (current_time >= today_session_start)
    {
-      // We're past today's session, use tomorrow's values
-      current_session_start = tomorrow_session_start;
-      current_session_end = tomorrow_midnight + server_close_hour * 3600;
+      // We're at or after today's session start
+      current_session_start = today_session_start;
+      current_session_end = today_session_end;
       current_range_end = current_session_start + SESSION_OR_MINUTES * 60;
-
-      // Set next_session_start to tomorrow's session (the one we're waiting for)
       next_session_start = tomorrow_session_start;
-
-      // Extremely limited logging of session changes (once per hour and only at debug_level >= 2)
-      static datetime last_session_log = 0;
-      static int session_log_count = 0;
-      if (DEBUG_LEVEL >= 2 && current_time - last_session_log > 3600)
-      {
-         // Only log the first 2 instances per EA run
-         if (session_log_count < 2)
-         {
-            if (DEBUG_LEVEL >= 2)
-               Print("Current time ", TimeToString(current_time), " is past today's session end. Using tomorrow's session.");
-            session_log_count++;
-         }
-         last_session_log = current_time;
-      }
+   }
+   else if (current_time >= yesterday_session_end)
+   {
+      // We're between yesterday's session end and today's session start
+      // This is the "after hours" period for yesterday's session
+      current_session_start = yesterday_session_start;
+      current_session_end = yesterday_session_end;
+      current_range_end = current_session_start + SESSION_OR_MINUTES * 60;
+      next_session_start = today_session_start;
    }
    else
    {
-      // We're in or before today's session
+      // We're before yesterday's session end (shouldn't happen in normal trading)
+      // Default to today's session
       current_session_start = today_session_start;
       current_session_end = today_session_end;
-      current_range_end = today_range_end;
+      current_range_end = current_session_start + SESSION_OR_MINUTES * 60;
       next_session_start = tomorrow_session_start;
+   }
 
-      // Only log at very high debug level (3+)
-      if (DEBUG_LEVEL >= 3)
+   // Skip weekends for next_session_start (holidays are handled elsewhere)
+   MqlDateTime next_dt;
+   TimeToStruct(next_session_start, next_dt);
+   int safety_counter = 0;
+   
+   while ((next_dt.day_of_week == 0 || next_dt.day_of_week == 6) && safety_counter < 10)
+   {
+      next_session_start += 86400; // Add one day
+      TimeToStruct(next_session_start, next_dt);
+      safety_counter++;
+      
+      // Recalculate the session start time for the new day
+      datetime new_day_midnight = DateOfDay(next_session_start);
+      next_session_start = new_day_midnight + server_ny_start_hour * 3600 + server_ny_start_minute * 60;
+      TimeToStruct(next_session_start, next_dt);
+   }
+
+   // Extremely limited logging
+   static datetime last_session_log = 0;
+   static int session_log_count = 0;
+   if (DEBUG_LEVEL >= 2 && current_time - last_session_log > 3600)
+   {
+      if (session_log_count < 2)
       {
-         static datetime last_today_session_log = 0;
-         if (current_time - last_today_session_log > 3600)
-         { // Once per hour max
-            if (DEBUG_LEVEL >= 3)
-               Print("Using today's session window: ", TimeToString(current_session_start), " to ", TimeToString(current_session_end));
-            last_today_session_log = current_time;
-         }
+         if (DEBUG_LEVEL >= 2)
+            Print("Session computed: Current=", TimeToString(current_session_start), 
+                  " to ", TimeToString(current_session_end),
+                  ", Next=", TimeToString(next_session_start));
+         session_log_count++;
       }
+      last_session_log = current_time;
    }
 }
 
@@ -410,6 +384,15 @@ int OnInit()
    }
 
    // Calculate ATR
+   // Initialize ATR handle for efficient indicator access
+   atr_handle = iATR(_Symbol, _Period, ATR_PERIOD);
+   if (atr_handle == INVALID_HANDLE)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Failed to create ATR indicator handle. Error: ", GetLastError());
+      return (INIT_FAILED);
+   }
+   
    UpdateATR();
 
    // Add volume indicator to chart
@@ -512,6 +495,14 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, box_name);
    ObjectsDeleteAll(0, hl_name);
    ObjectsDeleteAll(0, ll_name);
+   
+   // Release ATR indicator handle
+   if (atr_handle != INVALID_HANDLE)
+   {
+      IndicatorRelease(atr_handle);
+      atr_handle = INVALID_HANDLE;
+   }
+   
    Comment("");
 }
 
@@ -600,6 +591,17 @@ void OnTick()
    // 3. MARKET ANALYSIS
    // Update ATR for breakout levels and position sizing
    UpdateATR();
+
+   // Debug ATR values periodically
+   static datetime last_atr_log = 0;
+   if (DEBUG_LEVEL >= 2 && current_time - last_atr_log > 1800) // Log every 30 minutes
+   {
+      last_atr_log = current_time;
+      Print("ATR STATUS: Current=", DoubleToString(atr_value, _Digits),
+            ", Median=", DoubleToString(atr_median, _Digits),
+            ", Filter=", (USE_VOLATILITY_FILTER ? "ON" : "OFF"),
+            ", Passed=", (volatility_ok ? "YES" : "NO"));
+   }
 
    // 4. STATE TRANSITIONS
    // Handle critical state transitions based on time
@@ -1566,12 +1568,38 @@ void ShowLabel()
          ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
          double sl = PositionGetDouble(POSITION_SL);
          double tp = PositionGetDouble(POSITION_TP);
-         int mins_to_next = (int)((next_session_start - TimeCurrent()) / 60);
+         
+         // Calculate time to next session with proper handling
+         datetime current_time = TimeCurrent();
+         int mins_to_next = (int)((next_session_start - current_time) / 60);
+         
+         string time_info;
+         if (mins_to_next > 0)
+         {
+            if (mins_to_next > 1440) // More than 24 hours
+            {
+               int days = mins_to_next / 1440;
+               int hours = (mins_to_next % 1440) / 60;
+               time_info = IntegerToString(days) + "d " + IntegerToString(hours) + "h to next session";
+            }
+            else if (mins_to_next > 60) // More than 1 hour
+            {
+               int hours = mins_to_next / 60;
+               int minutes = mins_to_next % 60;
+               time_info = IntegerToString(hours) + "h " + IntegerToString(minutes) + "m to next session";
+            }
+            else // Less than 1 hour
+            {
+               time_info = IntegerToString(mins_to_next) + "m to next session";
+            }
+         }
+         else
+         {
+            time_info = "Next session starting soon";
+         }
 
          status = "In " + (ptype == POSITION_TYPE_BUY ? "LONG" : "SHORT") +
-                  " AFTER HOURS position (" +
-                  IntegerToString(mins_to_next / 60) + "h " +
-                  IntegerToString(mins_to_next % 60) + "m to next session)";
+                  " AFTER HOURS position (" + time_info + ")";
       }
       else
       {
@@ -1624,36 +1652,47 @@ void ShowLabel()
 //+------------------------------------------------------------------+
 void UpdateATR()
 {
-   // Calculate current ATR value
-   int atr_handle = iATR(_Symbol, _Period, ATR_PERIOD);
+   // Calculate current ATR value using the global handle
    double atr_buff[];
 
    if (CopyBuffer(atr_handle, 0, 0, 2, atr_buff) <= 0)
    {
-      Print("ATR error: ", GetLastError());
+      if (DEBUG_LEVEL >= 1)
+         Print("ATR error: ", GetLastError());
       return;
    }
 
    // Get current ATR value (from previous completed bar)
    atr_value = atr_buff[1];
 
-   // Calculate median ATR if we don't have it yet
+   // Calculate median ATR if we don't have it yet or need to recalculate
    if (atr_median <= 0 && USE_VOLATILITY_FILTER)
    {
       // For median calculation we need a longer ATR history
-      int bars_needed = ATR_MEDIAN_DAYS * 24; // Approximately ATR_MEDIAN_DAYS days of data
+      // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 26 fifteen-minute bars per day
+      int bars_per_trading_day = 26;
+      int bars_needed = ATR_MEDIAN_DAYS * bars_per_trading_day;
 
       // Make sure we don't request more bars than available
       int available_bars = Bars(_Symbol, _Period);
       if (bars_needed > available_bars)
          bars_needed = available_bars;
 
+      // Only proceed if we have enough data
+      if (bars_needed < 10)
+      {
+         if (DEBUG_LEVEL >= 1)
+            Print("Insufficient data for ATR median calculation. Need at least 10 bars, have ", bars_needed);
+         return;
+      }
+
       // Get ATR values for the period
       ArrayResize(atr_history, bars_needed);
 
       if (CopyBuffer(atr_handle, 0, 0, bars_needed, atr_history) <= 0)
       {
-         Print("Error getting ATR history: ", GetLastError());
+         if (DEBUG_LEVEL >= 1)
+            Print("Error getting ATR history: ", GetLastError());
          return;
       }
 
@@ -1666,6 +1705,10 @@ void UpdateATR()
          atr_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
       else // Odd number of elements
          atr_median = atr_history[middle];
+
+      if (DEBUG_LEVEL >= 1)
+         Print("ATR median calculated: ", DoubleToString(atr_median, _Digits), 
+               " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
    }
 }
 
