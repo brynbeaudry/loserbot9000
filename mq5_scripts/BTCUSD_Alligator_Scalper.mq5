@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                        BTCUSD Alligator Scalper                   |
-//|                     1-Minute Scalping Strategy                    |
+//|         Original Williams Alligator Strategy (M1 Adapted)         |
 //|               Copyright 2025 - free to use / modify               |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
@@ -11,7 +11,7 @@
 // Risk Management - Percentage-Based System
 input double RISK_PER_TRADE_PCT = 2.0;    // % equity risk per trade (e.g., 2% of $10k = $200 risk)
 input double TAKE_PROFIT_MULT = 2.0;      // Profit target multiplier (2.0 = 2:1 risk:reward ratio)
-input int MAX_TRADES_PER_DAY = 10;         // Maximum trades per day
+input int MAX_TRADES_PER_DAY = 100;         // Maximum trades per day
 
 // Alligator Settings (Williams Alligator)
 input int JAW_PERIOD = 13;        // Jaw period (Blue line - slowest)
@@ -24,11 +24,10 @@ input ENUM_MA_METHOD MA_METHOD = MODE_SMMA;  // Moving average method
 input ENUM_APPLIED_PRICE APPLIED_PRICE = PRICE_MEDIAN; // Applied price
 
 // Trade Timing and Thresholds
-input int MIN_TREND_DURATION_SECONDS = 10;   // Minimum trend duration before crossover trade (seconds)
-input double PRICE_THRESHOLD_POINTS = 2;     // Minimum price movement threshold (points) - much lower for M1
-input double LINE_SEPARATION_POINTS = 1;     // Minimum separation between Alligator lines (points) - much lower
-input bool REQUIRE_TREND_ALIGNMENT = false;  // Require proper line alignment for trades - disabled for more signals
-input int SIGNAL_COOLDOWN_SECONDS = 15;      // Cooldown between signals (seconds) - shorter cooldown
+input double PRICE_THRESHOLD_POINTS = 5;   // Minimum price movement threshold (points) - very low for M1 scalping
+input double LINE_SEPARATION_POINTS = 3;   // Minimum separation between Alligator lines (points) - very low for sensitive detection
+input int SIGNAL_COOLDOWN_SECONDS = 180;      // Cooldown between signals (seconds) - prevents rapid fire & whipsaw
+input int CONFIRMATION_WINDOW_SECONDS = 120;  // Time window for lines to confirm after price crosses Jaw (seconds)
 
 // Visual Settings
 input bool SHOW_INFO = true;       // Show information panel
@@ -57,6 +56,14 @@ datetime bearish_trend_start = 0;     // When bearish alignment started
 datetime last_signal_time = 0;        // Last signal time for cooldown
 bool previous_bullish_alignment = false;
 bool previous_bearish_alignment = false;
+
+// Sequential confirmation tracking variables
+datetime price_crossed_jaw_up_time = 0;    // When price last crossed above Jaw
+datetime price_crossed_jaw_down_time = 0;  // When price last crossed below Jaw
+bool waiting_for_teeth_bullish = false;    // Step 1: Waiting for Teeth to cross above Jaw
+bool waiting_for_lips_bullish = false;     // Step 2: Waiting for Lips to be above Teeth
+bool waiting_for_teeth_bearish = false;    // Step 1: Waiting for Teeth to cross below Jaw  
+bool waiting_for_lips_bearish = false;     // Step 2: Waiting for Lips to be below Teeth
 
 // Trade state tracking
 enum TradeDirection
@@ -325,12 +332,25 @@ bool UpdateAlligatorValues()
 }
 
 //+------------------------------------------------------------------+
-//| Update price values for crossover detection                      |
+//| Update price values for crossover detection (CANDLE CLOSES ONLY) |
 //+------------------------------------------------------------------+
 void UpdatePriceValues()
 {
    price_previous = price_current;
-   price_current = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   // Use CANDLE CLOSE prices instead of live bid/ask to avoid false signals
+   double close_prices[];
+   if(CopyClose(_Symbol, _Period, 0, 2, close_prices) >= 2)
+   {
+      price_current = close_prices[0];  // Current (latest) candle close
+      if(price_previous == 0) // First run
+         price_previous = close_prices[1]; // Previous candle close
+   }
+   else
+   {
+      // Fallback to live price if candle data unavailable
+      price_current = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -365,16 +385,16 @@ void CheckEntrySignals()
    bool lips_crossed_below_teeth = (lips_current < teeth_current && lips_previous >= teeth_previous) &&
                                    (teeth_current - lips_current >= LINE_SEPARATION_POINTS * _Point);
    
+   // Add crossover detection for Teeth vs Jaw
+   bool teeth_crossed_above_jaw = (teeth_current > jaw_current && teeth_previous <= jaw_previous) &&
+                                  (teeth_current - jaw_current >= LINE_SEPARATION_POINTS * _Point);
+   
+   bool teeth_crossed_below_jaw = (teeth_current < jaw_current && teeth_previous >= jaw_previous) &&
+                                  (jaw_current - teeth_current >= LINE_SEPARATION_POINTS * _Point);
+   
    // Check line alignment for trend confirmation
    bool bullish_alignment = (lips_current > teeth_current && teeth_current > jaw_current);
    bool bearish_alignment = (jaw_current > teeth_current && teeth_current > lips_current);
-   
-   // Check trend duration requirements
-   bool bullish_duration_ok = (bullish_trend_start > 0) && 
-                              ((TimeCurrent() - bullish_trend_start) >= MIN_TREND_DURATION_SECONDS);
-   
-   bool bearish_duration_ok = (bearish_trend_start > 0) && 
-                              ((TimeCurrent() - bearish_trend_start) >= MIN_TREND_DURATION_SECONDS);
    
    // Debug signal analysis (more frequent for troubleshooting)
    if(DEBUG_LEVEL >= 1)
@@ -389,50 +409,141 @@ void CheckEntrySignals()
                ", Below=", lips_crossed_below_teeth ? "YES" : "No");
          Print("Alignment: Bullish=", bullish_alignment ? "YES" : "No", 
                ", Bearish=", bearish_alignment ? "YES" : "No");
-         Print("Duration OK: Bullish=", bullish_duration_ok ? "YES" : "No",
-               ", Bearish=", bearish_duration_ok ? "YES" : "No");
          
-         // Show current thresholds being used
+         // Detailed crossover analysis for debugging
+         Print("=== DETAILED CROSSOVER DEBUG ===");
+         Print("Price: Current=", DoubleToString(price_current, _Digits), ", Previous=", DoubleToString(price_previous, _Digits));
+         Print("Jaw: Current=", DoubleToString(jaw_current, _Digits), ", Previous=", DoubleToString(jaw_previous, _Digits));
+         Print("Teeth: Current=", DoubleToString(teeth_current, _Digits), ", Previous=", DoubleToString(teeth_previous, _Digits));  
+         Print("Lips: Current=", DoubleToString(lips_current, _Digits), ", Previous=", DoubleToString(lips_previous, _Digits));
+         
+         // Check raw crossover conditions (without thresholds)
+         bool raw_price_cross_up = (price_current > jaw_current && price_previous <= jaw_previous);
+         bool raw_price_cross_down = (price_current < jaw_current && price_previous >= jaw_previous);
+         bool raw_lips_cross_up = (lips_current > teeth_current && lips_previous <= teeth_previous);
+         bool raw_lips_cross_down = (lips_current < teeth_current && lips_previous >= teeth_previous);
+         
+         Print("Raw Crossovers (no thresholds): Price Up=", raw_price_cross_up ? "YES" : "No",
+               ", Price Down=", raw_price_cross_down ? "YES" : "No",
+               ", Lips Up=", raw_lips_cross_up ? "YES" : "No", 
+               ", Lips Down=", raw_lips_cross_down ? "YES" : "No");
+         
+         // Show current thresholds and mode being used
          Print("Thresholds: Price=", PRICE_THRESHOLD_POINTS, " points, Line=", LINE_SEPARATION_POINTS, " points");
-         Print("Trend Duration Req: ", MIN_TREND_DURATION_SECONDS, " seconds");
-         Print("Require Alignment: ", REQUIRE_TREND_ALIGNMENT ? "YES" : "No");
+         Print("Mode: WILLIAMS ALLIGATOR (Sequential crossover: Price→Teeth→Lips) - NO DURATION FILTER");
+         
+         // Show current line positioning for Williams Alligator analysis
+         bool lips_above_teeth = lips_current > teeth_current;
+         bool teeth_vs_jaw = teeth_current > jaw_current;
+         bool lips_vs_jaw = lips_current > jaw_current;
+         Print("Line Positioning: Lips vs Teeth = ", lips_above_teeth ? "ABOVE" : "BELOW");
+         Print("Line Stack Check: Teeth vs Jaw = ", teeth_vs_jaw ? "ABOVE" : "BELOW", 
+               ", Lips vs Jaw = ", lips_vs_jaw ? "ABOVE" : "BELOW");
+         
+         // Show confirmation status
+         if(waiting_for_teeth_bullish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
+            Print("CONFIRMATION STATUS: Waiting for TEETH to cross above JAW (", time_remaining, " seconds remaining)");
+         }
+         else if(waiting_for_lips_bullish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
+            Print("CONFIRMATION STATUS: Waiting for LIPS above TEETH (", time_remaining, " seconds remaining)");
+         }
+         else if(waiting_for_teeth_bearish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
+            Print("CONFIRMATION STATUS: Waiting for TEETH to cross below JAW (", time_remaining, " seconds remaining)");
+         }
+         else if(waiting_for_lips_bearish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
+            Print("CONFIRMATION STATUS: Waiting for LIPS below TEETH (", time_remaining, " seconds remaining)");
+         }
+         else
+         {
+            Print("CONFIRMATION STATUS: Not waiting (no recent sequential confirmation started)");
+         }
          
          last_signal_debug = TimeCurrent();
       }
    }
    
-   // SIMPLIFIED BUY SIGNAL for M1 scalping
+   // WILLIAMS ALLIGATOR BUY: Sequential Crossover Confirmation
+   // Step 1: Price crosses above Jaw (trigger)
+   // Step 2: Teeth crosses above Jaw (first confirmation)  
+   // Step 3: Lips above Teeth (final confirmation & entry)
+   
    bool buy_signal = false;
    string buy_reason = "";
    
-   if(REQUIRE_TREND_ALIGNMENT)
+   // Step 1: Check for new price cross above Jaw (trigger)
+   if(price_crossed_above_jaw && !waiting_for_teeth_bullish && !waiting_for_lips_bullish)
    {
-      // Strict mode: require both conditions + alignment + duration
-      buy_signal = price_crossed_above_jaw && lips_crossed_above_teeth && 
-                   bullish_alignment && bullish_duration_ok;
-      if(buy_signal)
-         buy_reason = "Price + Lips crossed with bullish alignment and duration";
+      price_crossed_jaw_up_time = TimeCurrent();
+      waiting_for_teeth_bullish = true;
+      waiting_for_teeth_bearish = false; // Cancel any bearish sequence
+      waiting_for_lips_bearish = false;
+      if(DEBUG_LEVEL >= 1)
+         Print("🔔 STEP 1: Price crossed above Jaw - waiting for Teeth to cross above Jaw");
    }
-   else
+   
+   // Step 2: Check for Teeth crossing above Jaw (first confirmation)
+   // CRITICAL: Only accept teeth crossovers that happen AFTER price crossed jaw
+   // Ensure at least 1 second has passed since price crossed jaw to prevent same-tick acceptance
+   bool teeth_cross_after_price = waiting_for_teeth_bullish && 
+                                 (TimeCurrent() - price_crossed_jaw_up_time >= 1);
+   
+   if(teeth_crossed_above_jaw && teeth_cross_after_price)
    {
-      // RELAXED mode for M1 scalping: much simpler requirements
-      buy_signal = (price_crossed_above_jaw || lips_crossed_above_teeth) && bullish_duration_ok;
-      if(buy_signal)
-      {
-         if(price_crossed_above_jaw) buy_reason += "Price crossed above Jaw ";
-         if(lips_crossed_above_teeth) buy_reason += "Lips crossed above Teeth ";
-         buy_reason += "with duration OK";
-      }
+      waiting_for_teeth_bullish = false;
+      waiting_for_lips_bullish = true;
+      if(DEBUG_LEVEL >= 1)
+         Print("✅ STEP 2: Teeth crossed above Jaw AFTER price cross - waiting for Lips above Teeth");
+   }
+   
+   // Step 3: Check for final confirmation and entry
+   bool lips_above_teeth = lips_current > teeth_current;
+   bool within_bullish_window = waiting_for_lips_bullish && 
+                                (TimeCurrent() - price_crossed_jaw_up_time <= CONFIRMATION_WINDOW_SECONDS);
+   
+   buy_signal = within_bullish_window && lips_above_teeth;
+   
+   if(buy_signal)
+   {
+      buy_reason = "WILLIAMS ALLIGATOR: Sequential confirmation complete (Price>Jaw→Teeth>Jaw→Lips>Teeth)";
+      waiting_for_lips_bullish = false; // Reset confirmation flags
    }
    
    // Log potential signals that don't meet all criteria
-   if((price_crossed_above_jaw || lips_crossed_above_teeth) && DEBUG_LEVEL >= 1)
+   bool potential_buy_condition = waiting_for_teeth_bullish || waiting_for_lips_bullish;
+      
+   if(potential_buy_condition && DEBUG_LEVEL >= 1)
    {
       if(!buy_signal)
       {
-         Print("POTENTIAL BUY SIGNAL - but failed requirements:");
-         if(!bullish_duration_ok) Print("  - Duration not met (need ", MIN_TREND_DURATION_SECONDS, " seconds)");
-         if(REQUIRE_TREND_ALIGNMENT && !bullish_alignment) Print("  - Bullish alignment required but not present");
+         Print("POTENTIAL BUY SIGNAL - but failed WILLIAMS ALLIGATOR requirements:");
+         if(!within_bullish_window) Print("  - Not within confirmation window (", CONFIRMATION_WINDOW_SECONDS, " sec after Jaw cross)");
+         if(waiting_for_teeth_bullish) 
+         {
+            int time_since_price_cross = (int)(TimeCurrent() - price_crossed_jaw_up_time);
+            Print("  - Waiting for Teeth to cross above Jaw (", time_since_price_cross, " sec since price crossed)");
+            if(teeth_crossed_above_jaw && time_since_price_cross < 1)
+               Print("    → Teeth crossover detected but too soon (need 1+ sec after price cross)");
+         }
+         if(waiting_for_lips_bullish && !lips_above_teeth) Print("  - Waiting for Lips to be above Teeth");
+         if(waiting_for_teeth_bullish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
+            Print("  - Sequential confirmation: Step 1 (", time_remaining, " seconds remaining)");
+         }
+         else if(waiting_for_lips_bullish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
+            Print("  - Sequential confirmation: Step 2 (", time_remaining, " seconds remaining)");
+         }
+         Print("  - Mode: WILLIAMS ALLIGATOR (Sequential crossover: Price→Teeth→Lips)");
       }
    }
    
@@ -446,38 +557,80 @@ void CheckEntrySignals()
       return;
    }
    
-   // SIMPLIFIED SELL SIGNAL for M1 scalping  
+   // WILLIAMS ALLIGATOR SELL: Sequential Crossover Confirmation
+   // Step 1: Price crosses below Jaw (trigger)
+   // Step 2: Teeth crosses below Jaw (first confirmation)
+   // Step 3: Lips below Teeth (final confirmation & entry)
+   
    bool sell_signal = false;
    string sell_reason = "";
    
-   if(REQUIRE_TREND_ALIGNMENT)
+   // Step 1: Check for new price cross below Jaw (trigger)
+   if(price_crossed_below_jaw && !waiting_for_teeth_bearish && !waiting_for_lips_bearish)
    {
-      // Strict mode: require both conditions + alignment + duration
-      sell_signal = price_crossed_below_jaw && lips_crossed_below_teeth && 
-                    bearish_alignment && bearish_duration_ok;
-      if(sell_signal)
-         sell_reason = "Price + Lips crossed with bearish alignment and duration";
+      price_crossed_jaw_down_time = TimeCurrent();
+      waiting_for_teeth_bearish = true;
+      waiting_for_teeth_bullish = false; // Cancel any bullish sequence
+      waiting_for_lips_bullish = false;
+      if(DEBUG_LEVEL >= 1)
+         Print("🔔 STEP 1: Price crossed below Jaw - waiting for Teeth to cross below Jaw");
    }
-   else
+   
+   // Step 2: Check for Teeth crossing below Jaw (first confirmation)
+   // CRITICAL: Only accept teeth crossovers that happen AFTER price crossed jaw
+   // Ensure at least 1 second has passed since price crossed jaw to prevent same-tick acceptance
+   bool teeth_cross_after_price_bearish = waiting_for_teeth_bearish && 
+                                         (TimeCurrent() - price_crossed_jaw_down_time >= 1);
+   
+   if(teeth_crossed_below_jaw && teeth_cross_after_price_bearish)
    {
-      // RELAXED mode for M1 scalping: much simpler requirements
-      sell_signal = (price_crossed_below_jaw || lips_crossed_below_teeth) && bearish_duration_ok;
-      if(sell_signal)
-      {
-         if(price_crossed_below_jaw) sell_reason += "Price crossed below Jaw ";
-         if(lips_crossed_below_teeth) sell_reason += "Lips crossed below Teeth ";
-         sell_reason += "with duration OK";
-      }
+      waiting_for_teeth_bearish = false;
+      waiting_for_lips_bearish = true;
+      if(DEBUG_LEVEL >= 1)
+         Print("✅ STEP 2: Teeth crossed below Jaw AFTER price cross - waiting for Lips below Teeth");
+   }
+   
+   // Step 3: Check for final confirmation and entry
+   bool lips_below_teeth = lips_current < teeth_current;
+   bool within_bearish_window = waiting_for_lips_bearish && 
+                                (TimeCurrent() - price_crossed_jaw_down_time <= CONFIRMATION_WINDOW_SECONDS);
+   
+   sell_signal = within_bearish_window && lips_below_teeth;
+   
+   if(sell_signal)
+   {
+      sell_reason = "WILLIAMS ALLIGATOR: Sequential confirmation complete (Price<Jaw→Teeth<Jaw→Lips<Teeth)";
+      waiting_for_lips_bearish = false; // Reset confirmation flags
    }
    
    // Log potential signals that don't meet all criteria
-   if((price_crossed_below_jaw || lips_crossed_below_teeth) && DEBUG_LEVEL >= 1)
+   bool potential_sell_condition = waiting_for_teeth_bearish || waiting_for_lips_bearish;
+      
+   if(potential_sell_condition && DEBUG_LEVEL >= 1)
    {
       if(!sell_signal)
       {
-         Print("POTENTIAL SELL SIGNAL - but failed requirements:");
-         if(!bearish_duration_ok) Print("  - Duration not met (need ", MIN_TREND_DURATION_SECONDS, " seconds)");
-         if(REQUIRE_TREND_ALIGNMENT && !bearish_alignment) Print("  - Bearish alignment required but not present");
+         Print("POTENTIAL SELL SIGNAL - but failed WILLIAMS ALLIGATOR requirements:");
+         if(!within_bearish_window) Print("  - Not within confirmation window (", CONFIRMATION_WINDOW_SECONDS, " sec after Jaw cross)");
+         if(waiting_for_teeth_bearish) 
+         {
+            int time_since_price_cross = (int)(TimeCurrent() - price_crossed_jaw_down_time);
+            Print("  - Waiting for Teeth to cross below Jaw (", time_since_price_cross, " sec since price crossed)");
+            if(teeth_crossed_below_jaw && time_since_price_cross < 1)
+               Print("    → Teeth crossover detected but too soon (need 1+ sec after price cross)");
+         }
+         if(waiting_for_lips_bearish && !lips_below_teeth) Print("  - Waiting for Lips to be below Teeth");
+         if(waiting_for_teeth_bearish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
+            Print("  - Sequential confirmation: Step 1 (", time_remaining, " seconds remaining)");
+         }
+         else if(waiting_for_lips_bearish)
+         {
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
+            Print("  - Sequential confirmation: Step 2 (", time_remaining, " seconds remaining)");
+         }
+         Print("  - Mode: WILLIAMS ALLIGATOR (Sequential crossover: Price→Teeth→Lips)");
       }
    }
    
@@ -490,6 +643,23 @@ void CheckEntrySignals()
       last_signal_time = TimeCurrent();
       return;
    }
+   
+   // Reset confirmation flags if windows expire
+   if((waiting_for_teeth_bullish || waiting_for_lips_bullish) && (TimeCurrent() - price_crossed_jaw_up_time > CONFIRMATION_WINDOW_SECONDS))
+   {
+      waiting_for_teeth_bullish = false;
+      waiting_for_lips_bullish = false;
+      if(DEBUG_LEVEL >= 1)
+         Print("⏰ TIMEOUT: Bullish sequential confirmation window expired");
+   }
+   
+   if((waiting_for_teeth_bearish || waiting_for_lips_bearish) && (TimeCurrent() - price_crossed_jaw_down_time > CONFIRMATION_WINDOW_SECONDS))
+   {
+      waiting_for_teeth_bearish = false;
+      waiting_for_lips_bearish = false;
+      if(DEBUG_LEVEL >= 1)
+         Print("⏰ TIMEOUT: Bearish sequential confirmation window expired");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -499,41 +669,39 @@ void ExecuteBuyOrder()
 {
    double entry_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
-   // Calculate percentage-based risk and position sizing
+   // Calculate percentage-based risk amount
    double risk_amount = CalculateRiskAmount();
    double profit_target = risk_amount * TAKE_PROFIT_MULT;
    
-   // For BTCUSD: Default $50 stop loss, $20 minimum for broker requirements
-   double default_sl_distance = 50.0; // Default $50 stop loss
-   double min_sl_distance = 20.0;     // Minimum $20 for broker requirements
-   
-   // Calculate stop loss and take profit levels
-   double sl_distance = default_sl_distance; // Start with default
-   double stop_loss = entry_price - sl_distance;
-   double take_profit = entry_price + (sl_distance * TAKE_PROFIT_MULT); // Simple 2:1 ratio
+   // Stop loss distance = risk amount (in points)
+   double sl_points = risk_amount; // SL distance equals risk amount for direct 1:1 relationship
+   double stop_loss = entry_price - sl_points;
+   double take_profit = entry_price + (sl_points * TAKE_PROFIT_MULT);
    
    // Validate and adjust stops for broker requirements
    ValidateAndAdjustStops(ORDER_TYPE_BUY, entry_price, stop_loss, take_profit);
    
-   // Recalculate actual distances after adjustment
-   double actual_sl_distance = entry_price - stop_loss;
-   double actual_tp_distance = take_profit - entry_price;
+   // Recalculate actual distances after adjustment (in price points)
+   double actual_sl_points = entry_price - stop_loss;
+   double actual_tp_points = take_profit - entry_price;
    
-   // Calculate lot size based on risk amount and actual SL distance
-   double raw_lot_size = risk_amount / actual_sl_distance;
+   // CORRECT VOLUME CALCULATION: Risk amount ÷ (SL points × point value)
+   double point_value = CalculatePointValue();
+   double raw_lot_size = risk_amount / (actual_sl_points * point_value);
    double lot_size = NormalizeLotSize(raw_lot_size);
    
-   // Debug the percentage-based calculation
-   Print("=== PERCENTAGE-BASED POSITION SIZING (BUY) ===");
+   // Debug the simple calculation
+   Print("=== SIMPLE PERCENTAGE-BASED POSITION SIZING (BUY) ===");
    Print("Risk amount: $", DoubleToString(risk_amount, 2));
    Print("Profit target: $", DoubleToString(profit_target, 2));
    Print("Entry price: $", DoubleToString(entry_price, 2));
-   Print("Stop loss: $", DoubleToString(stop_loss, 2), " (distance: $", DoubleToString(actual_sl_distance, 2), ")");
-   Print("Take profit: $", DoubleToString(take_profit, 2), " (distance: $", DoubleToString(actual_tp_distance, 2), ")");
+   Print("Stop loss: $", DoubleToString(stop_loss, 2), " (distance: ", DoubleToString(actual_sl_points, 2), " points)");
+   Print("Take profit: $", DoubleToString(take_profit, 2), " (distance: ", DoubleToString(actual_tp_points, 2), " points)");
+   Print("Point value: $", DoubleToString(point_value, 2), " per point per lot");
    Print("Raw lot size: ", DoubleToString(raw_lot_size, 4));
    Print("Final lot size: ", DoubleToString(lot_size, 4));
-   Print("Actual dollar risk: $", DoubleToString(lot_size * actual_sl_distance, 2));
-   Print("Actual dollar profit target: $", DoubleToString(lot_size * actual_tp_distance, 2));
+   Print("Actual dollar risk: $", DoubleToString(lot_size * actual_sl_points * point_value, 2));
+   Print("Actual dollar profit target: $", DoubleToString(lot_size * actual_tp_points * point_value, 2));
    Print("==========================================");
    
    // Enhanced filling mode detection with extensive debugging
@@ -642,41 +810,39 @@ void ExecuteSellOrder()
 {
    double entry_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
-   // Calculate percentage-based risk and position sizing
+   // Calculate percentage-based risk amount
    double risk_amount = CalculateRiskAmount();
    double profit_target = risk_amount * TAKE_PROFIT_MULT;
    
-   // For BTCUSD: Default $50 stop loss, $20 minimum for broker requirements
-   double default_sl_distance = 50.0; // Default $50 stop loss
-   double min_sl_distance = 20.0;     // Minimum $20 for broker requirements
-   
-   // Calculate stop loss and take profit levels
-   double sl_distance = default_sl_distance; // Start with default
-   double stop_loss = entry_price + sl_distance;
-   double take_profit = entry_price - (sl_distance * TAKE_PROFIT_MULT); // Simple 2:1 ratio
+   // Stop loss distance = risk amount (in points)
+   double sl_points = risk_amount; // SL distance equals risk amount for direct 1:1 relationship
+   double stop_loss = entry_price + sl_points;
+   double take_profit = entry_price - (sl_points * TAKE_PROFIT_MULT);
    
    // Validate and adjust stops for broker requirements
    ValidateAndAdjustStops(ORDER_TYPE_SELL, entry_price, stop_loss, take_profit);
    
-   // Recalculate actual distances after adjustment
-   double actual_sl_distance = stop_loss - entry_price;
-   double actual_tp_distance = entry_price - take_profit;
+   // Recalculate actual distances after adjustment (in price points)
+   double actual_sl_points = stop_loss - entry_price;
+   double actual_tp_points = entry_price - take_profit;
    
-   // Calculate lot size based on risk amount and actual SL distance
-   double raw_lot_size = risk_amount / actual_sl_distance;
+   // CORRECT VOLUME CALCULATION: Risk amount ÷ (SL points × point value)
+   double point_value = CalculatePointValue();
+   double raw_lot_size = risk_amount / (actual_sl_points * point_value);
    double lot_size = NormalizeLotSize(raw_lot_size);
    
-   // Debug the percentage-based calculation
-   Print("=== PERCENTAGE-BASED POSITION SIZING (SELL) ===");
+   // Debug the simple calculation
+   Print("=== SIMPLE PERCENTAGE-BASED POSITION SIZING (SELL) ===");
    Print("Risk amount: $", DoubleToString(risk_amount, 2));
    Print("Profit target: $", DoubleToString(profit_target, 2));
    Print("Entry price: $", DoubleToString(entry_price, 2));
-   Print("Stop loss: $", DoubleToString(stop_loss, 2), " (distance: $", DoubleToString(actual_sl_distance, 2), ")");
-   Print("Take profit: $", DoubleToString(take_profit, 2), " (distance: $", DoubleToString(actual_tp_distance, 2), ")");
+   Print("Stop loss: $", DoubleToString(stop_loss, 2), " (distance: ", DoubleToString(actual_sl_points, 2), " points)");
+   Print("Take profit: $", DoubleToString(take_profit, 2), " (distance: ", DoubleToString(actual_tp_points, 2), " points)");
+   Print("Point value: $", DoubleToString(point_value, 2), " per point per lot");
    Print("Raw lot size: ", DoubleToString(raw_lot_size, 4));
    Print("Final lot size: ", DoubleToString(lot_size, 4));
-   Print("Actual dollar risk: $", DoubleToString(lot_size * actual_sl_distance, 2));
-   Print("Actual dollar profit target: $", DoubleToString(lot_size * actual_tp_distance, 2));
+   Print("Actual dollar risk: $", DoubleToString(lot_size * actual_sl_points * point_value, 2));
+   Print("Actual dollar profit target: $", DoubleToString(lot_size * actual_tp_points * point_value, 2));
    Print("==========================================");
    
    // Enhanced filling mode detection with extensive debugging
@@ -980,32 +1146,20 @@ void ManagePosition()
    
    if(current_direction == LONG_TRADE)
    {
-      // Exit long position if price crosses below Lips (Green line)
+      // WILLIAMS ALLIGATOR EXIT: Price candle closes below Lips (Green line) - momentum weakening
       if(price_current < lips_current && price_previous >= lips_previous)
       {
          should_exit = true;
-         exit_reason = "Price crossed below Lips (Green line)";
-      }
-      // Also exit if line order changes (no longer Green > Red > Blue)
-      else if(!(lips_current > teeth_current && teeth_current > jaw_current))
-      {
-         should_exit = true;
-         exit_reason = "Alligator line order changed - trend weakening";
+         exit_reason = "WILLIAMS ALLIGATOR EXIT: Price closed below Lips - bullish momentum weakening";
       }
    }
    else if(current_direction == SHORT_TRADE)
    {
-      // Exit short position if price crosses above Lips (Green line)  
+      // WILLIAMS ALLIGATOR EXIT: Price candle closes above Lips (Green line) - momentum weakening
       if(price_current > lips_current && price_previous <= lips_previous)
       {
          should_exit = true;
-         exit_reason = "Price crossed above Lips (Green line)";
-      }
-      // Also exit if line order changes (no longer Blue > Red > Green)
-      else if(!(jaw_current > teeth_current && teeth_current > lips_current))
-      {
-         should_exit = true;
-         exit_reason = "Alligator line order changed - trend weakening";
+         exit_reason = "WILLIAMS ALLIGATOR EXIT: Price closed above Lips - bearish momentum weakening";
       }
    }
    
@@ -1134,6 +1288,28 @@ double CalculateRiskAmount()
 }
 
 //+------------------------------------------------------------------+
+//| Calculate point value for BTCUSD                                 |
+//+------------------------------------------------------------------+
+double CalculatePointValue()
+{
+   // For BTCUSD: 1 lot = 1 BTC, 1 point = $1.00
+   // This is the standard for most crypto brokers
+   double point_value = 1.0; // $1 per point per lot
+   
+   if(DEBUG_LEVEL >= 2)
+   {
+      Print("=== BTCUSD POINT VALUE CALCULATION ===");
+      Print("Symbol: ", _Symbol);
+      Print("Point value: $", DoubleToString(point_value, 2), " per point per lot");
+      Print("Contract size: ", SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE));
+      Print("Point size: ", DoubleToString(_Point, _Digits));
+      Print("=====================================");
+   }
+   
+   return point_value;
+}
+
+//+------------------------------------------------------------------+
 //| Normalize lot size to broker requirements                        |
 //+------------------------------------------------------------------+
 double NormalizeLotSize(double lot_size)
@@ -1207,14 +1383,21 @@ void ShowInfo()
       status = "Looking for entry signals";
    }
    
-   // Check line alignment for trend indication
+   // Check line alignment for WILLIAMS ALLIGATOR trend indication
    string trend_status = "";
-   if(lips_current > teeth_current && teeth_current > jaw_current)
-      trend_status = "BULLISH (Green>Red>Blue)";
-   else if(jaw_current > teeth_current && teeth_current > lips_current)
-      trend_status = "BEARISH (Blue>Red>Green)";
+   bool bullish_stack = (lips_current > teeth_current && teeth_current > jaw_current);
+   bool bearish_stack = (jaw_current > teeth_current && teeth_current > lips_current);
+   
+   if(bullish_stack)
+      trend_status = "BULLISH TREND (Green>Red>Blue) - Alligator mouth open up";
+   else if(bearish_stack)
+      trend_status = "BEARISH TREND (Blue>Red>Green) - Alligator mouth open down";
+   else if(lips_current > teeth_current)
+      trend_status = "POTENTIAL BULLISH (Green>Red, waiting for full stack)";
+   else if(lips_current < teeth_current)
+      trend_status = "POTENTIAL BEARISH (Red>Green, waiting for full stack)";
    else
-      trend_status = "SIDEWAYS (Mixed alignment)";
+      trend_status = "SIDEWAYS/SLEEPING ALLIGATOR (Mixed lines)";
    
    string info = StringFormat(
       "BTCUSD Alligator Scalper | Trades Today: %d/%d\n" +
@@ -1300,14 +1483,14 @@ double OnTester()
 
    // Heavily penalize high drawdowns (>50%)
    double drawdown_multiplier = 1.0;
-   if (max_drawdown_pct > 50)
+   if (max_drawdown_pct > 80)
       drawdown_multiplier = 0.1; // Severe penalty but not complete rejection
 
    // Profit is the dominant factor - use a much higher power to emphasize it
    double profit_weight = 4.0; // Extremely high weight for profit
 
    // Drawdown is minor factor - use very small penalty
-   double drawdown_penalty = 1; // Minimal impact from drawdown
+   double drawdown_penalty = 3; // Minimal impact from drawdown
 
    // Core formula: Massively prioritize profit, with minimal drawdown impact
    // Profit^4 makes profit extremely dominant
@@ -1318,7 +1501,7 @@ double OnTester()
       custom_criterion *= profit_factor;
 
    // For scalping strategies, adjust minimum trades for statistical significance
-   double min_trades_target = 500; // Higher minimum for scalping due to more frequent trades
+   double min_trades_target = 10; // Higher minimum for scalping due to more frequent trades
 
    // Trade count multiplier - reaches 1.0 at min_trades_target
    double trade_multiplier = MathMin(1.0, trades / min_trades_target);
