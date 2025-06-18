@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|                        BTCUSD Alligator Scalper                   |
-//|         Original Williams Alligator Strategy (M1 Adapted)         |
+//|                   BTCUSD Alligator Early Entry Scalper            |
+//|              Early Entry Strategy - Alligator Awakening           |
 //|               Copyright 2025 - free to use / modify               |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025"
-#property version "1.00"
+#property version "2.00"
 #property strict
 
 //---------------  USER INPUTS  ---------------------------//
@@ -23,15 +23,17 @@ input int LIPS_SHIFT = 3;                              // Lips shift
 input ENUM_MA_METHOD MA_METHOD = MODE_SMMA;            // Moving average method
 input ENUM_APPLIED_PRICE APPLIED_PRICE = PRICE_MEDIAN; // Applied price
 
-// Trade Timing and Thresholds
-input int SIGNAL_COOLDOWN_SECONDS = 180;         // Cooldown between signals (seconds) - prevents rapid fire & whipsaw
-input int CONFIRMATION_WINDOW_SECONDS = 120;     // Time window for lines to confirm after price crosses Jaw (seconds)
+// Early Entry Strategy Parameters
+input int SLEEPING_WINDOW_SECONDS = 300;               // Time window required for alligator to be sleeping (5 minutes)
+input double ALLIGATOR_CLOSED_LINES_ATR_PERCENTAGE = 10.0; // How close lines must be for "sleeping" (10% of ATR)
+input double ATR_PRICE_THRESHOLD_PERCENT = 200.0;      // Price movement required to trigger entry (200% = 2.0 * ATR)
+input int CONFIRMATION_WINDOW_SECONDS = 120;           // Time to achieve line separation or exit trade
+input double LINE_SEPARATE_ATR_PERCENTAGE = 50.0;     // Required line separation % to stay in trade (50% of ATR)
 
-// ATR-Based Dynamic Thresholds
+// Risk Management
 input int ATR_PERIOD = 14;                        // ATR period for all calculations
-input double ATR_PRICE_THRESHOLD_PERCENT = 100.0; // Price threshold as % of ATR (100% = 1.0 * ATR)
-input double LINE_SEPARATE_ATR_PERCENTAGE = 1.0;   // Line separation as % of ATR (1% = 0.01 * ATR)
 input double ATR_STOP_LOSS_MULTIPLIER = 1.0;      // ATR multiplier for stop loss distance
+input int SIGNAL_COOLDOWN_SECONDS = 180;         // Cooldown between signals (seconds)
 
 // Visual Settings
 input bool SHOW_INFO = true; // Show information panel
@@ -55,20 +57,15 @@ double lips_current, lips_previous;   // Green line (fastest)
 // Price tracking for crossover detection
 double price_current, price_previous;
 
-// Trend tracking variables
-datetime bullish_trend_start = 0; // When bullish alignment started
-datetime bearish_trend_start = 0; // When bearish alignment started
-datetime last_signal_time = 0;    // Last signal time for cooldown
-bool previous_bullish_alignment = false;
-bool previous_bearish_alignment = false;
+// Early Entry Strategy Variables
+datetime alligator_sleep_start = 0;    // When alligator started sleeping
+datetime last_signal_time = 0;         // Last signal time for cooldown
+bool alligator_is_sleeping = false;    // Current sleeping state
+datetime entry_time = 0;               // When we entered a trade
+bool monitoring_separation = false;    // Are we monitoring line separation after entry?
 
-// Sequential confirmation tracking variables
-datetime price_crossed_jaw_up_time = 0;   // When price last crossed above Jaw
-datetime price_crossed_jaw_down_time = 0; // When price last crossed below Jaw
-bool waiting_for_lips_bullish = false;    // Step 1: Waiting for Lips to cross above Jaw
-bool waiting_for_teeth_bullish = false;   // Step 2: Waiting for Teeth to cross above Jaw
-bool waiting_for_lips_bearish = false;    // Step 1: Waiting for Lips to cross below Jaw
-bool waiting_for_teeth_bearish = false;   // Step 2: Waiting for Teeth to cross below Jaw
+// Visual elements for backtesting
+int visual_counter = 0;                // Counter for unique object names
 
 // Trade state tracking
 enum TradeDirection
@@ -159,33 +156,30 @@ int OnInit()
    lips_previous = 0;
    price_previous = 0;
    
-   // Reset sequential confirmation state
-   waiting_for_lips_bullish = false;
-   waiting_for_teeth_bullish = false;
-   waiting_for_lips_bearish = false;
-   waiting_for_teeth_bearish = false;
-   price_crossed_jaw_up_time = 0;
-   price_crossed_jaw_down_time = 0;
-   
-   // Reset trend tracking
-   bullish_trend_start = 0;
-   bearish_trend_start = 0;
+   // Reset early entry strategy state
+   alligator_sleep_start = 0;
+   alligator_is_sleeping = false;
+   entry_time = 0;
+   monitoring_separation = false;
    last_signal_time = 0;
-   previous_bullish_alignment = false;
-   previous_bearish_alignment = false;
 
    // Reset daily trade counter if new day
    ResetDailyCounter();
 
    if (DEBUG_LEVEL >= 1)
    {
-      Print("=== BTCUSD Alligator EA Initialized ===");
+      Print("=== BTCUSD Alligator Early Entry EA Initialized ===");
       Print("Timeframe: ", PeriodToString((ENUM_TIMEFRAMES)_Period));
+      Print("Strategy: Early Entry - Alligator Awakening");
+      Print("Sleeping window: ", SLEEPING_WINDOW_SECONDS, " seconds");
+      Print("Lines close threshold: ", ALLIGATOR_CLOSED_LINES_ATR_PERCENTAGE, "% of ATR");
+      Print("Price breakout threshold: ", ATR_PRICE_THRESHOLD_PERCENT, "% of ATR");
+      Print("Separation confirmation: ", LINE_SEPARATE_ATR_PERCENTAGE, "% of ATR");
       Print("Max trades per day: ", MAX_TRADES_PER_DAY);
       Print("Risk Management: ", RISK_PER_TRADE_PCT, "% of account per trade");
       Print("Risk:Reward Ratio = 1:", TAKE_PROFIT_MULT);
       Print("Stop Loss: ATR(", ATR_PERIOD, ") × ", ATR_STOP_LOSS_MULTIPLIER, " (volatility-adaptive)");
-      Print("==========================================");
+      Print("=====================================================");
    }
 
    return (INIT_SUCCEEDED);
@@ -208,6 +202,9 @@ void OnDeinit(const int reason)
       IndicatorRelease(atr_handle);
       atr_handle = INVALID_HANDLE;
    }
+
+   // Clean up visual objects
+   CleanupVisualObjects();
 
    Comment("");
 }
@@ -255,8 +252,8 @@ void OnTick()
    // Update price values
    UpdatePriceValues();
 
-   // Update trend duration tracking
-   UpdateTrendDuration();
+   // Monitor alligator sleeping state for early entry strategy
+   MonitorAlligatorSleepState();
 
    // Debug current values (throttled)
    if (DEBUG_LEVEL >= 2)
@@ -294,49 +291,79 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Update trend duration tracking                                   |
+//| Monitor Alligator sleeping state for early entry strategy        |
 //+------------------------------------------------------------------+
-void UpdateTrendDuration()
+void MonitorAlligatorSleepState()
 {
-   // Check current line alignment
-   bool bullish_alignment = (lips_current > teeth_current && teeth_current > jaw_current);
-   bool bearish_alignment = (jaw_current > teeth_current && teeth_current > lips_current);
-
-   // Track bullish trend duration
-   if (bullish_alignment && !previous_bullish_alignment)
+   // Get current ATR value for threshold calculations
+   double atr_buffer[];
+   if (CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) <= 0)
    {
-      // Bullish trend just started
-      bullish_trend_start = TimeCurrent();
-      if (DEBUG_LEVEL >= 2)
-         Print("BULLISH TREND STARTED at ", TimeToString(bullish_trend_start));
+      if (DEBUG_LEVEL >= 1)
+         Print("Failed to get ATR value for sleep monitoring");
+      return;
    }
-   else if (!bullish_alignment && previous_bullish_alignment)
+   double current_atr = atr_buffer[0];
+   
+   // Calculate line separation thresholds
+   double sleep_threshold = current_atr * (ALLIGATOR_CLOSED_LINES_ATR_PERCENTAGE / 100.0);
+   
+   // Check if lines are close together (alligator sleeping)
+   double lips_teeth_gap = MathAbs(lips_current - teeth_current);
+   double teeth_jaw_gap = MathAbs(teeth_current - jaw_current);
+   double lips_jaw_gap = MathAbs(lips_current - jaw_current);
+   
+   bool lines_are_close = (lips_teeth_gap <= sleep_threshold && 
+                          teeth_jaw_gap <= sleep_threshold && 
+                          lips_jaw_gap <= sleep_threshold);
+   
+   datetime current_time = TimeCurrent();
+   
+   // Update sleeping state
+   if (lines_are_close && !alligator_is_sleeping)
    {
-      // Bullish trend ended
+      // Alligator just started sleeping
+      alligator_sleep_start = current_time;
+      alligator_is_sleeping = true;
+      
       if (DEBUG_LEVEL >= 2)
-         Print("BULLISH TREND ENDED at ", TimeToString(TimeCurrent()));
-      bullish_trend_start = 0;
+         Print("😴 ALLIGATOR SLEEPING: Lines close together (threshold: ", DoubleToString(sleep_threshold, _Digits), ")");
    }
-
-   // Track bearish trend duration
-   if (bearish_alignment && !previous_bearish_alignment)
+   else if (!lines_are_close && alligator_is_sleeping)
    {
-      // Bearish trend just started
-      bearish_trend_start = TimeCurrent();
+      // Alligator woke up
+      alligator_is_sleeping = false;
+      
       if (DEBUG_LEVEL >= 2)
-         Print("BEARISH TREND STARTED at ", TimeToString(bearish_trend_start));
+         Print("👁️ ALLIGATOR AWAKENING: Lines separating");
+      
+      // Reset sleep timer since alligator woke up
+      alligator_sleep_start = 0;
    }
-   else if (!bearish_alignment && previous_bearish_alignment)
+   
+   // Debug sleeping status (throttled)
+   if (DEBUG_LEVEL >= 3)
    {
-      // Bearish trend ended
-      if (DEBUG_LEVEL >= 2)
-         Print("BEARISH TREND ENDED at ", TimeToString(TimeCurrent()));
-      bearish_trend_start = 0;
+      static datetime last_sleep_debug = 0;
+      if (current_time - last_sleep_debug > 30) // Every 30 seconds
+      {
+         Print("=== SLEEP STATUS DEBUG ===");
+         Print("Lines Close: ", lines_are_close ? "YES" : "NO");
+         Print("Sleeping: ", alligator_is_sleeping ? "YES" : "NO");
+         Print("Sleep threshold: ", DoubleToString(sleep_threshold, _Digits));
+         Print("Lips-Teeth gap: ", DoubleToString(lips_teeth_gap, _Digits));
+         Print("Teeth-Jaw gap: ", DoubleToString(teeth_jaw_gap, _Digits));
+         Print("Lips-Jaw gap: ", DoubleToString(lips_jaw_gap, _Digits));
+         
+         if (alligator_is_sleeping && alligator_sleep_start > 0)
+         {
+            int sleep_duration = (int)(current_time - alligator_sleep_start);
+            Print("Sleep duration: ", sleep_duration, " seconds (need ", SLEEPING_WINDOW_SECONDS, ")");
+         }
+         
+         last_sleep_debug = current_time;
+      }
    }
-
-   // Update previous states
-   previous_bullish_alignment = bullish_alignment;
-   previous_bearish_alignment = bearish_alignment;
 }
 
 //+------------------------------------------------------------------+
@@ -344,7 +371,7 @@ void UpdateTrendDuration()
 //+------------------------------------------------------------------+
 void PrintAlligatorStatus()
 {
-   Print("=== ALLIGATOR STATUS ===");
+   Print("=== EARLY ENTRY ALLIGATOR STATUS ===");
    Print("Price: Current=", DoubleToString(price_current, _Digits),
          ", Previous=", DoubleToString(price_previous, _Digits));
    Print("Jaw (Blue): Current=", DoubleToString(jaw_current, _Digits),
@@ -354,27 +381,31 @@ void PrintAlligatorStatus()
    Print("Lips (Green): Current=", DoubleToString(lips_current, _Digits),
          ", Previous=", DoubleToString(lips_previous, _Digits));
 
-   // Check line alignment
-   string alignment = "";
-   if (lips_current > teeth_current && teeth_current > jaw_current)
-      alignment = "BULLISH (Green>Red>Blue)";
-   else if (jaw_current > teeth_current && teeth_current > lips_current)
-      alignment = "BEARISH (Blue>Red>Green)";
-   else
-      alignment = "SIDEWAYS (Mixed)";
-   Print("Line Alignment: ", alignment);
-
-   // Show trend durations
-   if (bullish_trend_start > 0)
+   // Show alligator state
+   string state = "";
+   if (alligator_is_sleeping)
    {
-      int bullish_duration = (int)(TimeCurrent() - bullish_trend_start);
-      Print("Bullish trend duration: ", bullish_duration, " seconds");
+      int sleep_duration = (int)(TimeCurrent() - alligator_sleep_start);
+      state = "SLEEPING (" + IntegerToString(sleep_duration) + " seconds)";
    }
-
-   if (bearish_trend_start > 0)
+   else
    {
-      int bearish_duration = (int)(TimeCurrent() - bearish_trend_start);
-      Print("Bearish trend duration: ", bearish_duration, " seconds");
+      // Check line alignment for trend direction
+      if (lips_current > teeth_current && teeth_current > jaw_current)
+         state = "AWAKE - BULLISH (Green>Red>Blue)";
+      else if (jaw_current > teeth_current && teeth_current > lips_current)
+         state = "AWAKE - BEARISH (Blue>Red>Green)";
+      else
+         state = "AWAKE - MIXED SIGNALS";
+   }
+   Print("Alligator State: ", state);
+   
+   // Show position status if in trade
+   if (current_ticket != 0 && monitoring_separation)
+   {
+      int time_in_trade = (int)(TimeCurrent() - entry_time);
+      int time_remaining = CONFIRMATION_WINDOW_SECONDS - time_in_trade;
+      Print("Position Status: Monitoring separation (", time_remaining, " seconds remaining)");
    }
 }
 
@@ -429,7 +460,7 @@ void UpdatePriceValues()
 }
 
 //+------------------------------------------------------------------+
-//| Check for entry signals based on Alligator strategy             |
+//| Check for early entry signals - Alligator Awakening Strategy    |
 //+------------------------------------------------------------------+
 void CheckEntrySignals()
 {
@@ -447,367 +478,175 @@ void CheckEntrySignals()
       return;
    }
 
-   // Get current ATR value for dynamic thresholds
+   // Get current ATR value for threshold calculations
    double atr_buffer[];
    if (CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) <= 0)
    {
       if (DEBUG_LEVEL >= 1)
-         Print("Failed to get ATR value for threshold calculation");
+         Print("Failed to get ATR value for early entry signals");
       return;
    }
    double current_atr = atr_buffer[0];
    
    // Calculate dynamic thresholds based on ATR
-   double price_threshold = current_atr * (ATR_PRICE_THRESHOLD_PERCENT / 100.0);
-   double line_separation_threshold = current_atr * (LINE_SEPARATE_ATR_PERCENTAGE / 100.0);
+   double price_breakout_threshold = current_atr * (ATR_PRICE_THRESHOLD_PERCENT / 100.0);
    
+   datetime current_time = TimeCurrent();
+   
+   // EARLY ENTRY CONDITION 1: Alligator must have been sleeping long enough
+   bool alligator_slept_enough = alligator_is_sleeping && 
+                                alligator_sleep_start > 0 && 
+                                (current_time - alligator_sleep_start >= SLEEPING_WINDOW_SECONDS);
+   
+   if (!alligator_slept_enough)
+   {
+      if (DEBUG_LEVEL >= 3)
+      {
+         static datetime last_sleep_log = 0;
+         if (current_time - last_sleep_log > 30)
+         {
+            if (!alligator_is_sleeping)
+               Print("EARLY ENTRY: Alligator not sleeping - waiting for consolidation");
+            else if (alligator_sleep_start > 0)
+            {
+               int sleep_duration = (int)(current_time - alligator_sleep_start);
+               Print("EARLY ENTRY: Alligator sleeping for ", sleep_duration, " seconds (need ", SLEEPING_WINDOW_SECONDS, ")");
+            }
+            last_sleep_log = current_time;
+         }
+      }
+      return;
+   }
+   
+   // Debug early entry analysis
    if (DEBUG_LEVEL >= 2)
    {
-      static datetime last_threshold_log = 0;
-      if (TimeCurrent() - last_threshold_log > 30) // Log every 30 seconds
+      static datetime last_entry_debug = 0;
+      if (current_time - last_entry_debug > 5) // Every 5 seconds
       {
-         Print("Dynamic Thresholds: ATR=", DoubleToString(current_atr, _Digits),
-               ", Price Threshold=", DoubleToString(price_threshold, _Digits),
-               ", Line Separation=", DoubleToString(line_separation_threshold, _Digits));
-         last_threshold_log = TimeCurrent();
+         Print("=== EARLY ENTRY ANALYSIS ===");
+         Print("Alligator slept enough: YES (", (int)(current_time - alligator_sleep_start), " seconds)");
+         Print("Price breakout threshold: ", DoubleToString(price_breakout_threshold, _Digits));
+         Print("Current ATR: ", DoubleToString(current_atr, _Digits));
+         
+         // Show current line positions
+         Print("Lines: Jaw=", DoubleToString(jaw_current, _Digits), 
+               ", Teeth=", DoubleToString(teeth_current, _Digits),
+               ", Lips=", DoubleToString(lips_current, _Digits));
+         Print("Price: Current=", DoubleToString(price_current, _Digits),
+               ", Previous=", DoubleToString(price_previous, _Digits));
+         
+         last_entry_debug = current_time;
       }
    }
 
-   // Check individual conditions with dynamic ATR-based thresholds
-   bool price_crossed_above_jaw = (price_current > jaw_current && price_previous <= jaw_previous) &&
-                                  (price_current - jaw_current >= price_threshold);
-
-   bool price_crossed_below_jaw = (price_current < jaw_current && price_previous >= jaw_previous) &&
-                                  (jaw_current - price_current >= price_threshold);
-
-   bool lips_crossed_above_teeth = (lips_current > teeth_current && lips_previous <= teeth_previous) &&
-                                   (lips_current - teeth_current >= line_separation_threshold);
-
-   bool lips_crossed_below_teeth = (lips_current < teeth_current && lips_previous >= teeth_previous) &&
-                                   (teeth_current - lips_current >= line_separation_threshold);
-
-   // Add crossover detection for Lips vs Jaw (any crossover - no threshold)
-   bool lips_crossed_above_jaw = (lips_current > jaw_current && lips_previous <= jaw_previous);
-
-   bool lips_crossed_below_jaw = (lips_current < jaw_current && lips_previous >= jaw_previous);
-
-   // Add crossover detection for Teeth vs Jaw (any crossover - no threshold)
-   bool teeth_crossed_above_jaw = (teeth_current > jaw_current && teeth_previous <= jaw_previous);
-
-   bool teeth_crossed_below_jaw = (teeth_current < jaw_current && teeth_previous >= jaw_previous);
-
-   // Check line alignment for trend confirmation
-   bool bullish_alignment = (lips_current > teeth_current && teeth_current > jaw_current);
-   bool bearish_alignment = (jaw_current > teeth_current && teeth_current > lips_current);
-
-   // Debug signal analysis (more frequent for troubleshooting)
-   if (DEBUG_LEVEL >= 1)
-   {
-      static datetime last_signal_debug = 0;
-      if (TimeCurrent() - last_signal_debug > 2) // Every 2 seconds for troubleshooting
-      {
-         Print("=== SIGNAL ANALYSIS ===");
-         Print("Price vs Jaw: Above=", price_crossed_above_jaw ? "YES" : "No",
-               ", Below=", price_crossed_below_jaw ? "YES" : "No");
-         Print("Lips vs Teeth: Above=", lips_crossed_above_teeth ? "YES" : "No",
-               ", Below=", lips_crossed_below_teeth ? "YES" : "No");
-         Print("Alignment: Bullish=", bullish_alignment ? "YES" : "No",
-               ", Bearish=", bearish_alignment ? "YES" : "No");
-
-         // Detailed crossover analysis for debugging
-         Print("=== DETAILED CROSSOVER DEBUG ===");
-         Print("Price: Current=", DoubleToString(price_current, _Digits), ", Previous=", DoubleToString(price_previous, _Digits));
-         Print("Jaw: Current=", DoubleToString(jaw_current, _Digits), ", Previous=", DoubleToString(jaw_previous, _Digits));
-         Print("Teeth: Current=", DoubleToString(teeth_current, _Digits), ", Previous=", DoubleToString(teeth_previous, _Digits));
-         Print("Lips: Current=", DoubleToString(lips_current, _Digits), ", Previous=", DoubleToString(lips_previous, _Digits));
-
-         // Check raw crossover conditions (without thresholds)
-         bool raw_price_cross_up = (price_current > jaw_current && price_previous <= jaw_previous);
-         bool raw_price_cross_down = (price_current < jaw_current && price_previous >= jaw_previous);
-         bool raw_lips_cross_up = (lips_current > teeth_current && lips_previous <= teeth_previous);
-         bool raw_lips_cross_down = (lips_current < teeth_current && lips_previous >= teeth_previous);
-
-         Print("Raw Crossovers (no thresholds): Price Up=", raw_price_cross_up ? "YES" : "No",
-               ", Price Down=", raw_price_cross_down ? "YES" : "No",
-               ", Lips Up=", raw_lips_cross_up ? "YES" : "No",
-               ", Lips Down=", raw_lips_cross_down ? "YES" : "No");
-
-         // Show actual threshold effectiveness for BTCUSD
-         Print("=== THRESHOLD EFFECTIVENESS ANALYSIS ===");
-         Print("Price threshold: ", DoubleToString(price_threshold, _Digits));
-         Print("Line threshold: ", DoubleToString(line_separation_threshold, _Digits));
-
-         if (raw_price_cross_up)
-         {
-            double actual_price_gap = price_current - jaw_current;
-            Print("BULLISH: Actual price gap = ", DoubleToString(actual_price_gap, _Digits),
-                  " vs required ", DoubleToString(price_threshold, _Digits));
-            if (actual_price_gap < price_threshold)
-               Print("  → Price crossover REJECTED due to threshold");
-            else
-               Print("  → Price crossover ACCEPTED");
-         }
-
-         if (raw_price_cross_down)
-         {
-            double actual_price_gap = jaw_current - price_current;
-            Print("BEARISH: Actual price gap = ", DoubleToString(actual_price_gap, _Digits),
-                  " vs required ", DoubleToString(price_threshold, _Digits));
-            if (actual_price_gap < price_threshold)
-               Print("  → Price crossover REJECTED due to threshold");
-            else
-               Print("  → Price crossover ACCEPTED");
-         }
-
-         // Show current thresholds and mode being used
-         Print("Dynamic Thresholds: Price=", DoubleToString(price_threshold, _Digits), ", Line=", DoubleToString(line_separation_threshold, _Digits));
-         Print("Mode: WILLIAMS ALLIGATOR (Sequential crossover: Price→Lips→Teeth) on ", PeriodToString((ENUM_TIMEFRAMES)_Period));
-
-         // Show current line positioning for Williams Alligator analysis
-         bool lips_above_teeth = lips_current > teeth_current;
-         bool teeth_vs_jaw = teeth_current > jaw_current;
-         bool lips_vs_jaw = lips_current > jaw_current;
-         Print("Line Positioning: Lips vs Teeth = ", lips_above_teeth ? "ABOVE" : "BELOW");
-         Print("Line Stack Check: Teeth vs Jaw = ", teeth_vs_jaw ? "ABOVE" : "BELOW",
-               ", Lips vs Jaw = ", lips_vs_jaw ? "ABOVE" : "BELOW");
-
-         // Show confirmation status
-         if (waiting_for_teeth_bullish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
-            Print("CONFIRMATION STATUS: Waiting for TEETH to cross above JAW (", time_remaining, " seconds remaining)");
-         }
-         else if (waiting_for_lips_bullish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
-            Print("CONFIRMATION STATUS: Waiting for LIPS above TEETH (", time_remaining, " seconds remaining)");
-         }
-         else if (waiting_for_teeth_bearish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
-            Print("CONFIRMATION STATUS: Waiting for TEETH to cross below JAW (", time_remaining, " seconds remaining)");
-         }
-         else if (waiting_for_lips_bearish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
-            Print("CONFIRMATION STATUS: Waiting for LIPS below TEETH (", time_remaining, " seconds remaining)");
-         }
-         else
-         {
-            Print("CONFIRMATION STATUS: Not waiting (no recent sequential confirmation started)");
-         }
-
-         last_signal_debug = TimeCurrent();
-      }
-   }
-
-   // WILLIAMS ALLIGATOR BUY: Sequential Crossover Confirmation
-   // Step 1: Price crosses above Jaw (trigger)
-   // Step 2: Lips crosses above Jaw (first confirmation)
-   // Step 3: Teeth crosses above Jaw (final confirmation & entry)
-
-   bool buy_signal = false;
-   string buy_reason = "";
-
-   // Step 1: Check for new price cross above Jaw (trigger)
-   if (price_crossed_above_jaw && !waiting_for_lips_bullish && !waiting_for_teeth_bullish)
-   {
-      price_crossed_jaw_up_time = TimeCurrent();
-      waiting_for_lips_bullish = true;
-      waiting_for_lips_bearish = false; // Cancel any bearish sequence
-      waiting_for_teeth_bearish = false;
-      if (DEBUG_LEVEL >= 1)
-         Print("🔔 STEP 1: Price crossed above Jaw - waiting for Lips to cross above Jaw");
-   }
-
-   // Step 2: Check for Lips crossing above Jaw (first confirmation)
-   // CRITICAL: Only accept lips crossovers that happen AFTER price crossed jaw
-   // Ensure at least 1 second has passed since price crossed jaw to prevent same-tick acceptance
-   bool lips_cross_after_price = waiting_for_lips_bullish &&
-                                 (TimeCurrent() - price_crossed_jaw_up_time >= 1);
-
-   if (lips_crossed_above_jaw && lips_cross_after_price)
-   {
-      waiting_for_lips_bullish = false;
-      waiting_for_teeth_bullish = true;
-      if (DEBUG_LEVEL >= 1)
-         Print("✅ STEP 2: Lips crossed above Jaw AFTER price cross - waiting for Teeth to cross above Jaw");
-   }
-
-      // Step 3: Check for final confirmation and entry
-   // Verify complete Williams Alligator alignment: Price > Lips > Teeth > Jaw with proper separation
-   bool price_above_lips = (price_current - lips_current) >= line_separation_threshold;
-   bool lips_above_teeth = (lips_current - teeth_current) >= line_separation_threshold;
-   bool teeth_above_jaw = (teeth_current - jaw_current) >= line_separation_threshold;
-   bool within_bullish_window = waiting_for_teeth_bullish && 
-                                (TimeCurrent() - price_crossed_jaw_up_time <= CONFIRMATION_WINDOW_SECONDS);
+   // EARLY ENTRY CONDITION 2: Check for bullish awakening breakout
+   // Price must cross above ALL three lines with significant momentum
+   bool price_above_all_lines = (price_current > jaw_current && 
+                                price_current > teeth_current && 
+                                price_current > lips_current);
    
-   buy_signal = within_bullish_window && teeth_crossed_above_jaw && price_above_lips && lips_above_teeth && teeth_above_jaw;
+   bool price_was_below_or_near_lines = (price_previous <= MathMax(MathMax(jaw_previous, teeth_previous), lips_previous));
+   
+   bool strong_bullish_breakout = price_above_all_lines && price_was_below_or_near_lines &&
+                                 (price_current - MathMax(MathMax(jaw_current, teeth_current), lips_current) >= price_breakout_threshold);
+   
+   // Check if lines are starting to separate bullishly (Lips > Teeth > Jaw trending)
+   bool lines_separating_bullish = (lips_current > teeth_current && teeth_current > jaw_current) &&
+                                  (lips_current > lips_previous && teeth_current > teeth_previous);
 
+   // EARLY ENTRY CONDITION 3: Check for bearish awakening breakout  
+   // Price must cross below ALL three lines with significant momentum
+   bool price_below_all_lines = (price_current < jaw_current && 
+                                price_current < teeth_current && 
+                                price_current < lips_current);
+   
+   bool price_was_above_or_near_lines = (price_previous >= MathMin(MathMin(jaw_previous, teeth_previous), lips_previous));
+   
+   bool strong_bearish_breakout = price_below_all_lines && price_was_above_or_near_lines &&
+                                 (MathMin(MathMin(jaw_current, teeth_current), lips_current) - price_current >= price_breakout_threshold);
+   
+   // Check if lines are starting to separate bearishly (Jaw > Teeth > Lips trending)
+   bool lines_separating_bearish = (jaw_current > teeth_current && teeth_current > lips_current) &&
+                                  (jaw_current > jaw_previous && teeth_current > teeth_previous);
+
+   // EXECUTE EARLY ENTRY TRADES
+   
+   bool buy_signal = strong_bullish_breakout && lines_separating_bullish;
+   bool sell_signal = strong_bearish_breakout && lines_separating_bearish;
+   
    if (buy_signal)
    {
-               buy_reason = "WILLIAMS ALLIGATOR: Full bullish alignment (Price>Lips>Teeth>Jaw with ATR-based separation: " + DoubleToString(line_separation_threshold, _Digits) + " + Sequential crossovers)";
-      waiting_for_teeth_bullish = false; // Reset confirmation flags
-   }
-
-   // Log potential signals that don't meet all criteria
-   bool potential_buy_condition = waiting_for_teeth_bullish || waiting_for_lips_bullish;
-
-   if (potential_buy_condition && DEBUG_LEVEL >= 1)
-   {
-      if (!buy_signal)
-      {
-         Print("POTENTIAL BUY SIGNAL - but failed WILLIAMS ALLIGATOR requirements:");
-         if (!within_bullish_window)
-            Print("  - Not within confirmation window (", CONFIRMATION_WINDOW_SECONDS, " sec after Jaw cross)");
-         if (waiting_for_teeth_bullish)
-         {
-            int time_since_price_cross = (int)(TimeCurrent() - price_crossed_jaw_up_time);
-            Print("  - Waiting for Teeth to cross above Jaw (", time_since_price_cross, " sec since price crossed)");
-            if (teeth_crossed_above_jaw && time_since_price_cross < 1)
-               Print("    → Teeth crossover detected but too soon (need 1+ sec after price cross)");
-         }
-         if (waiting_for_lips_bullish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
-            Print("  - Waiting for Lips to cross above Jaw (", time_remaining, " seconds remaining)");
-         }
-         if (waiting_for_teeth_bullish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_up_time);
-            Print("  - Waiting for Teeth to cross above Jaw (", time_remaining, " seconds remaining)");
-            if (!price_above_lips)
-                           Print("    → Price not ", DoubleToString(line_separation_threshold, _Digits), " above Lips (gap: ", DoubleToString(price_current - lips_current, _Digits), ")");
-         if (!lips_above_teeth)
-            Print("    → Lips not ", DoubleToString(line_separation_threshold, _Digits), " above Teeth (gap: ", DoubleToString(lips_current - teeth_current, _Digits), ")");
-         if (!teeth_above_jaw)
-            Print("    → Teeth not ", DoubleToString(line_separation_threshold, _Digits), " above Jaw (gap: ", DoubleToString(teeth_current - jaw_current, _Digits), ")");
-         }
-         Print("  - Mode: WILLIAMS ALLIGATOR (Sequential crossover: Price→Lips→Teeth)");
-      }
-   }
-
-   if (buy_signal)
-   {
+      string buy_reason = "EARLY ENTRY BULLISH AWAKENING: Price breakout above all lines (" + 
+                         DoubleToString(price_breakout_threshold, _Digits) + " threshold) + Lines separating bullishly after " +
+                         IntegerToString((int)(current_time - alligator_sleep_start)) + " seconds of sleep";
+      
       if (DEBUG_LEVEL >= 1)
-         Print("🔵 BUY SIGNAL DETECTED: ", buy_reason);
-
+         Print("🚀 EARLY BUY SIGNAL: ", buy_reason);
+      
+      // Draw visual indicators for backtesting
+      DrawBreakoutBox(alligator_sleep_start, current_time, true);
+      DrawBreakoutArrow(current_time, price_current, true);
+      DrawThresholdLines(current_time, price_breakout_threshold, true);
+      
       ExecuteBuyOrder();
-      last_signal_time = TimeCurrent();
+      last_signal_time = current_time;
+      entry_time = current_time;
+      monitoring_separation = true;
       return;
    }
-
-   // WILLIAMS ALLIGATOR SELL: Sequential Crossover Confirmation
-   // Step 1: Price crosses below Jaw (trigger)
-   // Step 2: Lips crosses below Jaw (first confirmation)
-   // Step 3: Teeth crosses below Jaw (final confirmation & entry)
-
-   bool sell_signal = false;
-   string sell_reason = "";
-
-   // Step 1: Check for new price cross below Jaw (trigger)
-   if (price_crossed_below_jaw && !waiting_for_lips_bearish && !waiting_for_teeth_bearish)
-   {
-      price_crossed_jaw_down_time = TimeCurrent();
-      waiting_for_lips_bearish = true;
-      waiting_for_lips_bullish = false; // Cancel any bullish sequence
-      waiting_for_teeth_bullish = false;
-      if (DEBUG_LEVEL >= 1)
-         Print("🔔 STEP 1: Price crossed below Jaw - waiting for Lips to cross below Jaw");
-   }
-
-   // Step 2: Check for Lips crossing below Jaw (first confirmation)
-   // CRITICAL: Only accept lips crossovers that happen AFTER price crossed jaw
-   // Ensure at least 1 second has passed since price crossed jaw to prevent same-tick acceptance
-   bool lips_cross_after_price_bearish = waiting_for_lips_bearish &&
-                                         (TimeCurrent() - price_crossed_jaw_down_time >= 1);
-
-   if (lips_crossed_below_jaw && lips_cross_after_price_bearish)
-   {
-      waiting_for_lips_bearish = false;
-      waiting_for_teeth_bearish = true;
-      if (DEBUG_LEVEL >= 1)
-         Print("✅ STEP 2: Lips crossed below Jaw AFTER price cross - waiting for Teeth to cross below Jaw");
-   }
-
-      // Step 3: Check for final confirmation and entry
-   // Verify complete Williams Alligator alignment: Jaw > Teeth > Lips > Price with proper separation
-   bool price_below_lips = (lips_current - price_current) >= line_separation_threshold;
-   bool lips_below_teeth = (teeth_current - lips_current) >= line_separation_threshold;
-   bool teeth_below_jaw = (jaw_current - teeth_current) >= line_separation_threshold;
-   bool within_bearish_window = waiting_for_teeth_bearish && 
-                                (TimeCurrent() - price_crossed_jaw_down_time <= CONFIRMATION_WINDOW_SECONDS);
    
-   sell_signal = within_bearish_window && teeth_crossed_below_jaw && price_below_lips && lips_below_teeth && teeth_below_jaw;
-
    if (sell_signal)
    {
-               sell_reason = "WILLIAMS ALLIGATOR: Full bearish alignment (Jaw>Teeth>Lips>Price with ATR-based separation: " + DoubleToString(line_separation_threshold, _Digits) + " + Sequential crossovers)";
-      waiting_for_teeth_bearish = false; // Reset confirmation flags
-   }
-
-   // Log potential signals that don't meet all criteria
-   bool potential_sell_condition = waiting_for_teeth_bearish || waiting_for_lips_bearish;
-
-   if (potential_sell_condition && DEBUG_LEVEL >= 1)
-   {
-      if (!sell_signal)
-      {
-         Print("POTENTIAL SELL SIGNAL - but failed WILLIAMS ALLIGATOR requirements:");
-         if (!within_bearish_window)
-            Print("  - Not within confirmation window (", CONFIRMATION_WINDOW_SECONDS, " sec after Jaw cross)");
-         if (waiting_for_teeth_bearish)
-         {
-            int time_since_price_cross = (int)(TimeCurrent() - price_crossed_jaw_down_time);
-            Print("  - Waiting for Teeth to cross below Jaw (", time_since_price_cross, " sec since price crossed)");
-            if (teeth_crossed_below_jaw && time_since_price_cross < 1)
-               Print("    → Teeth crossover detected but too soon (need 1+ sec after price cross)");
-         }
-         if (waiting_for_lips_bearish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
-            Print("  - Waiting for Lips to cross below Jaw (", time_remaining, " seconds remaining)");
-         }
-         if (waiting_for_teeth_bearish)
-         {
-            int time_remaining = CONFIRMATION_WINDOW_SECONDS - (int)(TimeCurrent() - price_crossed_jaw_down_time);
-            Print("  - Waiting for Teeth to cross below Jaw (", time_remaining, " seconds remaining)");
-            if (!price_below_lips)
-                           Print("    → Price not ", DoubleToString(line_separation_threshold, _Digits), " below Lips (gap: ", DoubleToString(lips_current - price_current, _Digits), ")");
-         if (!lips_below_teeth)
-            Print("    → Lips not ", DoubleToString(line_separation_threshold, _Digits), " below Teeth (gap: ", DoubleToString(teeth_current - lips_current, _Digits), ")");
-         if (!teeth_below_jaw)
-            Print("    → Teeth not ", DoubleToString(line_separation_threshold, _Digits), " below Jaw (gap: ", DoubleToString(jaw_current - teeth_current, _Digits), ")");
-         }
-         Print("  - Mode: WILLIAMS ALLIGATOR (Sequential crossover: Price→Lips→Teeth)");
-      }
-   }
-
-   if (sell_signal)
-   {
+      string sell_reason = "EARLY ENTRY BEARISH AWAKENING: Price breakout below all lines (" + 
+                          DoubleToString(price_breakout_threshold, _Digits) + " threshold) + Lines separating bearishly after " +
+                          IntegerToString((int)(current_time - alligator_sleep_start)) + " seconds of sleep";
+      
       if (DEBUG_LEVEL >= 1)
-         Print("🔴 SELL SIGNAL DETECTED: ", sell_reason);
-
+         Print("🚀 EARLY SELL SIGNAL: ", sell_reason);
+      
+      // Draw visual indicators for backtesting
+      DrawBreakoutBox(alligator_sleep_start, current_time, false);
+      DrawBreakoutArrow(current_time, price_current, false);
+      DrawThresholdLines(current_time, price_breakout_threshold, false);
+      
       ExecuteSellOrder();
-      last_signal_time = TimeCurrent();
+      last_signal_time = current_time;
+      entry_time = current_time;
+      monitoring_separation = true;
       return;
    }
-
-   // Reset confirmation flags if windows expire
-   if ((waiting_for_teeth_bullish || waiting_for_lips_bullish) && (TimeCurrent() - price_crossed_jaw_up_time > CONFIRMATION_WINDOW_SECONDS))
+   
+   // Debug why signals didn't trigger (if conditions are close)
+   if ((strong_bullish_breakout || strong_bearish_breakout) && DEBUG_LEVEL >= 1)
    {
-      waiting_for_teeth_bullish = false;
-      waiting_for_lips_bullish = false;
-      if (DEBUG_LEVEL >= 1)
-         Print("⏰ TIMEOUT: Bullish sequential confirmation window expired");
-   }
-
-   if ((waiting_for_teeth_bearish || waiting_for_lips_bearish) && (TimeCurrent() - price_crossed_jaw_down_time > CONFIRMATION_WINDOW_SECONDS))
-   {
-      waiting_for_teeth_bearish = false;
-      waiting_for_lips_bearish = false;
-      if (DEBUG_LEVEL >= 1)
-         Print("⏰ TIMEOUT: Bearish sequential confirmation window expired");
+      Print("=== EARLY ENTRY SIGNAL DEBUG ===");
+      
+      if (strong_bullish_breakout)
+      {
+         Print("Strong bullish breakout: YES");
+         Print("Lines separating bullish: ", lines_separating_bullish ? "YES" : "NO");
+         if (!lines_separating_bullish)
+         {
+            Print("  Lips>Teeth: ", (lips_current > teeth_current) ? "YES" : "NO");
+            Print("  Teeth>Jaw: ", (teeth_current > jaw_current) ? "YES" : "NO");
+            Print("  Lips rising: ", (lips_current > lips_previous) ? "YES" : "NO");
+            Print("  Teeth rising: ", (teeth_current > teeth_previous) ? "YES" : "NO");
+         }
+      }
+      
+      if (strong_bearish_breakout)
+      {
+         Print("Strong bearish breakout: YES");
+         Print("Lines separating bearish: ", lines_separating_bearish ? "YES" : "NO");
+         if (!lines_separating_bearish)
+         {
+            Print("  Jaw>Teeth: ", (jaw_current > teeth_current) ? "YES" : "NO");
+            Print("  Teeth>Lips: ", (teeth_current > lips_current) ? "YES" : "NO");
+            Print("  Jaw rising: ", (jaw_current > jaw_previous) ? "YES" : "NO");
+            Print("  Teeth falling: ", (teeth_current < teeth_previous) ? "YES" : "NO");
+         }
+      }
    }
 }
 
@@ -863,12 +702,14 @@ void ExecuteBuyOrder()
 
       // Recalculate risk with reduced position
       risk_amount = position_size_btc * stop_loss_distance * point_value;
-      profit_target = risk_amount * TAKE_PROFIT_MULT;
+      // FIX: Take profit should always be based on stop loss distance, not risk amount
+      profit_target = stop_loss_distance * TAKE_PROFIT_MULT;
 
       Print("⚠️ POSITION SIZE REDUCED FOR SAFETY:");
       Print("  Original position would be ", DoubleToString(position_as_percent_of_account, 1), "% of account");
       Print("  Reduced to 50% of account for safety");
       Print("  New risk amount: $", DoubleToString(risk_amount, 2));
+      Print("  Take profit maintained at: $", DoubleToString(profit_target, 2), " (", TAKE_PROFIT_MULT, "x SL distance)");
    }
 
    // Calculate actual prices
@@ -1051,12 +892,14 @@ void ExecuteSellOrder()
 
       // Recalculate risk with reduced position
       risk_amount = position_size_btc * stop_loss_distance * point_value;
-      profit_target = risk_amount * TAKE_PROFIT_MULT;
+      // FIX: Take profit should always be based on stop loss distance, not risk amount
+      profit_target = stop_loss_distance * TAKE_PROFIT_MULT;
 
       Print("⚠️ POSITION SIZE REDUCED FOR SAFETY:");
       Print("  Original position would be ", DoubleToString(position_as_percent_of_account, 1), "% of account");
       Print("  Reduced to 50% of account for safety");
       Print("  New risk amount: $", DoubleToString(risk_amount, 2));
+      Print("  Take profit maintained at: $", DoubleToString(profit_target, 2), " (", TAKE_PROFIT_MULT, "x SL distance)");
    }
 
    // Calculate actual prices for SELL order
@@ -1093,7 +936,7 @@ void ExecuteSellOrder()
    Print("Entry price: $", DoubleToString(entry_price, 2));
    Print("ATR value: $", DoubleToString(atr_value, 2), " (", ATR_PERIOD, "-period)");
    Print("Stop loss distance: $", DoubleToString(stop_loss_distance, 2), " (= ATR × ", ATR_STOP_LOSS_MULTIPLIER, ")");
-   Print("Take profit target: $", DoubleToString(profit_target, 2), " (= ", TAKE_PROFIT_MULT, "x risk)");
+   Print("Take profit target: $", DoubleToString(profit_target, 2), " (= ", TAKE_PROFIT_MULT, "x SL distance)");
    Print("Calculated position size: ", DoubleToString(position_size_btc, 6), " BTC");
    Print("Final lot size: ", DoubleToString(lot_size, 6), " BTC");
    Print("Position value: $", DoubleToString(position_value, 2));
@@ -1191,7 +1034,7 @@ void ExecuteSellOrder()
                ", Entry=", DoubleToString(entry_price, _Digits),
                ", SL=", DoubleToString(stop_loss, _Digits),
                ", TP=", DoubleToString(take_profit, _Digits),
-               ", Lots=", DoubleToString(lot_size, 6));
+               ", Lots=", DoubleToString(lot_size, 2));
    }
    else
    {
@@ -1200,7 +1043,7 @@ void ExecuteSellOrder()
       Print("Entry price: ", DoubleToString(entry_price, _Digits));
       Print("Stop loss: ", DoubleToString(stop_loss, _Digits));
       Print("Take profit: ", DoubleToString(take_profit, _Digits));
-      Print("Lot size: ", DoubleToString(lot_size, 6));
+      Print("Lot size: ", DoubleToString(lot_size, 2));
       Print("Slippage: ", GetSymbolSlippage());
    }
 }
@@ -1398,35 +1241,178 @@ void ManagePosition()
 
       current_ticket = 0;
       current_direction = NO_TRADE;
+      monitoring_separation = false;
+      entry_time = 0;
       return;
    }
 
-   // Check for early exit signals based on Alligator
+   datetime current_time = TimeCurrent();
    bool should_exit = false;
    string exit_reason = "";
 
-   if (current_direction == LONG_TRADE)
+   // EARLY ENTRY STRATEGY: Check line separation monitoring
+   if (monitoring_separation && entry_time > 0)
    {
-      // WILLIAMS ALLIGATOR EXIT: Price candle closes below Lips (Green line) - momentum weakening
-      if (price_current < lips_current && price_previous >= lips_previous)
+      int time_in_trade = (int)(current_time - entry_time);
+      
+      // Get current ATR for separation threshold
+      double atr_buffer[];
+      if (CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) > 0)
       {
-         should_exit = true;
-         exit_reason = "WILLIAMS ALLIGATOR EXIT: Price closed below Lips - bullish momentum weakening";
+         double current_atr = atr_buffer[0];
+         double required_separation = current_atr * (LINE_SEPARATE_ATR_PERCENTAGE / 100.0);
+         
+         if (current_direction == LONG_TRADE)
+         {
+            // For long trades, check if lines have achieved bullish separation AND correct order
+            // Required order: Price > Lips > Teeth > Jaw
+            bool correct_bullish_order = (price_current > lips_current && 
+                                         lips_current > teeth_current && 
+                                         teeth_current > jaw_current);
+            
+            double lips_teeth_gap = lips_current - teeth_current;
+            double teeth_jaw_gap = teeth_current - jaw_current;
+            double price_lips_gap = price_current - lips_current;
+            
+            bool sufficient_separation = (lips_teeth_gap >= required_separation && 
+                                        teeth_jaw_gap >= required_separation && 
+                                        price_lips_gap >= required_separation);
+            
+            bool good_separation = correct_bullish_order && sufficient_separation;
+            
+            if (good_separation)
+            {
+               // Good separation achieved - stop monitoring
+               monitoring_separation = false;
+               if (DEBUG_LEVEL >= 1)
+                  Print("✅ SEPARATION CONFIRMED: Long position - correct bullish order (Price>Lips>Teeth>Jaw) with required separation (", 
+                        DoubleToString(required_separation, _Digits), ")");
+            }
+            else if (time_in_trade >= CONFIRMATION_WINDOW_SECONDS)
+            {
+               // Timeout - lines didn't separate enough or lost correct order
+               should_exit = true;
+               string order_status = correct_bullish_order ? "YES" : "NO";
+               string separation_status = sufficient_separation ? "YES" : "NO";
+               exit_reason = "EARLY ENTRY TIMEOUT: Failed to achieve bullish alignment within " + 
+                           IntegerToString(CONFIRMATION_WINDOW_SECONDS) + " seconds. " +
+                           "Correct order (P>L>T>J): " + order_status + 
+                           ", Sufficient separation: " + separation_status +
+                           " (gaps: P-L=" + DoubleToString(price_lips_gap, _Digits) + 
+                           ", L-T=" + DoubleToString(lips_teeth_gap, _Digits) + 
+                           ", T-J=" + DoubleToString(teeth_jaw_gap, _Digits) + 
+                           ", required=" + DoubleToString(required_separation, _Digits) + ")";
+            }
+            
+            // Debug separation monitoring
+            if (DEBUG_LEVEL >= 2 && time_in_trade % 10 == 0) // Every 10 seconds
+            {
+               int time_remaining = CONFIRMATION_WINDOW_SECONDS - time_in_trade;
+               Print("LONG SEPARATION CHECK:");
+               Print("  Order (P>L>T>J): ", correct_bullish_order ? "YES" : "NO", 
+                     " | P=", DoubleToString(price_current, _Digits),
+                     ", L=", DoubleToString(lips_current, _Digits),
+                     ", T=", DoubleToString(teeth_current, _Digits),
+                     ", J=", DoubleToString(jaw_current, _Digits));
+               Print("  Gaps: P-L=", DoubleToString(price_lips_gap, _Digits),
+                     ", L-T=", DoubleToString(lips_teeth_gap, _Digits),
+                     ", T-J=", DoubleToString(teeth_jaw_gap, _Digits),
+                     " | Required=", DoubleToString(required_separation, _Digits));
+               Print("  Separation OK: ", sufficient_separation ? "YES" : "NO",
+                     " | Time remaining: ", time_remaining, "s");
+            }
+         }
+         else if (current_direction == SHORT_TRADE)
+         {
+            // For short trades, check if lines have achieved bearish separation AND correct order
+            // Required order: Jaw > Teeth > Lips > Price
+            bool correct_bearish_order = (jaw_current > teeth_current && 
+                                         teeth_current > lips_current && 
+                                         lips_current > price_current);
+            
+            double jaw_teeth_gap = jaw_current - teeth_current;
+            double teeth_lips_gap = teeth_current - lips_current;
+            double lips_price_gap = lips_current - price_current;
+            
+            bool sufficient_separation = (jaw_teeth_gap >= required_separation && 
+                                        teeth_lips_gap >= required_separation && 
+                                        lips_price_gap >= required_separation);
+            
+            bool good_separation = correct_bearish_order && sufficient_separation;
+            
+            if (good_separation)
+            {
+               // Good separation achieved - stop monitoring
+               monitoring_separation = false;
+               if (DEBUG_LEVEL >= 1)
+                  Print("✅ SEPARATION CONFIRMED: Short position - correct bearish order (Jaw>Teeth>Lips>Price) with required separation (", 
+                        DoubleToString(required_separation, _Digits), ")");
+            }
+            else if (time_in_trade >= CONFIRMATION_WINDOW_SECONDS)
+            {
+               // Timeout - lines didn't separate enough or lost correct order
+               should_exit = true;
+               string order_status = correct_bearish_order ? "YES" : "NO";
+               string separation_status = sufficient_separation ? "YES" : "NO";
+               exit_reason = "EARLY ENTRY TIMEOUT: Failed to achieve bearish alignment within " + 
+                           IntegerToString(CONFIRMATION_WINDOW_SECONDS) + " seconds. " +
+                           "Correct order (J>T>L>P): " + order_status + 
+                           ", Sufficient separation: " + separation_status +
+                           " (gaps: J-T=" + DoubleToString(jaw_teeth_gap, _Digits) + 
+                           ", T-L=" + DoubleToString(teeth_lips_gap, _Digits) + 
+                           ", L-P=" + DoubleToString(lips_price_gap, _Digits) + 
+                           ", required=" + DoubleToString(required_separation, _Digits) + ")";
+            }
+            
+            // Debug separation monitoring
+            if (DEBUG_LEVEL >= 2 && time_in_trade % 10 == 0) // Every 10 seconds
+            {
+               int time_remaining = CONFIRMATION_WINDOW_SECONDS - time_in_trade;
+               Print("SHORT SEPARATION CHECK:");
+               Print("  Order (J>T>L>P): ", correct_bearish_order ? "YES" : "NO", 
+                     " | J=", DoubleToString(jaw_current, _Digits),
+                     ", T=", DoubleToString(teeth_current, _Digits),
+                     ", L=", DoubleToString(lips_current, _Digits),
+                     ", P=", DoubleToString(price_current, _Digits));
+               Print("  Gaps: J-T=", DoubleToString(jaw_teeth_gap, _Digits),
+                     ", T-L=", DoubleToString(teeth_lips_gap, _Digits),
+                     ", L-P=", DoubleToString(lips_price_gap, _Digits),
+                     " | Required=", DoubleToString(required_separation, _Digits));
+               Print("  Separation OK: ", sufficient_separation ? "YES" : "NO",
+                     " | Time remaining: ", time_remaining, "s");
+            }
+         }
       }
    }
-   else if (current_direction == SHORT_TRADE)
+
+   // MOMENTUM EXIT SIGNALS: Check for momentum weakening
+   if (!should_exit)
    {
-      // WILLIAMS ALLIGATOR EXIT: Price candle closes above Lips (Green line) - momentum weakening
-      if (price_current > lips_current && price_previous <= lips_previous)
+      if (current_direction == LONG_TRADE)
       {
-         should_exit = true;
-         exit_reason = "WILLIAMS ALLIGATOR EXIT: Price closed above Lips - bearish momentum weakening";
+         // Early exit if price closes below Lips (momentum weakening)
+         if (price_current < lips_current && price_previous >= lips_previous)
+         {
+            should_exit = true;
+            exit_reason = "MOMENTUM EXIT: Price closed below Lips - bullish momentum weakening";
+         }
+      }
+      else if (current_direction == SHORT_TRADE)
+      {
+         // Early exit if price closes above Lips (momentum weakening)
+         if (price_current > lips_current && price_previous <= lips_previous)
+         {
+            should_exit = true;
+            exit_reason = "MOMENTUM EXIT: Price closed above Lips - bearish momentum weakening";
+         }
       }
    }
 
    if (should_exit)
    {
       ClosePosition(exit_reason);
+      monitoring_separation = false;
+      entry_time = 0;
    }
 }
 
@@ -1534,6 +1520,136 @@ void ClosePosition(string reason)
 }
 
 //+------------------------------------------------------------------+
+//| Draw breakout box showing sleep period and awakening             |
+//+------------------------------------------------------------------+
+void DrawBreakoutBox(datetime sleep_start, datetime breakout_time, bool is_bullish)
+{
+   if (sleep_start == 0) return; // Safety check
+   
+   visual_counter++;
+   string box_name = "BreakoutBox_" + IntegerToString(visual_counter);
+   
+   // Get price range during sleep period
+   double high_prices[], low_prices[];
+   int bars_count = (int)((breakout_time - sleep_start) / PeriodSeconds());
+   bars_count = MathMax(1, MathMin(bars_count, 500)); // Limit for performance
+   
+   if (CopyHigh(_Symbol, _Period, iBarShift(_Symbol, _Period, sleep_start), bars_count, high_prices) > 0 &&
+       CopyLow(_Symbol, _Period, iBarShift(_Symbol, _Period, sleep_start), bars_count, low_prices) > 0)
+   {
+      double highest = high_prices[ArrayMaximum(high_prices)];
+      double lowest = low_prices[ArrayMinimum(low_prices)];
+      
+      // Add some padding to the box
+      double padding = (highest - lowest) * 0.1;
+      highest += padding;
+      lowest -= padding;
+      
+      // Create rectangle showing the sleep period
+      if (ObjectCreate(0, box_name, OBJ_RECTANGLE, 0, sleep_start, highest, breakout_time, lowest))
+      {
+         // Set box properties
+         color box_color = is_bullish ? clrLightGreen : clrLightCoral;
+         ObjectSetInteger(0, box_name, OBJPROP_COLOR, box_color);
+         ObjectSetInteger(0, box_name, OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetInteger(0, box_name, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, box_name, OBJPROP_BACK, true);
+         ObjectSetInteger(0, box_name, OBJPROP_FILL, true);
+         ObjectSetInteger(0, box_name, OBJPROP_SELECTED, false);
+         ObjectSetInteger(0, box_name, OBJPROP_SELECTABLE, false);
+         
+         // Add text label
+         string label_name = "BreakoutLabel_" + IntegerToString(visual_counter);
+         if (ObjectCreate(0, label_name, OBJ_TEXT, 0, breakout_time, (highest + lowest) / 2))
+         {
+            string label_text = is_bullish ? "🚀 BULLISH AWAKENING" : "📉 BEARISH AWAKENING";
+            ObjectSetString(0, label_name, OBJPROP_TEXT, label_text);
+            ObjectSetString(0, label_name, OBJPROP_FONT, "Arial");
+            ObjectSetInteger(0, label_name, OBJPROP_FONTSIZE, 8);
+            ObjectSetInteger(0, label_name, OBJPROP_COLOR, is_bullish ? clrDarkGreen : clrDarkRed);
+            ObjectSetInteger(0, label_name, OBJPROP_ANCHOR, ANCHOR_LEFT);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw breakout arrow at entry point                               |
+//+------------------------------------------------------------------+
+void DrawBreakoutArrow(datetime time, double price, bool is_bullish)
+{
+   visual_counter++;
+   string arrow_name = "BreakoutArrow_" + IntegerToString(visual_counter);
+   
+   // Create arrow object
+   ENUM_OBJECT arrow_type = is_bullish ? OBJ_ARROW_UP : OBJ_ARROW_DOWN;
+   
+   if (ObjectCreate(0, arrow_name, arrow_type, 0, time, price))
+   {
+      // Set arrow properties
+      color arrow_color = is_bullish ? clrBlue : clrRed;
+      ObjectSetInteger(0, arrow_name, OBJPROP_COLOR, arrow_color);
+      ObjectSetInteger(0, arrow_name, OBJPROP_WIDTH, 3);
+      ObjectSetInteger(0, arrow_name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, arrow_name, OBJPROP_SELECTED, false);
+      ObjectSetInteger(0, arrow_name, OBJPROP_SELECTABLE, false);
+      
+      // Set arrow code for up/down arrows
+      ObjectSetInteger(0, arrow_name, OBJPROP_ARROWCODE, is_bullish ? 233 : 234);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw threshold lines showing breakout levels                     |
+//+------------------------------------------------------------------+
+void DrawThresholdLines(datetime time, double threshold_distance, bool is_bullish)
+{
+   visual_counter++;
+   string threshold_name = "Threshold_" + IntegerToString(visual_counter);
+   
+   // Calculate threshold level based on Alligator lines
+   double max_line = MathMax(MathMax(jaw_current, teeth_current), lips_current);
+   double min_line = MathMin(MathMin(jaw_current, teeth_current), lips_current);
+   double threshold_level = is_bullish ? (max_line + threshold_distance) : (min_line - threshold_distance);
+   
+   // Create horizontal line
+   datetime end_time = time + PeriodSeconds() * 20; // Show for 20 bars
+   
+   if (ObjectCreate(0, threshold_name, OBJ_TREND, 0, time, threshold_level, end_time, threshold_level))
+   {
+      color line_color = is_bullish ? clrDodgerBlue : clrOrangeRed;
+      ObjectSetInteger(0, threshold_name, OBJPROP_COLOR, line_color);
+      ObjectSetInteger(0, threshold_name, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, threshold_name, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, threshold_name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, threshold_name, OBJPROP_RAY_RIGHT, false);
+      ObjectSetInteger(0, threshold_name, OBJPROP_SELECTED, false);
+      ObjectSetInteger(0, threshold_name, OBJPROP_SELECTABLE, false);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Clean up visual objects from chart                               |
+//+------------------------------------------------------------------+
+void CleanupVisualObjects()
+{
+   // Remove all objects created by this EA
+   for (int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string obj_name = ObjectName(0, i);
+      if (StringFind(obj_name, "BreakoutBox_") >= 0 || 
+          StringFind(obj_name, "BreakoutLabel_") >= 0 ||
+          StringFind(obj_name, "BreakoutArrow_") >= 0 ||
+          StringFind(obj_name, "Threshold_") >= 0)
+      {
+         ObjectDelete(0, obj_name);
+      }
+   }
+   
+   visual_counter = 0; // Reset counter
+}
+
+//+------------------------------------------------------------------+
 //| Calculate risk amount in dollars                                 |
 //+------------------------------------------------------------------+
 double CalculateRiskAmount()
@@ -1615,44 +1731,74 @@ void ShowInfo()
          double profit = PositionGetDouble(POSITION_PROFIT);
          status = "In " + ((current_direction == LONG_TRADE) ? "LONG" : "SHORT") +
                   " position | P&L: $" + DoubleToString(profit, 2);
+         
+         // Show separation monitoring status
+         if (monitoring_separation && entry_time > 0)
+         {
+            int time_in_trade = (int)(TimeCurrent() - entry_time);
+            int time_remaining = CONFIRMATION_WINDOW_SECONDS - time_in_trade;
+            status += " | Monitoring separation (" + IntegerToString(time_remaining) + "s remaining)";
+         }
       }
    }
    else
    {
-      status = "Looking for entry signals";
+      status = "Looking for early entry signals";
    }
 
-   // Check line alignment for WILLIAMS ALLIGATOR trend indication
-   string trend_status = "";
-   bool bullish_stack = (lips_current > teeth_current && teeth_current > jaw_current);
-   bool bearish_stack = (jaw_current > teeth_current && teeth_current > lips_current);
-
-   if (bullish_stack)
-      trend_status = "BULLISH TREND (Green>Red>Blue) - Alligator mouth open up";
-   else if (bearish_stack)
-      trend_status = "BEARISH TREND (Blue>Red>Green) - Alligator mouth open down";
-   else if (lips_current > teeth_current)
-      trend_status = "POTENTIAL BULLISH (Green>Red, waiting for full stack)";
-   else if (lips_current < teeth_current)
-      trend_status = "POTENTIAL BEARISH (Red>Green, waiting for full stack)";
+   // Early Entry Strategy Status
+   string strategy_status = "";
+   if (alligator_is_sleeping)
+   {
+      if (alligator_sleep_start > 0)
+      {
+         int sleep_duration = (int)(TimeCurrent() - alligator_sleep_start);
+         if (sleep_duration >= SLEEPING_WINDOW_SECONDS)
+            strategy_status = "READY FOR BREAKOUT (Slept " + IntegerToString(sleep_duration) + "s)";
+         else
+         {
+            int remaining = SLEEPING_WINDOW_SECONDS - sleep_duration;
+            strategy_status = "SLEEPING - Need " + IntegerToString(remaining) + "s more";
+         }
+      }
+      else
+         strategy_status = "SLEEPING (just started)";
+   }
    else
-      trend_status = "SIDEWAYS/SLEEPING ALLIGATOR (Mixed lines)";
+   {
+      // Show line alignment for awake alligator
+      bool bullish_stack = (lips_current > teeth_current && teeth_current > jaw_current);
+      bool bearish_stack = (jaw_current > teeth_current && teeth_current > lips_current);
+
+      if (bullish_stack)
+         strategy_status = "AWAKE - BULLISH TREND (Green>Red>Blue)";
+      else if (bearish_stack)
+         strategy_status = "AWAKE - BEARISH TREND (Blue>Red>Green)";
+      else if (lips_current > teeth_current)
+         strategy_status = "AWAKE - POTENTIAL BULLISH (Green>Red)";
+      else if (lips_current < teeth_current)
+         strategy_status = "AWAKE - POTENTIAL BEARISH (Red>Green)";
+      else
+         strategy_status = "AWAKE - MIXED SIGNALS";
+   }
 
    string info = StringFormat(
-       "BTCUSD Alligator Scalper | Trades Today: %d/%d\n" +
+       "BTCUSD Alligator Early Entry | Trades Today: %d/%d\n" +
            "Status: %s\n" +
-           "Trend: %s\n" +
+           "Strategy: %s\n" +
            "Price: %s | Jaw: %s | Teeth: %s | Lips: %s\n" +
-           "Risk per trade: %.1f%% | Max trades: %d",
+           "Settings: Risk=%.1f%% | Sleep=%ds | Breakout=%.0f%% ATR | Separation=%.0f%% ATR",
        trades_today, MAX_TRADES_PER_DAY,
        status,
-       trend_status,
+       strategy_status,
        DoubleToString(price_current, _Digits),
        DoubleToString(jaw_current, _Digits),
        DoubleToString(teeth_current, _Digits),
        DoubleToString(lips_current, _Digits),
        RISK_PER_TRADE_PCT,
-       MAX_TRADES_PER_DAY);
+       SLEEPING_WINDOW_SECONDS,
+       ATR_PRICE_THRESHOLD_PERCENT,
+       LINE_SEPARATE_ATR_PERCENTAGE);
 
    Comment(info);
 }
@@ -1789,4 +1935,5 @@ double OnTester()
    return fitness;
 }
 
+//+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
