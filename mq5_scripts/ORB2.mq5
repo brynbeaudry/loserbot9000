@@ -54,6 +54,7 @@ input int ATR_MEDIAN_DAYS = 120;         // ATR Median Days - Keep 120 days (6 m
 //
 input double RANGE_MULT = 1.0;                     // Keep 1.0 for balanced risk:reward; lower to 0.5-0.8 for faster but smaller profits; raise to 1.5-2.0 for larger but slower profits
 input int CONFIRMATION_CANDLES = 1;                // Candles required to confirm breakout (1=immediate, 2+=more conservative)
+input double MIN_BREAKOUT_ANGLE = 75.0;             // Minimum angle from breakout point to current price (degrees, 0=disabled)
 input bool ALLOW_TP_AFTER_HOURS = false;           // Allow positions to reach TP after session close (will close before next session)
 input int CLOSE_MINUTES_BEFORE_NEXT_SESSION = 120; // Minutes before next session to close after-hours positions (only applies if ALLOW_TP_AFTER_HOURS is true)
 
@@ -105,11 +106,18 @@ datetime active_trading_session = 0; // Timestamp of the trading session we're c
 int bull_breakout_count = 0; // Count of consecutive bullish breakout candles
 int bear_breakout_count = 0; // Count of consecutive bearish breakout candles
 
+// Angle-based breakout tracking
+double breakout_start_price = 0;    // Price when breakout started
+datetime breakout_start_time = 0;   // Time when breakout started
+
 // ATR history for median calculation
 double atr_history[];
 
 // ATR handle for efficient indicator access
 int atr_handle = INVALID_HANDLE;
+
+// Current live price for trend detection (set in CheckBreakout)
+double price = 0;  
 
 // Time variables are now defined in the TIME VARIABLES section
 
@@ -333,7 +341,12 @@ int OnInit()
       Print("Opening Range: ", SESSION_OR_MINUTES, " minutes");
       Print("Max Trades: ", MAX_TRADES_PER_DAY, " per day");
       Print("Buffer: Range × ", DoubleToString(RANGE_BUFFER_MULT, 1));
-      Print("Trend Detection: ", TREND_CANDLES, " candles, ", DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold");
+      Print("Trend Detection: ", TREND_CANDLES, " candles (live price + historical), ", DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold");
+      Print("Trend Requirement: Current price MUST be beyond previous close");
+      if (MIN_BREAKOUT_ANGLE > 0)
+         Print("Minimum Breakout Angle: ", DoubleToString(MIN_BREAKOUT_ANGLE, 1), "°");
+      else
+         Print("Minimum Breakout Angle: DISABLED (set to 0)");
       Print("Take Profit Type: Range Multiple");
    }
 
@@ -767,6 +780,9 @@ void InitializeRangeValues()
    // Reset breakout confirmation counters
    bull_breakout_count = 0;
    bear_breakout_count = 0;
+   
+   // Reset angle-based breakout tracking
+   ResetBreakoutTracking();
 
    // Reset box drawing flag
    box_drawn = false;
@@ -1006,7 +1022,9 @@ void CheckBreakout()
       return;
    }
 
-   // Get current price data
+   // Get current live price (for trend detection) and completed bar close (for breakout detection)
+   price = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0; // Live mid price
+   
    double close[1];
    if (CopyClose(_Symbol, PERIOD_M1, 1, 1, close) <= 0)
    {
@@ -1034,7 +1052,7 @@ void CheckBreakout()
    }
    else
    {
-      ResetBreakoutCounters();
+      ResetBreakoutCounters(close[0], buffer_points);
    }
 }
 
@@ -1063,44 +1081,105 @@ void LogBreakoutLevels(double close, double buffer_points, double bull_level, do
 //+------------------------------------------------------------------+
 void ProcessBullishBreakout(double close, double buffer_points)
 {
-   // Check if trend is bullish - required for bullish breakout
-   if (!IsTrendBullish())
+   // STEP 1: Critical trend requirement (fastest check - single comparison)
+   // Don't reset counters immediately - live price can fluctuate temporarily
+   if (price <= GetPreviousClose())
    {
-      if (DEBUG_LEVEL >= 2)
-         Print("BULLISH BREAKOUT REJECTED: Trend not bullish enough (", 
-               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
+      if (DEBUG_LEVEL >= 3)
+         Print("BULLISH BREAKOUT: Current price ", DoubleToString(price, _Digits), 
+               " <= previous close ", DoubleToString(GetPreviousClose(), _Digits), " - waiting for recovery");
       
-      // Reset counters if trend doesn't support breakout
-      bull_breakout_count = 0;
+      // Just return without incrementing - don't reset counters for temporary dips
       return;
    }
    
+   // STEP 2: Confirmation candles check (very fast - avoid expensive calculations if not ready)
    // Use bar time to ensure we only count once per bar for confirmation
    static datetime last_bull_bar_time = 0;
    datetime current_bar_time = iTime(_Symbol, PERIOD_M1, 0);
    
-   if (current_bar_time != last_bull_bar_time)
+   bool is_new_bar = (current_bar_time != last_bull_bar_time);
+   if (is_new_bar)
    {
       bull_breakout_count++;
       last_bull_bar_time = current_bar_time;
    }
    
    bear_breakout_count = 0; // Reset bear count on bullish candle
-
-   if (DEBUG_LEVEL >= 1)
-      Print("BULLISH BREAKOUT + TREND CONFIRMED: ", bull_breakout_count, "/", CONFIRMATION_CANDLES,
-            " | Close ", DoubleToString(close, _Digits),
-            " > Range high ", DoubleToString(range_high, _Digits),
-            " + Buffer ", DoubleToString(buffer_points, _Digits));
-
-   // Only execute trade after enough confirmation candles
-   if (bull_breakout_count >= CONFIRMATION_CANDLES)
+   
+   // Exit early if we don't have enough confirmations yet (avoid expensive checks)
+   if (bull_breakout_count < CONFIRMATION_CANDLES)
    {
-      if (DEBUG_LEVEL >= 1)
-         Print("CONFIRMED BULL BREAKOUT + TREND AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY");
-      SendOrder(ORDER_TYPE_BUY);
-      bull_breakout_count = 0; // Reset counter after trade
+      if (DEBUG_LEVEL >= 2)
+         Print("BULLISH BREAKOUT: Waiting for confirmations (", bull_breakout_count, "/", CONFIRMATION_CANDLES, ")");
+      return;
    }
+   
+   // STEP 3: Angle validation (if enabled - moderate cost trigonometric calculations)
+   // Initialize breakout tracking on first detection
+   if (breakout_start_time == 0)
+   {
+      breakout_start_price = range_high + buffer_points; // Actual breakout level
+      breakout_start_time = TimeCurrent();
+   }
+   
+   if (MIN_BREAKOUT_ANGLE > 0)
+   {
+      // Calculate angle from breakout point to current price
+      double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
+      
+      if (breakout_angle < MIN_BREAKOUT_ANGLE)
+      {
+         if (DEBUG_LEVEL >= 2)
+            Print("BULLISH BREAKOUT REJECTED: Angle ", DoubleToString(breakout_angle, 1), 
+                  "° < required ", DoubleToString(MIN_BREAKOUT_ANGLE, 1), "°");
+         // Don't reset counters - let it try again next tick with potentially better angle
+         return;
+      }
+   }
+   
+   // STEP 4: Full trend alignment check (most expensive - array operations)
+   if (!IsTrendAlignmentBullish())
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("BULLISH BREAKOUT REJECTED: Trend alignment insufficient (", 
+               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
+      
+      // Check if trend is strongly bearish (major opposite signal)
+      if (IsTrendAlignmentBearish())
+      {
+         if (DEBUG_LEVEL >= 2)
+            Print("STRONG BEARISH TREND DETECTED - resetting bull counters");
+         bull_breakout_count = 0;
+         ResetBreakoutTracking();
+      }
+      // If trend is just weak/neutral, don't reset - let price action determine
+      return;
+   }
+
+   // All validations passed - execute trade
+   if (DEBUG_LEVEL >= 1)
+   {
+      string angle_info = "";
+      if (MIN_BREAKOUT_ANGLE > 0)
+      {
+         double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
+         angle_info = " | Angle: " + DoubleToString(breakout_angle, 1) + "°";
+      }
+      else
+      {
+         angle_info = " | Angle: DISABLED";
+      }
+      
+      if (MIN_BREAKOUT_ANGLE > 0)
+         Print("CONFIRMED BULL BREAKOUT + TREND + ANGLE AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY", angle_info);
+      else
+         Print("CONFIRMED BULL BREAKOUT + TREND AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY (angle disabled)");
+   }
+
+   SendOrder(ORDER_TYPE_BUY);
+   bull_breakout_count = 0; // Reset counter after trade
+   ResetBreakoutTracking(); // Reset tracking after trade
 }
 
 //+------------------------------------------------------------------+
@@ -1108,64 +1187,171 @@ void ProcessBullishBreakout(double close, double buffer_points)
 //+------------------------------------------------------------------+
 void ProcessBearishBreakout(double close, double buffer_points)
 {
-   // Check if trend is bearish - required for bearish breakout
-   if (!IsTrendBearish())
+   // STEP 1: Critical trend requirement (fastest check - single comparison)
+   // Don't reset counters immediately - live price can fluctuate temporarily
+   if (price >= GetPreviousClose())
    {
-      if (DEBUG_LEVEL >= 2)
-         Print("BEARISH BREAKOUT REJECTED: Trend not bearish enough (", 
-               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
+      if (DEBUG_LEVEL >= 3)
+         Print("BEARISH BREAKOUT: Current price ", DoubleToString(price, _Digits), 
+               " >= previous close ", DoubleToString(GetPreviousClose(), _Digits), " - waiting for recovery");
       
-      // Reset counters if trend doesn't support breakout
-      bear_breakout_count = 0;
+      // Just return without incrementing - don't reset counters for temporary rises
       return;
    }
    
+   // STEP 2: Confirmation candles check (very fast - avoid expensive calculations if not ready)
    // Use bar time to ensure we only count once per bar for confirmation
    static datetime last_bear_bar_time = 0;
    datetime current_bar_time = iTime(_Symbol, PERIOD_M1, 0);
    
-   if (current_bar_time != last_bear_bar_time)
+   bool is_new_bar = (current_bar_time != last_bear_bar_time);
+   if (is_new_bar)
    {
       bear_breakout_count++;
       last_bear_bar_time = current_bar_time;
    }
    
    bull_breakout_count = 0; // Reset bull count on bearish candle
-
-   if (DEBUG_LEVEL >= 1)
-      Print("BEARISH BREAKOUT + TREND CONFIRMED: ", bear_breakout_count, "/", CONFIRMATION_CANDLES,
-            " | Close ", DoubleToString(close, _Digits),
-            " < Range low ", DoubleToString(range_low, _Digits),
-            " - Buffer ", DoubleToString(buffer_points, _Digits));
-
-   // Only execute trade after enough confirmation candles
-   if (bear_breakout_count >= CONFIRMATION_CANDLES)
+   
+   // Exit early if we don't have enough confirmations yet (avoid expensive checks)
+   if (bear_breakout_count < CONFIRMATION_CANDLES)
    {
-      if (DEBUG_LEVEL >= 1)
-         Print("CONFIRMED BEAR BREAKOUT + TREND AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL");
-      SendOrder(ORDER_TYPE_SELL);
-      bear_breakout_count = 0; // Reset counter after trade
+      if (DEBUG_LEVEL >= 2)
+         Print("BEARISH BREAKOUT: Waiting for confirmations (", bear_breakout_count, "/", CONFIRMATION_CANDLES, ")");
+      return;
+   }
+   
+   // STEP 3: Angle validation (if enabled - moderate cost trigonometric calculations)
+   // Initialize breakout tracking on first detection
+   if (breakout_start_time == 0)
+   {
+      breakout_start_price = range_low - buffer_points; // Actual breakout level
+      breakout_start_time = TimeCurrent();
+   }
+   
+   if (MIN_BREAKOUT_ANGLE > 0)
+   {
+      // Calculate angle from breakout point to current price
+      double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
+      
+      if (breakout_angle < MIN_BREAKOUT_ANGLE)
+      {
+         if (DEBUG_LEVEL >= 2)
+            Print("BEARISH BREAKOUT REJECTED: Angle ", DoubleToString(breakout_angle, 1), 
+                  "° < required ", DoubleToString(MIN_BREAKOUT_ANGLE, 1), "°");
+         // Don't reset counters - let it try again next tick with potentially better angle
+         return;
+      }
+   }
+   
+   // STEP 4: Full trend alignment check (most expensive - array operations)
+   if (!IsTrendAlignmentBearish())
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("BEARISH BREAKOUT REJECTED: Trend alignment insufficient (", 
+               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
+      
+      // Check if trend is strongly bullish (major opposite signal)
+      if (IsTrendAlignmentBullish())
+      {
+         if (DEBUG_LEVEL >= 2)
+            Print("STRONG BULLISH TREND DETECTED - resetting bear counters");
+         bear_breakout_count = 0;
+         ResetBreakoutTracking();
+      }
+      // If trend is just weak/neutral, don't reset - let price action determine
+      return;
+   }
+
+   // All validations passed - execute trade
+   if (DEBUG_LEVEL >= 1)
+   {
+      string angle_info = "";
+      if (MIN_BREAKOUT_ANGLE > 0)
+      {
+         double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
+         angle_info = " | Angle: " + DoubleToString(breakout_angle, 1) + "°";
+      }
+      else
+      {
+         angle_info = " | Angle: DISABLED";
+      }
+      
+      if (MIN_BREAKOUT_ANGLE > 0)
+         Print("CONFIRMED BEAR BREAKOUT + TREND + ANGLE AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL", angle_info);
+      else
+         Print("CONFIRMED BEAR BREAKOUT + TREND AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL (angle disabled)");
+   }
+
+   SendOrder(ORDER_TYPE_SELL);
+   bear_breakout_count = 0; // Reset counter after trade
+   ResetBreakoutTracking(); // Reset tracking after trade
+}
+
+//+------------------------------------------------------------------+
+//| Reset breakout counters only when strong opposite signals occur  |
+//+------------------------------------------------------------------+
+void ResetBreakoutCounters(double close, double buffer_points)
+{
+   // Calculate breakout levels
+   double bull_breakout_level = CalculateBullBreakoutLevel();
+   double bear_breakout_level = CalculateBearBreakoutLevel();
+   
+   // Check for strong opposite direction signals
+   bool should_reset_bull_counters = false;
+   bool should_reset_bear_counters = false;
+   
+   // SIGNAL 1: Price crossed to opposite buffer zone (decisive opposite direction)
+   if (bull_breakout_count > 0 && close <= bear_breakout_level)
+   {
+      // Bullish breakout in progress, but price crossed to bearish zone
+      should_reset_bull_counters = true;
+      if (DEBUG_LEVEL >= 2)
+         Print("RESET BULL COUNTERS: Price crossed to bearish zone (", 
+               DoubleToString(close, _Digits), " <= ", DoubleToString(bear_breakout_level, _Digits), ")");
+   }
+   
+   if (bear_breakout_count > 0 && close >= bull_breakout_level)
+   {
+      // Bearish breakout in progress, but price crossed to bullish zone  
+      should_reset_bear_counters = true;
+      if (DEBUG_LEVEL >= 2)
+         Print("RESET BEAR COUNTERS: Price crossed to bullish zone (", 
+               DoubleToString(close, _Digits), " >= ", DoubleToString(bull_breakout_level, _Digits), ")");
+   }
+   
+   // Apply resets
+   if (should_reset_bull_counters)
+   {
+      bull_breakout_count = 0;
+      if (breakout_start_time > 0 && bear_breakout_count == 0) // Only reset if not switching to opposite direction
+         ResetBreakoutTracking();
+   }
+   
+   if (should_reset_bear_counters)
+   {
+      bear_breakout_count = 0;
+      if (breakout_start_time > 0 && bull_breakout_count == 0) // Only reset if not switching to opposite direction
+         ResetBreakoutTracking();
+   }
+   
+   // Log current state for debugging
+   if (DEBUG_LEVEL >= 3 && (bull_breakout_count > 0 || bear_breakout_count > 0))
+   {
+      Print("BREAKOUT TRACKING: Bull=", bull_breakout_count, ", Bear=", bear_breakout_count, 
+            ", Price=", DoubleToString(close, _Digits),
+            ", Bull level=", DoubleToString(bull_breakout_level, _Digits),
+            ", Bear level=", DoubleToString(bear_breakout_level, _Digits));
    }
 }
 
 //+------------------------------------------------------------------+
-//| Reset breakout counters when no breakout is detected             |
+//| Reset angle-based breakout tracking                              |
 //+------------------------------------------------------------------+
-void ResetBreakoutCounters()
+void ResetBreakoutTracking()
 {
-   // No breakout - reset both counters
-   if (bull_breakout_count > 0 || bear_breakout_count > 0)
-   {
-      if (DEBUG_LEVEL >= 2)
-         Print("No breakout continuation - resetting confirmation counters");
-      bull_breakout_count = 0;
-      bear_breakout_count = 0;
-   }
-   else
-   {
-      if (DEBUG_LEVEL >= 3)
-         Print("No breakout detected - price within range");
-   }
+   breakout_start_price = 0;
+   breakout_start_time = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -2055,27 +2241,154 @@ int GetSymbolSlippage()
 }
 
 //+------------------------------------------------------------------+
+//| Efficient helper functions for optimized breakout validation     |
+//+------------------------------------------------------------------+
+double GetPreviousClose()
+{
+   double closes[1];
+   if (CopyClose(_Symbol, PERIOD_M1, 1, 1, closes) <= 0)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting previous close price");
+      return 0.0; // Return 0 if error - will cause trend checks to fail safely
+   }
+   return closes[0];
+}
+
+bool IsTrendAlignmentBullish()
+{
+   // Get historical closes (excluding current price - we already checked that)
+   double closes[];
+   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting close prices for bullish trend alignment");
+      return false;
+   }
+   
+   // Append current price to the array (resize and add at front)
+   ArrayResize(closes, TREND_CANDLES);
+   for (int i = TREND_CANDLES - 1; i > 0; i--)
+   {
+      closes[i] = closes[i-1]; // Shift existing closes to the right
+   }
+   closes[0] = price; // Add current price at front
+   
+   int bullish_candles = 0;
+   int bearish_candles = 0;
+   
+   // Analyze all moves including current price
+   for (int i = 0; i < TREND_CANDLES - 1; i++)
+   {
+      if (closes[i] > closes[i+1]) // Compare current with previous
+         bullish_candles++;
+      else if (closes[i] < closes[i+1])
+         bearish_candles++;
+      // Equal closes are ignored (neutral)
+   }
+   
+   int total_directional_candles = bullish_candles + bearish_candles;
+   if (total_directional_candles == 0) return false;
+   
+   double bullish_percentage = (double)bullish_candles / total_directional_candles;
+   
+   if (DEBUG_LEVEL >= 2)
+   {
+      Print("BULLISH TREND ALIGNMENT: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ", 
+            total_directional_candles, " directional moves (", 
+            DoubleToString(bullish_percentage * 100, 1), "% bullish)");
+   }
+   
+   return bullish_percentage >= TREND_THRESHOLD;
+}
+
+bool IsTrendAlignmentBearish()
+{
+   // Get historical closes (excluding current price - we already checked that)
+   double closes[];
+   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting close prices for bearish trend alignment");
+      return false;
+   }
+   
+   // Append current price to the array (resize and add at front)
+   ArrayResize(closes, TREND_CANDLES);
+   for (int i = TREND_CANDLES - 1; i > 0; i--)
+   {
+      closes[i] = closes[i-1]; // Shift existing closes to the right
+   }
+   closes[0] = price; // Add current price at front
+   
+   int bullish_candles = 0;
+   int bearish_candles = 0;
+   
+   // Analyze all moves including current price
+   for (int i = 0; i < TREND_CANDLES - 1; i++)
+   {
+      if (closes[i] > closes[i+1]) // Compare current with previous
+         bullish_candles++;
+      else if (closes[i] < closes[i+1])
+         bearish_candles++;
+      // Equal closes are ignored (neutral)
+   }
+   
+   int total_directional_candles = bullish_candles + bearish_candles;
+   if (total_directional_candles == 0) return false;
+   
+   double bearish_percentage = (double)bearish_candles / total_directional_candles;
+   
+   if (DEBUG_LEVEL >= 2)
+   {
+      Print("BEARISH TREND ALIGNMENT: ", bearish_candles, " bearish, ", bullish_candles, " bullish out of ", 
+            total_directional_candles, " directional moves (", 
+            DoubleToString(bearish_percentage * 100, 1), "% bearish)");
+   }
+   
+   return bearish_percentage >= TREND_THRESHOLD;
+}
+
+//+------------------------------------------------------------------+
 //| Detect trend direction based on recent candle closes             |
 //+------------------------------------------------------------------+
 bool IsTrendBullish()
 {
+   // Get historical closes 
    double closes[];
-   if (CopyClose(_Symbol, PERIOD_M1, 0, TREND_CANDLES, closes) != TREND_CANDLES)
+   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
    {
       if (DEBUG_LEVEL >= 1)
          Print("Error getting close prices for trend detection");
       return false; // Default to no trend if data unavailable
    }
    
+   // CRITICAL: Current price must be > previous close for bullish trend
+   if (price <= closes[0])
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("BULLISH TREND REJECTED: Current price ", DoubleToString(price, _Digits), 
+               " <= previous close ", DoubleToString(closes[0], _Digits));
+      return false;
+   }
+   
+   // Append current price to the array (resize and add at front)
+   ArrayResize(closes, TREND_CANDLES);
+   for (int i = TREND_CANDLES - 1; i > 0; i--)
+   {
+      closes[i] = closes[i-1]; // Shift existing closes to the right
+   }
+   closes[0] = price; // Add current price at front
+   
    int bullish_candles = 0;
    int bearish_candles = 0;
    
-   // Analyze candle closes - compare each candle with the previous one
-   for (int i = 1; i < TREND_CANDLES; i++)
+   // Analyze all moves including current price
+   for (int i = 0; i < TREND_CANDLES - 1; i++)
    {
-      if (closes[i] > closes[i-1])
+      if (closes[i] > closes[i+1]) // Compare current with previous
          bullish_candles++;
-      else if (closes[i] < closes[i-1])
+      else if (closes[i] < closes[i+1])
          bearish_candles++;
       // Equal closes are ignored (neutral)
    }
@@ -2087,8 +2400,8 @@ bool IsTrendBullish()
    
    if (DEBUG_LEVEL >= 2)
    {
-      Print("TREND ANALYSIS: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ", 
-            total_directional_candles, " directional candles (", 
+      Print("BULLISH TREND ANALYSIS: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ", 
+            total_directional_candles, " directional moves (", 
             DoubleToString(bullish_percentage * 100, 1), "% bullish)");
    }
    
@@ -2097,23 +2410,41 @@ bool IsTrendBullish()
 
 bool IsTrendBearish()
 {
+   // Get historical closes
    double closes[];
-   if (CopyClose(_Symbol, PERIOD_M1, 0, TREND_CANDLES, closes) != TREND_CANDLES)
+   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
    {
       if (DEBUG_LEVEL >= 1)
          Print("Error getting close prices for trend detection");
       return false; // Default to no trend if data unavailable
    }
    
+   // CRITICAL: Current price must be < previous close for bearish trend
+   if (price >= closes[0])
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("BEARISH TREND REJECTED: Current price ", DoubleToString(price, _Digits), 
+               " >= previous close ", DoubleToString(closes[0], _Digits));
+      return false;
+   }
+   
+   // Append current price to the array (resize and add at front)
+   ArrayResize(closes, TREND_CANDLES);
+   for (int i = TREND_CANDLES - 1; i > 0; i--)
+   {
+      closes[i] = closes[i-1]; // Shift existing closes to the right
+   }
+   closes[0] = price; // Add current price at front
+   
    int bullish_candles = 0;
    int bearish_candles = 0;
    
-   // Analyze candle closes - compare each candle with the previous one
-   for (int i = 1; i < TREND_CANDLES; i++)
+   // Analyze all moves including current price
+   for (int i = 0; i < TREND_CANDLES - 1; i++)
    {
-      if (closes[i] > closes[i-1])
+      if (closes[i] > closes[i+1]) // Compare current with previous
          bullish_candles++;
-      else if (closes[i] < closes[i-1])
+      else if (closes[i] < closes[i+1])
          bearish_candles++;
       // Equal closes are ignored (neutral)
    }
@@ -2123,5 +2454,49 @@ bool IsTrendBearish()
    
    double bearish_percentage = (double)bearish_candles / total_directional_candles;
    
+   if (DEBUG_LEVEL >= 2)
+   {
+      Print("BEARISH TREND ANALYSIS: ", bearish_candles, " bearish, ", bullish_candles, " bullish out of ", 
+            total_directional_candles, " directional moves (", 
+            DoubleToString(bearish_percentage * 100, 1), "% bearish)");
+   }
+   
    return bearish_percentage >= TREND_THRESHOLD;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate angle between two price points over time               |
+//+------------------------------------------------------------------+
+double CalculateSlopeAngleFromSeconds(double price_start, double price_end, double elapsed_seconds)
+{
+   // Calculate percentage change to make it scale-independent
+   double percentage_change = MathAbs(price_end - price_start) / price_start * 100.0;
+
+   // Convert seconds directly to hours
+   double time_duration_hours = elapsed_seconds / 3600.0;
+
+   // Avoid division by zero
+   if (time_duration_hours <= 0.0)
+      return 0.0;
+
+   // Calculate slope as percentage change per hour
+   double slope = percentage_change / time_duration_hours;
+
+   // Convert to angle in degrees
+   double angle_radians = MathArctan(slope);
+   double angle_degrees = angle_radians * 180.0 / M_PI;
+
+   return angle_degrees;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate angle from breakout point to current price             |
+//+------------------------------------------------------------------+
+double CalculateBreakoutAngle(double start_price, datetime start_time, double current_price)
+{
+   if (start_time == 0 || start_price == 0)
+      return 0.0;
+      
+   double elapsed_seconds = (double)(TimeCurrent() - start_time);
+   return CalculateSlopeAngleFromSeconds(start_price, current_price, elapsed_seconds);
 }
