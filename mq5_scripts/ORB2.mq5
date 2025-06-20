@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|               NY Cash Session ORB EA (30-minute)                  |
+//|       NY Cash Session ORB EA (1-minute + trend detection)        |
 //|     Handles PU Prime server UTC+2/UTC+3 and NY EST/EDT shift      |
 //|               Copyright 2025 - free to use / modify               |
 //+------------------------------------------------------------------+
@@ -19,7 +19,9 @@ input int SESSION_OR_MINUTES = 30;             // Opening-range length (minutes)
 input int NY_SESSION_CLOSE_HOUR = 16;          // NY Close hour (default 16:00 NY)
 
 // 2) Breakout / risk
-input double ATR_BUFFER_MULT = 0.2; // Buffer as ATR multiple
+input double RANGE_BUFFER_MULT = 0.2;   // Buffer as range fraction (replaces ATR buffer)
+input int TREND_CANDLES = 15;           // Number of candles for trend detection
+input double TREND_THRESHOLD = 0.6;     // Trend confirmation threshold (0.6 = 60% of candles must be in trend direction)
 
 // Stop loss placement strategy
 enum SLPlacement
@@ -103,12 +105,11 @@ datetime active_trading_session = 0; // Timestamp of the trading session we're c
 int bull_breakout_count = 0; // Count of consecutive bullish breakout candles
 int bear_breakout_count = 0; // Count of consecutive bearish breakout candles
 
+// ATR history for median calculation
+double atr_history[];
+
 // ATR handle for efficient indicator access
 int atr_handle = INVALID_HANDLE;
-
-// 🔧 ADD: Daily ATR median recalculation tracking
-datetime last_atr_median_calculation = 0;  // Track when ATR median was last calculated
-const int ATR_MEDIAN_RECALC_HOURS = 24;    // Recalculate every 24 hours
 
 // Time variables are now defined in the TIME VARIABLES section
 
@@ -272,30 +273,6 @@ void ComputeSession()
 }
 
 //+------------------------------------------------------------------+
-//| Log session details                                              |
-//+------------------------------------------------------------------+
-void LogSessionDetails()
-{
-   // Calculate offsets for logging only
-   int ny_time_offset = IsNYDST(TimeCurrent()) ? -4 : -5;      // EDT(-4) in summer, EST(-5) in winter
-   int srv_offset = (int)((TimeCurrent() - TimeGMT()) / 3600); // Current server offset
-
-   string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
-
-   if (DEBUG_LEVEL >= 2)
-   {
-      Print("Session window calculated: ", session_type_str);
-      Print("  Opening Range: ", TimeToString(current_session_start), " to ",
-            TimeToString(current_range_end), " (", SESSION_OR_MINUTES, " minutes)");
-      Print("  Trading Hours: ", TimeToString(current_session_start), " to ",
-            TimeToString(current_session_end), " (server time)");
-      Print("  Next session starts: ", TimeToString(next_session_start));
-      Print("  Current server UTC offset: ", srv_offset,
-            ", NY offset: ", ny_time_offset, ", using fixed ", NY_TIME_OFFSET, "h gap");
-   }
-}
-
-//+------------------------------------------------------------------+
 //| Expert init                                                      |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -336,10 +313,10 @@ int OnInit()
    }
 
    // Verify timeframe
-   if (_Period != PERIOD_M15)
+   if (_Period != PERIOD_M1)
    {
       if (DEBUG_LEVEL >= 1)
-         Print("Attach to a 15-minute chart for optimal performance.");
+         Print("Attach to a 1-minute chart for optimal performance.");
       // We'll continue but warn the user
    }
 
@@ -355,7 +332,8 @@ int OnInit()
       Print("Session: ", session_type_str);
       Print("Opening Range: ", SESSION_OR_MINUTES, " minutes");
       Print("Max Trades: ", MAX_TRADES_PER_DAY, " per day");
-      Print("Buffer: ATR × ", DoubleToString(ATR_BUFFER_MULT, 1));
+      Print("Buffer: Range × ", DoubleToString(RANGE_BUFFER_MULT, 1));
+      Print("Trend Detection: ", TREND_CANDLES, " candles, ", DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold");
       Print("Take Profit Type: Range Multiple");
    }
 
@@ -443,15 +421,15 @@ void ValidateTestData()
    // Check bars before, at, and after session start
    for (int offset = -2; offset <= 2; offset++)
    {
-      datetime check_time = current_session_start + offset * 900; // 15-minute bars
-      int bar_index = iBarShift(_Symbol, PERIOD_M15, check_time, false);
+      datetime check_time = current_session_start + offset * 60; // 1-minute bars
+      int bar_index = iBarShift(_Symbol, PERIOD_M1, check_time, false);
 
       if (bar_index >= 0)
       {
-         double close = iClose(_Symbol, PERIOD_M15, bar_index);
-         double open = iOpen(_Symbol, PERIOD_M15, bar_index);
-         double high = iHigh(_Symbol, PERIOD_M15, bar_index);
-         double low = iLow(_Symbol, PERIOD_M15, bar_index);
+         double close = iClose(_Symbol, PERIOD_M1, bar_index);
+         double open = iOpen(_Symbol, PERIOD_M1, bar_index);
+         double high = iHigh(_Symbol, PERIOD_M1, bar_index);
+         double low = iLow(_Symbol, PERIOD_M1, bar_index);
 
          if (DEBUG_LEVEL >= 3)
             Print("Bar found at ", TimeToString(check_time),
@@ -469,9 +447,9 @@ void ValidateTestData()
       }
    }
 
-   // Specifically check the first 15-minute bar of the session
+   // Specifically check the first 1-minute bar of the session
    datetime first_bar_time = current_session_start;
-   int first_bar_index = iBarShift(_Symbol, PERIOD_M15, first_bar_time, false);
+   int first_bar_index = iBarShift(_Symbol, PERIOD_M1, first_bar_time, false);
 
    if (first_bar_index >= 0)
    {
@@ -515,8 +493,7 @@ void OnTick()
    // Get current time - use once for efficiency
    datetime current_time = TimeCurrent();
 
-   // Check for new bar - only used for breakout detection
-   bool is_new_bar = IsNewBar();
+   // Note: We now use tick-based breakout detection for faster response
 
    // Recalculate session times - critical for accurate after-hours position management
    // Must run on every tick for reliability
@@ -617,8 +594,7 @@ void OnTick()
       break;
 
    case STATE_RANGE_LOCKED:
-      if (is_new_bar)
-         CheckBreakout(); // Only check on new bars
+      CheckBreakout(); // Check on every tick for faster detection
       break;
 
    case STATE_IN_POSITION:
@@ -772,10 +748,7 @@ void UpdateSessionState(datetime current_time)
                   DoubleToString(range_size / _Point, 0));
 
       // Check for breakout immediately after range is locked
-      if (IsNewBar())
-      {
-         CheckBreakout();
-      }
+      CheckBreakout();
    }
 }
 
@@ -827,31 +800,6 @@ void CheckVolatilityFilter()
                   ")");
       }
    }
-}
-
-//+------------------------------------------------------------------+
-//| Check if we have a new bar                                       |
-//+------------------------------------------------------------------+
-bool IsNewBar()
-{
-   static datetime last_bar_time = 0;
-   datetime current_bar_time = iTime(_Symbol, PERIOD_M15, 0);
-
-   if (current_bar_time != last_bar_time)
-   {
-      last_bar_time = current_bar_time;
-
-      // Only log new bar if debug level is high enough or during key periods
-      if (DEBUG_LEVEL >= 2 || trade_state == STATE_BUILDING_RANGE || trade_state == STATE_RANGE_LOCKED)
-      {
-         Print("NEW BAR DETECTED at ", TimeToString(current_bar_time),
-               ", session window: ", TimeToString(current_session_start), " to ", TimeToString(current_session_end),
-               ", state: ", GetStateString(trade_state));
-      }
-      return true;
-   }
-
-   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -914,8 +862,8 @@ void UpdateRange()
 {
    double high[], low[];
 
-   // Get the high/low of the most recent completed M15 bar
-   if (CopyHigh(_Symbol, PERIOD_M15, 1, 1, high) > 0 && CopyLow(_Symbol, PERIOD_M15, 1, 1, low) > 0)
+   // Get the high/low of the most recent completed M1 bar
+   if (CopyHigh(_Symbol, PERIOD_M1, 1, 1, high) > 0 && CopyLow(_Symbol, PERIOD_M1, 1, 1, low) > 0)
    {
       double h = high[0];
       double l = low[0];
@@ -938,11 +886,11 @@ void UpdateRange()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate ATR-based buffer points                                |
+//| Calculate Range-based buffer points                              |
 //+------------------------------------------------------------------+
-double CalculateATRBuffer()
+double CalculateRangeBuffer()
 {
-   return atr_value * ATR_BUFFER_MULT;
+   return range_size * RANGE_BUFFER_MULT;
 }
 
 //+------------------------------------------------------------------+
@@ -986,8 +934,8 @@ void DrawBox()
    string up_buffer_name = "ORB_UP_BUFFER";
    string dn_buffer_name = "ORB_DN_BUFFER";
 
-   // Calculate buffer using ATR
-   double buffer_points = CalculateATRBuffer();
+   // Calculate buffer using Range multiplier
+   double buffer_points = CalculateRangeBuffer();
 
    ObjectCreate(chart_id, up_buffer_name, OBJ_HLINE, 0, TimeCurrent(), range_high + buffer_points);
    ObjectSetInteger(chart_id, up_buffer_name, OBJPROP_COLOR, 0x00AAFF); // Light Blue
@@ -1021,7 +969,7 @@ void DrawBox()
 //+------------------------------------------------------------------+
 double CalculateBullBreakoutLevel()
 {
-   return range_high + CalculateATRBuffer();
+   return range_high + CalculateRangeBuffer();
 }
 
 //+------------------------------------------------------------------+
@@ -1029,7 +977,7 @@ double CalculateBullBreakoutLevel()
 //+------------------------------------------------------------------+
 double CalculateBearBreakoutLevel()
 {
-   return range_low - CalculateATRBuffer();
+   return range_low - CalculateRangeBuffer();
 }
 
 //+------------------------------------------------------------------+
@@ -1060,7 +1008,7 @@ void CheckBreakout()
 
    // Get current price data
    double close[1];
-   if (CopyClose(_Symbol, PERIOD_M15, 1, 1, close) <= 0)
+   if (CopyClose(_Symbol, PERIOD_M1, 1, 1, close) <= 0)
    {
       if (DEBUG_LEVEL >= 1)
          Print("Error getting close price for breakout check");
@@ -1070,7 +1018,7 @@ void CheckBreakout()
    // Calculate breakout levels using utility functions
    double bull_breakout_level = CalculateBullBreakoutLevel();
    double bear_breakout_level = CalculateBearBreakoutLevel();
-   double buffer_points = CalculateATRBuffer();
+   double buffer_points = CalculateRangeBuffer();
 
    LogBreakoutLevels(close[0], buffer_points, bull_breakout_level, bear_breakout_level);
 
@@ -1097,9 +1045,9 @@ void LogBreakoutLevels(double close, double buffer_points, double bull_level, do
 {
    if (DEBUG_LEVEL >= 2)
    {
-      Print("Using ATR buffer: ", DoubleToString(buffer_points, _Digits),
-            " (ATR=", DoubleToString(atr_value, _Digits),
-            " x ", DoubleToString(ATR_BUFFER_MULT, 2), ")");
+      Print("Using Range buffer: ", DoubleToString(buffer_points, _Digits),
+            " (Range=", DoubleToString(range_size, _Digits),
+            " x ", DoubleToString(RANGE_BUFFER_MULT, 2), ")");
 
       Print("BREAKOUT CHECK at ", TimeToString(TimeCurrent()));
       Print("  Bar close: ", DoubleToString(close, _Digits));
@@ -1115,11 +1063,32 @@ void LogBreakoutLevels(double close, double buffer_points, double bull_level, do
 //+------------------------------------------------------------------+
 void ProcessBullishBreakout(double close, double buffer_points)
 {
-   bull_breakout_count++;
+   // Check if trend is bullish - required for bullish breakout
+   if (!IsTrendBullish())
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("BULLISH BREAKOUT REJECTED: Trend not bullish enough (", 
+               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
+      
+      // Reset counters if trend doesn't support breakout
+      bull_breakout_count = 0;
+      return;
+   }
+   
+   // Use bar time to ensure we only count once per bar for confirmation
+   static datetime last_bull_bar_time = 0;
+   datetime current_bar_time = iTime(_Symbol, PERIOD_M1, 0);
+   
+   if (current_bar_time != last_bull_bar_time)
+   {
+      bull_breakout_count++;
+      last_bull_bar_time = current_bar_time;
+   }
+   
    bear_breakout_count = 0; // Reset bear count on bullish candle
 
    if (DEBUG_LEVEL >= 1)
-      Print("BULLISH BREAKOUT CANDLE: ", bull_breakout_count, "/", CONFIRMATION_CANDLES,
+      Print("BULLISH BREAKOUT + TREND CONFIRMED: ", bull_breakout_count, "/", CONFIRMATION_CANDLES,
             " | Close ", DoubleToString(close, _Digits),
             " > Range high ", DoubleToString(range_high, _Digits),
             " + Buffer ", DoubleToString(buffer_points, _Digits));
@@ -1128,7 +1097,7 @@ void ProcessBullishBreakout(double close, double buffer_points)
    if (bull_breakout_count >= CONFIRMATION_CANDLES)
    {
       if (DEBUG_LEVEL >= 1)
-         Print("CONFIRMED BULL BREAKOUT AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY");
+         Print("CONFIRMED BULL BREAKOUT + TREND AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY");
       SendOrder(ORDER_TYPE_BUY);
       bull_breakout_count = 0; // Reset counter after trade
    }
@@ -1139,11 +1108,32 @@ void ProcessBullishBreakout(double close, double buffer_points)
 //+------------------------------------------------------------------+
 void ProcessBearishBreakout(double close, double buffer_points)
 {
-   bear_breakout_count++;
+   // Check if trend is bearish - required for bearish breakout
+   if (!IsTrendBearish())
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("BEARISH BREAKOUT REJECTED: Trend not bearish enough (", 
+               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
+      
+      // Reset counters if trend doesn't support breakout
+      bear_breakout_count = 0;
+      return;
+   }
+   
+   // Use bar time to ensure we only count once per bar for confirmation
+   static datetime last_bear_bar_time = 0;
+   datetime current_bar_time = iTime(_Symbol, PERIOD_M1, 0);
+   
+   if (current_bar_time != last_bear_bar_time)
+   {
+      bear_breakout_count++;
+      last_bear_bar_time = current_bar_time;
+   }
+   
    bull_breakout_count = 0; // Reset bull count on bearish candle
 
    if (DEBUG_LEVEL >= 1)
-      Print("BEARISH BREAKOUT CANDLE: ", bear_breakout_count, "/", CONFIRMATION_CANDLES,
+      Print("BEARISH BREAKOUT + TREND CONFIRMED: ", bear_breakout_count, "/", CONFIRMATION_CANDLES,
             " | Close ", DoubleToString(close, _Digits),
             " < Range low ", DoubleToString(range_low, _Digits),
             " - Buffer ", DoubleToString(buffer_points, _Digits));
@@ -1152,7 +1142,7 @@ void ProcessBearishBreakout(double close, double buffer_points)
    if (bear_breakout_count >= CONFIRMATION_CANDLES)
    {
       if (DEBUG_LEVEL >= 1)
-         Print("CONFIRMED BEAR BREAKOUT AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL");
+         Print("CONFIRMED BEAR BREAKOUT + TREND AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL");
       SendOrder(ORDER_TYPE_SELL);
       bear_breakout_count = 0; // Reset counter after trade
    }
@@ -1304,174 +1294,116 @@ double CalculateTakeProfit(ENUM_ORDER_TYPE type, double entry_price)
 //+------------------------------------------------------------------+
 double CalculateLotSize(double entry_price, double stop_loss)
 {
-   double risk_amt = AccountInfoDouble(ACCOUNT_EQUITY) * RISK_PER_TRADE_PCT / 100.0;
+   // Get account equity and calculate risk amount
+   double account_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double risk_amt = account_equity * RISK_PER_TRADE_PCT / 100.0;
+   
+   // Calculate stop loss distance in points
    double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
    string symbol = _Symbol;
-
-   // Symbol-specific lot size calculation for accurate 1% risk
+   
+   // Calculate lots based on instrument type
    double lots = 0;
-
-   if (StringFind(symbol, "XAUUSD") >= 0 || StringFind(symbol, "GOLD") >= 0)
+   
+   // Convert symbol to uppercase for case-insensitive comparison
+   string symbol_upper = symbol;
+   StringToUpper(symbol_upper);
+   
+   if (StringFind(symbol_upper, "XAUUSD") >= 0 || StringFind(symbol_upper, "GOLD") >= 0)
    {
-      // GOLD: Standard lot = 100 oz, 1 pip = $0.01, pip value = $1.00 per lot
-      double sl_dist_pips = sl_dist_pts; // Gold: 1 pip = 1 point (2 decimals)
-      double pip_value_per_lot = 1.00;   // $1 per pip per lot
-      lots = risk_amt / (sl_dist_pips * pip_value_per_lot);
+      // Gold: Each point = $1 for CFD
+      double point_value = 1.0;
+      lots = risk_amt / (sl_dist_pts * point_value);
    }
-   else if (StringFind(symbol, "USDJPY") >= 0)
+   else if (StringFind(symbol_upper, "NAS100") >= 0 || StringFind(symbol_upper, "NAS") >= 0 ||
+            StringFind(symbol_upper, "SP500") >= 0 || StringFind(symbol_upper, "SPX") >= 0 || 
+            StringFind(symbol_upper, "DJ30") >= 0 || StringFind(symbol_upper, "DOW") >= 0)
    {
-      // USDJPY: Standard lot = 100,000, 1 pip = 0.01, pip value varies with price
-      double sl_dist_pips = sl_dist_pts / 10.0;                   // JPY: 1 pip = 10 points (3 decimals)
-      double pip_value_per_lot = (0.01 / entry_price) * 100000.0; // Dynamic pip value
-      lots = risk_amt / (sl_dist_pips * pip_value_per_lot);
+      // Index CFDs: Each point = $1 for CFD at PU Prime
+      double point_value = 1.0;
+      lots = risk_amt / (sl_dist_pts * point_value);
    }
-   else if (StringFind(symbol, "EURUSD") >= 0 || StringFind(symbol, "GBPUSD") >= 0)
+   else if (StringFind(symbol_upper, "EURUSD") >= 0 || StringFind(symbol_upper, "GBPUSD") >= 0 || 
+            StringFind(symbol_upper, "AUDUSD") >= 0 || StringFind(symbol_upper, "NZDUSD") >= 0)
    {
-      // EURUSD/GBPUSD: Standard lot = 100,000, 1 pip = 0.0001, pip value = $10.00 per lot
-      double sl_dist_pips = sl_dist_pts / 10.0; // Major pairs: 1 pip = 10 points (5 decimals)
-      double pip_value_per_lot = 10.00;         // $10 per pip per lot
-      lots = risk_amt / (sl_dist_pips * pip_value_per_lot);
+      // USD pairs: Each pip = $10 per standard lot
+      double sl_dist_pips = sl_dist_pts / 10.0;
+      double pip_value = 10.0;
+      lots = risk_amt / (sl_dist_pips * pip_value);
    }
-   else if (StringFind(symbol, "SP500") >= 0 || StringFind(symbol, "SPX") >= 0)
+   else if (StringFind(symbol_upper, "USDJPY") >= 0)
    {
-      // S&P 500: Standard lot = 1 contract, 1 point = $1.00 per contract
-      double sl_dist_points = sl_dist_pts;    // SP500: 1 point = 1 point
-      double point_value_per_contract = 1.00; // $1 per point per contract
-      lots = risk_amt / (sl_dist_points * point_value_per_contract);
+      // JPY pairs: Each pip = ¥1000 per standard lot
+      double sl_dist_pips = sl_dist_pts / 100.0;
+      double pip_value = (1000.0 / entry_price);
+      lots = risk_amt / (sl_dist_pips * pip_value);
    }
-   else if (StringFind(symbol, "NAS100") >= 0 || StringFind(symbol, "NDX") >= 0)
+   
+   // Normalize lot size to broker requirements
+   // First round to lot_step precision
+   int lot_step_decimals = 0;
+   double temp_step = lot_step;
+   while (temp_step < 1.0 && temp_step > 0)
    {
-      // NASDAQ 100: Standard lot = 1 contract, 1 point = $1.00 per contract
-      double sl_dist_points = sl_dist_pts;    // NAS100: 1 point = 1 point
-      double point_value_per_contract = 1.00; // $1 per point per contract
-      lots = risk_amt / (sl_dist_points * point_value_per_contract);
+      lot_step_decimals++;
+      temp_step *= 10;
    }
-   else if (StringFind(symbol, "DJ30") >= 0 || StringFind(symbol, "DJI") >= 0)
-   {
-      // Dow Jones 30: Standard lot = 1 contract, 1 point = $1.00 per contract
-      double sl_dist_points = sl_dist_pts;    // DJ30: 1 point = 1 point
-      double point_value_per_contract = 1.00; // $1 per point per contract
-      lots = risk_amt / (sl_dist_points * point_value_per_contract);
-   }
-   else
-   {
-      // Fallback for unknown symbols - use broker data with warning
-      double tick_val = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-      lots = risk_amt / ((sl_dist_pts * _Point / tick_size) * tick_val);
-
-      if (DEBUG_LEVEL >= 1)
-         Print("WARNING: Unknown symbol ", symbol, " - using broker data (may be inaccurate)");
-   }
-
-   // Normalize to broker's lot step
-   lots = NormalizeDouble(lots / lot_step, 0) * lot_step;
+   
+   lots = NormalizeDouble(lots / lot_step, lot_step_decimals) * lot_step;
+   lots = NormalizeDouble(lots, lot_step_decimals); // Ensure final value is properly rounded
+   
    // Ensure minimum lot size
-   lots = MathMax(lot_min, lots);
-
-   // Verification: Calculate actual risk with final lot size
-   double actual_risk = 0;
-   if (StringFind(symbol, "XAUUSD") >= 0 || StringFind(symbol, "GOLD") >= 0)
-      actual_risk = lots * sl_dist_pts * 1.00;
-   else if (StringFind(symbol, "USDJPY") >= 0)
-      actual_risk = lots * (sl_dist_pts / 10.0) * ((0.01 / entry_price) * 100000.0);
-   else if (StringFind(symbol, "EURUSD") >= 0 || StringFind(symbol, "GBPUSD") >= 0)
-      actual_risk = lots * (sl_dist_pts / 10.0) * 10.00;
-   else if (StringFind(symbol, "SP500") >= 0 || StringFind(symbol, "NAS100") >= 0 || StringFind(symbol, "DJ30") >= 0)
-      actual_risk = lots * sl_dist_pts * 1.00;
-
-   double actual_risk_pct = (actual_risk / AccountInfoDouble(ACCOUNT_EQUITY)) * 100.0;
-
-   if (DEBUG_LEVEL >= 1)
+   lots = MathMax(lots, lot_min);
+   
+   // Debug logging
+   if (DEBUG_LEVEL >= 1) // Changed to level 1 to see more info about lot calculations
    {
-      Print("=== SYMBOL-SPECIFIC LOT SIZE CALCULATION ===");
-      Print("Symbol: ", symbol);
-      Print("Account equity: $", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
-      Print("Target risk: $", DoubleToString(risk_amt, 2), " (", DoubleToString(RISK_PER_TRADE_PCT, 1), "%)");
-      Print("Stop loss distance: ", DoubleToString(sl_dist_pts, 1), " points");
-      Print("Calculated lots: ", DoubleToString(lots, 5));
-      Print("ACTUAL RISK: $", DoubleToString(actual_risk, 2), " (", DoubleToString(actual_risk_pct, 2), "%)");
-      Print("=========================================");
+      Print("=== LOT SIZE CALCULATION ===");
+      Print("Account equity: $", DoubleToString(account_equity, 2));
+      Print("Risk amount: $", DoubleToString(risk_amt, 2));
+      Print("Stop loss distance in points: ", DoubleToString(sl_dist_pts, 1));
+      Print("Lot step decimals: ", lot_step_decimals);
+      Print("Raw lot size: ", DoubleToString(lots, lot_step_decimals));
+      Print("Normalized lot size: ", DoubleToString(lots, lot_step_decimals));
+      Print("Minimum lot: ", DoubleToString(lot_min, lot_step_decimals));
+      Print("Lot step: ", DoubleToString(lot_step, lot_step_decimals));
+      Print("Actual risk: $", DoubleToString(CalculateActualRisk(lots, entry_price, stop_loss), 2));
+      Print("========================");
    }
-
+   
    return lots;
 }
 
-//+------------------------------------------------------------------+
-//| Get symbol-specific pip value per standard lot                   |
-//+------------------------------------------------------------------+
-double GetSymbolPipValue(string symbol, double current_price)
+// Calculate actual risk amount for verification
+double CalculateActualRisk(double lots, double entry_price, double stop_loss)
 {
-   // Calculate proper pip value based on symbol characteristics
-
-   if (StringFind(symbol, "JPY") >= 0) // JPY pairs
+   string symbol = _Symbol;
+   string symbol_upper = symbol;
+   StringToUpper(symbol_upper);
+   double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
+   double actual_risk = 0;
+   
+   if (StringFind(symbol_upper, "XAUUSD") >= 0 || StringFind(symbol_upper, "GOLD") >= 0)
    {
-      // For JPY pairs: 1 pip = 0.01, standard lot = 100,000 units
-      // Pip value = (0.01 / current_price) * 100,000
-      double pip_val = (0.01 / current_price) * 100000.0;
-
-      if (DEBUG_LEVEL >= 1)
-         Print("JPY pair detected - calculated pip value: $", DoubleToString(pip_val, 2));
-
-      return pip_val;
+      actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
    }
-   else if (StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0) // Gold
+   else if (StringFind(symbol_upper, "NAS100") >= 0 || StringFind(symbol_upper, "NAS") >= 0 ||
+            StringFind(symbol_upper, "SP500") >= 0 || StringFind(symbol_upper, "SPX") >= 0 || 
+            StringFind(symbol_upper, "DJ30") >= 0 || StringFind(symbol_upper, "DOW") >= 0)
    {
-      // For gold: 1 pip = 0.01, standard lot = 100 oz
-      // Pip value = 0.01 * 100 = $1.00 per pip
-      double pip_val = 1.00;
-
-      if (DEBUG_LEVEL >= 1)
-         Print("Gold detected - using standard pip value: $", DoubleToString(pip_val, 2));
-
-      return pip_val;
+      actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
    }
-   else // Major forex pairs (EUR, GBP, AUD, etc. vs USD)
+   else if (StringFind(symbol_upper, "EURUSD") >= 0 || StringFind(symbol_upper, "GBPUSD") >= 0 || 
+            StringFind(symbol_upper, "AUDUSD") >= 0 || StringFind(symbol_upper, "NZDUSD") >= 0)
    {
-      // For major pairs: 1 pip = 0.0001, standard lot = 100,000 units
-      if (StringFind(symbol, "USD") == 0) // USD is base currency (like USDCAD)
-      {
-         // Pip value = (0.0001 / current_price) * 100,000
-         double pip_val = (0.0001 / current_price) * 100000.0;
-
-         if (DEBUG_LEVEL >= 1)
-            Print("USD base pair detected - calculated pip value: $", DoubleToString(pip_val, 2));
-
-         return pip_val;
-      }
-      else // USD is quote currency (like EURUSD, GBPUSD)
-      {
-         // Pip value = 0.0001 * 100,000 = $10.00 per pip
-         double pip_val = 10.00;
-
-         if (DEBUG_LEVEL >= 1)
-            Print("USD quote pair detected - using standard pip value: $", DoubleToString(pip_val, 2));
-
-         return pip_val;
-      }
+      actual_risk = lots * (sl_dist_pts / 10.0) * 10.0; // $10 per pip
    }
-}
-
-//+------------------------------------------------------------------+
-//| Convert point distance to pip distance                           |
-//+------------------------------------------------------------------+
-double GetSymbolPipDistance(string symbol, double point_distance)
-{
-   if (StringFind(symbol, "JPY") >= 0) // JPY pairs
+   else if (StringFind(symbol_upper, "USDJPY") >= 0)
    {
-      // JPY pairs: 3 decimals, 1 pip = 10 points
-      return point_distance / 10.0;
+      actual_risk = lots * (sl_dist_pts / 100.0) * (1000.0 / entry_price);
    }
-   else if (StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0) // Gold
-   {
-      // Gold: 2 decimals, 1 pip = 1 point
-      return point_distance;
-   }
-   else // Major forex pairs
-   {
-      // Major pairs: 5 decimals, 1 pip = 10 points
-      return point_distance / 10.0;
-   }
+   
+   return actual_risk;
 }
 
 //+------------------------------------------------------------------+
@@ -1764,7 +1696,7 @@ void ShowLabel()
    string session_type_str = (SESSION_TYPE == CLASSIC_NYSE) ? "NYSE Open (9:30 NY)" : "Early US (8:00 NY)";
 
    // Format buffer info
-   string buffer_info = "ATR(" + IntegerToString(ATR_PERIOD) + ") × " + DoubleToString(ATR_BUFFER_MULT, 1);
+   string buffer_info = "Range " + DoubleToString(RANGE_BUFFER_MULT, 1) + "×Size";
 
    // Format take profit info
    string tp_info = "Range " + DoubleToString(RANGE_MULT, 1) + "×Size";
@@ -1814,39 +1746,12 @@ void UpdateATR()
    // Get current ATR value (from previous completed bar)
    atr_value = atr_buff[1];
 
-   // 🔧 IMPROVED: Calculate median ATR with daily recalculation
-   datetime current_time = TimeCurrent();
-   bool should_recalculate = false;
-   
-   // Trigger recalculation if:
-   // 1. Never calculated before (atr_median <= 0), OR
-   // 2. More than 24 hours since last calculation, OR  
-   // 3. Volatility filter is enabled and we need the median
-   if (USE_VOLATILITY_FILTER && 
-       (atr_median <= 0 || 
-        last_atr_median_calculation == 0 || 
-        current_time - last_atr_median_calculation >= ATR_MEDIAN_RECALC_HOURS * 3600))
+   // Calculate median ATR if we don't have it yet or need to recalculate
+   if (atr_median <= 0 && USE_VOLATILITY_FILTER)
    {
-      should_recalculate = true;
-      
-      if (DEBUG_LEVEL >= 1)
-      {
-         if (atr_median <= 0)
-            Print("🔄 ATR MEDIAN: Initial calculation");
-         else
-            Print("🔄 ATR MEDIAN: Daily recalculation (last: ", 
-                  TimeToString(last_atr_median_calculation), ")");
-      }
-   }
-   
-   if (should_recalculate)
-   {
-      // Store previous median for comparison
-      double previous_median = atr_median;
-      
       // For median calculation we need a longer ATR history
-      // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 26 fifteen-minute bars per day
-      int bars_per_trading_day = 26;
+      // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 390 one-minute bars per day
+      int bars_per_trading_day = 390;
       int bars_needed = ATR_MEDIAN_DAYS * bars_per_trading_day;
 
       // Make sure we don't request more bars than available
@@ -1862,53 +1767,29 @@ void UpdateATR()
          return;
       }
 
-      // Use local array to avoid memory persistence issues
-      double local_atr_history[];
-      ArrayResize(local_atr_history, bars_needed);
+      // Get ATR values for the period
+      ArrayResize(atr_history, bars_needed);
 
-      if (CopyBuffer(atr_handle, 0, 0, bars_needed, local_atr_history) <= 0)
+      if (CopyBuffer(atr_handle, 0, 0, bars_needed, atr_history) <= 0)
       {
          if (DEBUG_LEVEL >= 1)
             Print("Error getting ATR history: ", GetLastError());
-         
-         // Clean up local array
-         ArrayFree(local_atr_history);
          return;
       }
 
       // Sort the array to find median
-      ArraySort(local_atr_history);
+      ArraySort(atr_history);
 
       // Median is the middle value (or average of the two middle values)
       int middle = bars_needed / 2;
       if (bars_needed % 2 == 0) // Even number of elements
-         atr_median = (local_atr_history[middle - 1] + local_atr_history[middle]) / 2.0;
+         atr_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
       else // Odd number of elements
-         atr_median = local_atr_history[middle];
+         atr_median = atr_history[middle];
 
-      // Update the last calculation timestamp
-      last_atr_median_calculation = current_time;
-      
-      // Clean up local array immediately
-      ArrayFree(local_atr_history);
-
-      // Log the result with change tracking
       if (DEBUG_LEVEL >= 1)
-      {
-         if (previous_median > 0)
-         {
-            double change_pct = ((atr_median - previous_median) / previous_median) * 100.0;
-            Print("✅ ATR MEDIAN UPDATED: ", DoubleToString(atr_median, _Digits), 
-                  " (was: ", DoubleToString(previous_median, _Digits), 
-                  ", change: ", DoubleToString(change_pct, 1), "%) from ", 
-                  bars_needed, " bars (", ATR_MEDIAN_DAYS, " days)");
-         }
-         else
-         {
-            Print("✅ ATR MEDIAN CALCULATED: ", DoubleToString(atr_median, _Digits), 
-                  " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
-         }
-      }
+         Print("ATR median calculated: ", DoubleToString(atr_median, _Digits),
+               " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
    }
 }
 
@@ -2038,49 +1919,59 @@ void ManageAfterHoursPos()
 //+------------------------------------------------------------------+
 double OnTester()
 {
-   // Get basic trading statistics
-   double profit = TesterStatistics(STAT_PROFIT);
-   double drawdown = TesterStatistics(STAT_BALANCE_DD);
-   double max_drawdown_pct = TesterStatistics(STAT_BALANCE_DDREL_PERCENT); // Max drawdown as percentage
-   double trades = TesterStatistics(STAT_TRADES);
-   double profit_factor = TesterStatistics(STAT_PROFIT_FACTOR);
-   double sharpe_ratio = TesterStatistics(STAT_SHARPE_RATIO);
-
-   // If no trades or negative profit, return worst possible value
-   if (trades == 0 || profit <= 0)
-      return 0;
-
-   // If drawdown is zero, adjust to small value to avoid division by zero
-   if (drawdown == 0)
-      drawdown = 0.01;
-
-   // Heavily penalize high drawdowns (>50%)
-   double drawdown_multiplier = 1.0;
-   if (max_drawdown_pct > 50)
-      drawdown_multiplier = 0.1; // Severe penalty but not complete rejection
-
-   // Profit is the dominant factor - use a much higher power to emphasize it
-   double profit_weight = 4.0; // Extremely high weight for profit
-
-   // Drawdown is minor factor - use very small penalty
-   double drawdown_penalty = 1; // Minimal impact from drawdown
-
-   // Core formula: Massively prioritize profit, with minimal drawdown impact
-   // Profit^4 makes profit extremely dominant
-   double custom_criterion = MathPow(profit, profit_weight) / MathPow(drawdown, drawdown_penalty);
-
-   // Profit factor enhances profit emphasis
-   if (profit_factor > 1.0)
-      custom_criterion *= profit_factor;
-
-   // For similar profit strategies, give minimal consideration to other factors
-   double min_trades_target = 300; // Lower minimum for statistical significance
-
-   // Trade count multiplier - reaches 1.0 at min_trades_target
-   double trade_multiplier = MathMin(1.0, trades / min_trades_target);
-
-   // Final score - completely dominated by profit with minimal consideration for drawdown
-   return custom_criterion * trade_multiplier * drawdown_multiplier;
+   // Get backtest statistics
+   double total_trades = TesterStatistics(STAT_TRADES);
+   double gross_profit = TesterStatistics(STAT_GROSS_PROFIT);
+   double gross_loss = TesterStatistics(STAT_GROSS_LOSS);
+   double net_profit = TesterStatistics(STAT_PROFIT);
+   double max_drawdown = TesterStatistics(STAT_BALANCE_DD);
+   double initial_deposit = TesterStatistics(STAT_INITIAL_DEPOSIT);
+   
+   // Avoid division by zero and reject invalid data
+   if (total_trades < 5 || initial_deposit <= 0)
+      return 0.0;
+   
+   // Immediately reject zero or negative profit strategies
+   if (net_profit <= 0.0)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("OPTIMIZATION REJECTED: Zero or negative profit (", DoubleToString(net_profit, 2), ")");
+      return 0.0;
+   }
+   
+   double roi_percent = (net_profit / initial_deposit) * 100.0;
+   double drawdown_percent = (max_drawdown / initial_deposit) * 100.0;
+   
+   // SIMPLE FITNESS: High profit + Low drawdown + More trades
+   
+   // Base score: Profit adjusted for drawdown
+   double profit_score;
+   if (drawdown_percent > 0.1)  // Only adjust if meaningful drawdown (>0.1%)
+      profit_score = net_profit / drawdown_percent;  // Dollar profit per % drawdown
+   else
+      profit_score = net_profit * 100.0;  // Zero/tiny drawdown = multiply profit by 100 (huge bonus)
+   
+   // Trade multiplier: More trades = better (with diminishing returns)
+   double trade_multiplier = MathLog(total_trades + 1);  // Log scale to prevent explosion
+   
+   // Final fitness: Profit efficiency × Trade activity
+   double fitness = profit_score * trade_multiplier;
+   
+   // Debug output for optimization
+   if (DEBUG_LEVEL >= 1)
+   {
+      Print("=== SIMPLE OPTIMIZATION RESULTS ===");
+      Print("Total Trades: ", (int)total_trades);
+      Print("Net Profit: $", DoubleToString(net_profit, 2));
+      Print("ROI: ", DoubleToString(roi_percent, 2), "%");
+      Print("Max Drawdown: ", DoubleToString(drawdown_percent, 2), "%");
+      Print("Profit Score: ", DoubleToString(profit_score, 2));
+      Print("Trade Multiplier: ", DoubleToString(trade_multiplier, 2));
+      Print("FINAL FITNESS: ", DoubleToString(fitness, 2));
+      Print("===================================");
+   }
+   
+   return fitness;
 }
 
 //+------------------------------------------------------------------+
@@ -2164,3 +2055,73 @@ int GetSymbolSlippage()
 }
 
 //+------------------------------------------------------------------+
+//| Detect trend direction based on recent candle closes             |
+//+------------------------------------------------------------------+
+bool IsTrendBullish()
+{
+   double closes[];
+   if (CopyClose(_Symbol, PERIOD_M1, 0, TREND_CANDLES, closes) != TREND_CANDLES)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting close prices for trend detection");
+      return false; // Default to no trend if data unavailable
+   }
+   
+   int bullish_candles = 0;
+   int bearish_candles = 0;
+   
+   // Analyze candle closes - compare each candle with the previous one
+   for (int i = 1; i < TREND_CANDLES; i++)
+   {
+      if (closes[i] > closes[i-1])
+         bullish_candles++;
+      else if (closes[i] < closes[i-1])
+         bearish_candles++;
+      // Equal closes are ignored (neutral)
+   }
+   
+   int total_directional_candles = bullish_candles + bearish_candles;
+   if (total_directional_candles == 0) return false; // No trend if all closes are equal
+   
+   double bullish_percentage = (double)bullish_candles / total_directional_candles;
+   
+   if (DEBUG_LEVEL >= 2)
+   {
+      Print("TREND ANALYSIS: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ", 
+            total_directional_candles, " directional candles (", 
+            DoubleToString(bullish_percentage * 100, 1), "% bullish)");
+   }
+   
+   return bullish_percentage >= TREND_THRESHOLD;
+}
+
+bool IsTrendBearish()
+{
+   double closes[];
+   if (CopyClose(_Symbol, PERIOD_M1, 0, TREND_CANDLES, closes) != TREND_CANDLES)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting close prices for trend detection");
+      return false; // Default to no trend if data unavailable
+   }
+   
+   int bullish_candles = 0;
+   int bearish_candles = 0;
+   
+   // Analyze candle closes - compare each candle with the previous one
+   for (int i = 1; i < TREND_CANDLES; i++)
+   {
+      if (closes[i] > closes[i-1])
+         bullish_candles++;
+      else if (closes[i] < closes[i-1])
+         bearish_candles++;
+      // Equal closes are ignored (neutral)
+   }
+   
+   int total_directional_candles = bullish_candles + bearish_candles;
+   if (total_directional_candles == 0) return false; // No trend if all closes are equal
+   
+   double bearish_percentage = (double)bearish_candles / total_directional_candles;
+   
+   return bearish_percentage >= TREND_THRESHOLD;
+}

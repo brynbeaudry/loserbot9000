@@ -1314,33 +1314,38 @@ double CalculateLotSize(double entry_price, double stop_loss)
    // Calculate lots based on instrument type
    double lots = 0;
    
-   if (StringFind(symbol, "XAUUSD") >= 0)
+   // Convert symbol to uppercase for case-insensitive comparison
+   string symbol_upper = symbol;
+   StringToUpper(symbol_upper);
+   
+   if (StringFind(symbol_upper, "XAUUSD") >= 0 || StringFind(symbol_upper, "GOLD") >= 0)
    {
       // Gold: Each point = $1 for CFD
       double point_value = 1.0;
       lots = risk_amt / (sl_dist_pts * point_value);
    }
-   else if (StringFind(symbol, "EURUSD") >= 0 || StringFind(symbol, "GBPUSD") >= 0 || 
-            StringFind(symbol, "AUDUSD") >= 0 || StringFind(symbol, "NZDUSD") >= 0)
+   else if (StringFind(symbol_upper, "NAS100") >= 0 || StringFind(symbol_upper, "NAS") >= 0 ||
+            StringFind(symbol_upper, "SP500") >= 0 || StringFind(symbol_upper, "SPX") >= 0 || 
+            StringFind(symbol_upper, "DJ30") >= 0 || StringFind(symbol_upper, "DOW") >= 0)
+   {
+      // Index CFDs: Each point = $1 for CFD at PU Prime
+      double point_value = 1.0;
+      lots = risk_amt / (sl_dist_pts * point_value);
+   }
+   else if (StringFind(symbol_upper, "EURUSD") >= 0 || StringFind(symbol_upper, "GBPUSD") >= 0 || 
+            StringFind(symbol_upper, "AUDUSD") >= 0 || StringFind(symbol_upper, "NZDUSD") >= 0)
    {
       // USD pairs: Each pip = $10 per standard lot
       double sl_dist_pips = sl_dist_pts / 10.0;
       double pip_value = 10.0;
       lots = risk_amt / (sl_dist_pips * pip_value);
    }
-   else if (StringFind(symbol, "USDJPY") >= 0)
+   else if (StringFind(symbol_upper, "USDJPY") >= 0)
    {
       // JPY pairs: Each pip = ¥1000 per standard lot
       double sl_dist_pips = sl_dist_pts / 100.0;
       double pip_value = (1000.0 / entry_price);
       lots = risk_amt / (sl_dist_pips * pip_value);
-   }
-   else if (StringFind(symbol, "NAS100") >= 0 || StringFind(symbol, "SP500") >= 0 || 
-            StringFind(symbol, "DJ30") >= 0)
-   {
-      // Index CFDs: Each point = $1 for CFD at PU Prime
-      double point_value = 1.0;
-      lots = risk_amt / (sl_dist_pts * point_value);
    }
    
    // Normalize lot size to broker requirements
@@ -1382,26 +1387,29 @@ double CalculateLotSize(double entry_price, double stop_loss)
 double CalculateActualRisk(double lots, double entry_price, double stop_loss)
 {
    string symbol = _Symbol;
+   string symbol_upper = symbol;
+   StringToUpper(symbol_upper);
    double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
    double actual_risk = 0;
    
-   if (StringFind(symbol, "XAUUSD") >= 0)
+   if (StringFind(symbol_upper, "XAUUSD") >= 0 || StringFind(symbol_upper, "GOLD") >= 0)
    {
       actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
    }
-   else if (StringFind(symbol, "EURUSD") >= 0 || StringFind(symbol, "GBPUSD") >= 0 || 
-            StringFind(symbol, "AUDUSD") >= 0 || StringFind(symbol, "NZDUSD") >= 0)
+   else if (StringFind(symbol_upper, "NAS100") >= 0 || StringFind(symbol_upper, "NAS") >= 0 ||
+            StringFind(symbol_upper, "SP500") >= 0 || StringFind(symbol_upper, "SPX") >= 0 || 
+            StringFind(symbol_upper, "DJ30") >= 0 || StringFind(symbol_upper, "DOW") >= 0)
+   {
+      actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
+   }
+   else if (StringFind(symbol_upper, "EURUSD") >= 0 || StringFind(symbol_upper, "GBPUSD") >= 0 || 
+            StringFind(symbol_upper, "AUDUSD") >= 0 || StringFind(symbol_upper, "NZDUSD") >= 0)
    {
       actual_risk = lots * (sl_dist_pts / 10.0) * 10.0; // $10 per pip
    }
-   else if (StringFind(symbol, "USDJPY") >= 0)
+   else if (StringFind(symbol_upper, "USDJPY") >= 0)
    {
       actual_risk = lots * (sl_dist_pts / 100.0) * (1000.0 / entry_price);
-   }
-   else if (StringFind(symbol, "NAS100") >= 0 || StringFind(symbol, "SP500") >= 0 || 
-            StringFind(symbol, "DJ30") >= 0)
-   {
-      actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
    }
    
    return actual_risk;
