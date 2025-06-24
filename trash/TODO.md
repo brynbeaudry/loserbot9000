@@ -45,3 +45,12 @@
 - Search github repos of bots to convert to this system and try out.
 - https://github.com/ryu878/Bybit-BTCUSD-Inverse-Perpetual-Scalp-Trading-Bot/blob/main/inverse_bot_v5.0.py
 --> Make it lame and gay. Turn it into AI slop
+
+
+## xml to csv powershell
+
+.\convert_xml_to_csv.ps1 -FileName .\ReportOptimizer-797241-05-29-1.xml
+
+cd '.\Documents\MT5 Optimizer Reports\'
+
+.\convert_xml_to_csv.ps1

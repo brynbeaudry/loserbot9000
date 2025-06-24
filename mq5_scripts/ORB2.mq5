@@ -19,9 +19,9 @@ input int SESSION_OR_MINUTES = 30;             // Opening-range length (minutes)
 input int NY_SESSION_CLOSE_HOUR = 16;          // NY Close hour (default 16:00 NY)
 
 // 2) Breakout / risk
-input double RANGE_BUFFER_MULT = 0.2;   // Buffer as range fraction (replaces ATR buffer)
-input int TREND_CANDLES = 15;           // Number of candles for trend detection
-input double TREND_THRESHOLD = 0.6;     // Trend confirmation threshold (0.6 = 60% of candles must be in trend direction)
+input double RANGE_BUFFER_MULT = 0.2; // Buffer as range fraction (replaces ATR buffer)
+input int TREND_CANDLES = 15;         // Number of candles for trend detection
+input double TREND_THRESHOLD = 0.6;   // Trend confirmation threshold (0.6 = 60% of candles must be in trend direction)
 
 // Stop loss placement strategy
 enum SLPlacement
@@ -53,8 +53,7 @@ input int ATR_MEDIAN_DAYS = 120;         // ATR Median Days - Keep 120 days (6 m
 // For sell orders: TP = entry - (range_size × RANGE_MULT)
 //
 input double RANGE_MULT = 1.0;                     // Keep 1.0 for balanced risk:reward; lower to 0.5-0.8 for faster but smaller profits; raise to 1.5-2.0 for larger but slower profits
-input int CONFIRMATION_CANDLES = 1;                // Candles required to confirm breakout (1=immediate, 2+=more conservative)
-input double MIN_BREAKOUT_ANGLE = 75.0;             // Minimum angle from breakout point to current price (degrees, 0=disabled)
+input double MIN_BREAKOUT_ANGLE = 75.0;            // Minimum angle from breakout point to current price (degrees, 0=disabled)
 input bool ALLOW_TP_AFTER_HOURS = false;           // Allow positions to reach TP after session close (will close before next session)
 input int CLOSE_MINUTES_BEFORE_NEXT_SESSION = 120; // Minutes before next session to close after-hours positions (only applies if ALLOW_TP_AFTER_HOURS is true)
 
@@ -103,12 +102,11 @@ int trades_today = 0;
 datetime active_trading_session = 0; // Timestamp of the trading session we're currently operating in
 
 // Breakout confirmation tracking
-int bull_breakout_count = 0; // Count of consecutive bullish breakout candles
-int bear_breakout_count = 0; // Count of consecutive bearish breakout candles
+// REMOVED: breakout counters - using simple buffer crossing instead
 
 // Angle-based breakout tracking
-double breakout_start_price = 0;    // Price when breakout started
-datetime breakout_start_time = 0;   // Time when breakout started
+double breakout_start_price = 0;  // Price when breakout started
+datetime breakout_start_time = 0; // Time when breakout started
 
 // ATR history for median calculation
 double atr_history[];
@@ -117,7 +115,7 @@ double atr_history[];
 int atr_handle = INVALID_HANDLE;
 
 // Current live price for trend detection (set in CheckBreakout)
-double price = 0;  
+double price = 0;
 
 // Time variables are now defined in the TIME VARIABLES section
 
@@ -777,11 +775,7 @@ void InitializeRangeValues()
    // Reset range size
    range_size = 0;
 
-   // Reset breakout confirmation counters
-   bull_breakout_count = 0;
-   bear_breakout_count = 0;
-   
-   // Reset angle-based breakout tracking
+   // Reset breakout tracking (counters removed - using simple buffer crossing)
    ResetBreakoutTracking();
 
    // Reset box drawing flag
@@ -858,9 +852,7 @@ void ResetSession()
    range_high = RANGE_HIGH_INIT;
    range_low = RANGE_LOW_INIT;
 
-   // Reset breakout confirmation counters
-   bull_breakout_count = 0;
-   bear_breakout_count = 0;
+   // Reset breakout tracking (counters removed - using simple buffer crossing)
 
    box_drawn = false;
    ObjectsDeleteAll(0, box_name);
@@ -1024,36 +1016,152 @@ void CheckBreakout()
 
    // Get current live price (for trend detection) and completed bar close (for breakout detection)
    price = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0; // Live mid price
-   
-   double close[1];
-   if (CopyClose(_Symbol, PERIOD_M1, 1, 1, close) <= 0)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("Error getting close price for breakout check");
-      return;
-   }
+   double close = GetPreviousClose(); // Most recent completed bar close
 
    // Calculate breakout levels using utility functions
    double bull_breakout_level = CalculateBullBreakoutLevel();
    double bear_breakout_level = CalculateBearBreakoutLevel();
    double buffer_points = CalculateRangeBuffer();
 
-   LogBreakoutLevels(close[0], buffer_points, bull_breakout_level, bear_breakout_level);
+   LogBreakoutLevels(close, buffer_points, bull_breakout_level, bear_breakout_level);
 
    // Check for bullish breakout
-   if (close[0] >= bull_breakout_level)
+   if (price >= bull_breakout_level && price >= close)
    {
-      ProcessBullishBreakout(close[0], buffer_points);
+      if (ValidateBreakout(true)) // true = bullish
+      {
+         ProcessBreakout(true, close, buffer_points);
+      }
    }
    // Check for bearish breakout
-   else if (close[0] <= bear_breakout_level)
+   else if (price <= bear_breakout_level && price <= close)
    {
-      ProcessBearishBreakout(close[0], buffer_points);
+      if (ValidateBreakout(false)) // false = bearish
+      {
+         ProcessBreakout(false, close, buffer_points);
+      }
    }
-   else
+}
+
+//+------------------------------------------------------------------+
+//| Validate breakout conditions (unified for both directions)       |
+//+------------------------------------------------------------------+
+bool ValidateBreakout(bool is_bullish)
+{
+   // STEP 1: Critical trend requirement - current price must be beyond previous close
+   double prev_close = GetPreviousClose();
+   if (is_bullish && price <= prev_close)
    {
-      ResetBreakoutCounters(close[0], buffer_points);
+      if (DEBUG_LEVEL >= 3)
+         Print("BULLISH BREAKOUT: Current price ", DoubleToString(price, _Digits),
+               " <= previous close ", DoubleToString(prev_close, _Digits), " - trend requirement not met");
+      return false;
    }
+   else if (!is_bullish && price >= prev_close)
+   {
+      if (DEBUG_LEVEL >= 3)
+         Print("BEARISH BREAKOUT: Current price ", DoubleToString(price, _Digits),
+               " >= previous close ", DoubleToString(prev_close, _Digits), " - trend requirement not met");
+      return false;
+   }
+
+   // STEP 2: Check trend alignment FIRST - don't waste time on non-trending breakouts
+   bool trend_aligned = is_bullish ? IsTrendAlignmentBullish() : IsTrendAlignmentBearish();
+   if (!trend_aligned)
+   {
+      string direction = is_bullish ? "BULLISH" : "BEARISH";
+      if (DEBUG_LEVEL >= 2)
+         Print(direction, " BREAKOUT DETECTED but trend alignment insufficient (",
+               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold) - ignoring breakout");
+
+      // Check if trend is strongly in opposite direction (reset counters)
+      bool opposite_trend = is_bullish ? IsTrendAlignmentBearish() : IsTrendAlignmentBullish();
+      if (opposite_trend)
+      {
+         if (DEBUG_LEVEL >= 2)
+            Print("STRONG OPPOSITE TREND DETECTED - resetting ", direction, " counters");
+         
+         // Counter reset removed - using simple buffer crossing
+         ResetBreakoutTracking();
+      }
+      return false;
+   }
+
+   // Trend is good - proceed with breakout processing
+   if (DEBUG_LEVEL >= 2)
+   {
+      string direction = is_bullish ? "BULLISH" : "BEARISH";
+      Print(direction, " BREAKOUT with valid trend alignment - processing");
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Process breakout (unified for both directions)                   |
+//+------------------------------------------------------------------+
+void ProcessBreakout(bool is_bullish, double close, double buffer_points)
+{
+   // Initialize breakout tracking on first detection
+   if (breakout_start_time == 0)
+   {
+      if (is_bullish)
+         breakout_start_price = range_high + buffer_points;
+      else
+         breakout_start_price = range_low - buffer_points;
+      
+      breakout_start_time = TimeCurrent();
+   }
+
+
+   // STEP 2: Angle validation (if enabled)
+   if (MIN_BREAKOUT_ANGLE > 0)
+   {
+      double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
+      if (breakout_angle < MIN_BREAKOUT_ANGLE)
+      {
+         string direction = is_bullish ? "BULLISH" : "BEARISH";
+         if (DEBUG_LEVEL >= 2)
+            Print(direction, " BREAKOUT REJECTED: Angle ", DoubleToString(breakout_angle, 1),
+                  "° < required ", DoubleToString(MIN_BREAKOUT_ANGLE, 1), "°");
+         return;
+      }
+   }
+
+   // All validations passed - execute trade
+   ExecuteBreakoutTrade(is_bullish, close);
+}
+
+//+------------------------------------------------------------------+
+//| Execute breakout trade (simplified - no confirmation counting)   |
+//+------------------------------------------------------------------+
+void ExecuteBreakoutTrade(bool is_bullish, double close)
+{
+   string direction = is_bullish ? "BULLISH" : "BEARISH";
+   
+   if (DEBUG_LEVEL >= 1)
+   {
+      string angle_info = "";
+      if (MIN_BREAKOUT_ANGLE > 0)
+      {
+         double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
+         angle_info = " | Angle: " + DoubleToString(breakout_angle, 1) + "°";
+      }
+      else
+      {
+         angle_info = " | Angle: DISABLED";
+      }
+
+      Print("CONFIRMED ", direction, " BREAKOUT + TREND + BUFFER CROSSING - EXECUTING ", 
+            (is_bullish ? "BUY" : "SELL"), angle_info);
+   }
+
+   // Execute the trade
+   ENUM_ORDER_TYPE order_type = is_bullish ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   SendOrder(order_type);
+   
+   // Reset breakout tracking after trade
+         ResetBreakoutTracking();
 }
 
 //+------------------------------------------------------------------+
@@ -1077,276 +1185,423 @@ void LogBreakoutLevels(double close, double buffer_points, double bull_level, do
 }
 
 //+------------------------------------------------------------------+
-//| Process bullish breakout                                         |
+//| Calculate ATR and median ATR                                     |
 //+------------------------------------------------------------------+
-void ProcessBullishBreakout(double close, double buffer_points)
+void UpdateATR()
 {
-   // STEP 1: Critical trend requirement (fastest check - single comparison)
-   // Don't reset counters immediately - live price can fluctuate temporarily
-   if (price <= GetPreviousClose())
+   // Calculate current ATR value using the global handle
+   double atr_buff[];
+
+   if (CopyBuffer(atr_handle, 0, 0, 2, atr_buff) <= 0)
    {
-      if (DEBUG_LEVEL >= 3)
-         Print("BULLISH BREAKOUT: Current price ", DoubleToString(price, _Digits), 
-               " <= previous close ", DoubleToString(GetPreviousClose(), _Digits), " - waiting for recovery");
-      
-      // Just return without incrementing - don't reset counters for temporary dips
+      if (DEBUG_LEVEL >= 1)
+         Print("ATR error: ", GetLastError());
       return;
    }
-   
-   // STEP 2: Confirmation candles check (very fast - avoid expensive calculations if not ready)
-   // Use bar time to ensure we only count once per bar for confirmation
-   static datetime last_bull_bar_time = 0;
-   datetime current_bar_time = iTime(_Symbol, PERIOD_M1, 0);
-   
-   bool is_new_bar = (current_bar_time != last_bull_bar_time);
-   if (is_new_bar)
+
+   // Get current ATR value (from previous completed bar)
+   atr_value = atr_buff[1];
+
+   // Calculate median ATR if we don't have it yet or need to recalculate
+   if (atr_median <= 0 && USE_VOLATILITY_FILTER)
    {
-      bull_breakout_count++;
-      last_bull_bar_time = current_bar_time;
-   }
-   
-   bear_breakout_count = 0; // Reset bear count on bullish candle
-   
-   // Exit early if we don't have enough confirmations yet (avoid expensive checks)
-   if (bull_breakout_count < CONFIRMATION_CANDLES)
-   {
-      if (DEBUG_LEVEL >= 2)
-         Print("BULLISH BREAKOUT: Waiting for confirmations (", bull_breakout_count, "/", CONFIRMATION_CANDLES, ")");
-      return;
-   }
-   
-   // STEP 3: Angle validation (if enabled - moderate cost trigonometric calculations)
-   // Initialize breakout tracking on first detection
-   if (breakout_start_time == 0)
-   {
-      breakout_start_price = range_high + buffer_points; // Actual breakout level
-      breakout_start_time = TimeCurrent();
-   }
-   
-   if (MIN_BREAKOUT_ANGLE > 0)
-   {
-      // Calculate angle from breakout point to current price
-      double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
-      
-      if (breakout_angle < MIN_BREAKOUT_ANGLE)
+      // For median calculation we need a longer ATR history
+      // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 390 one-minute bars per day
+      int bars_per_trading_day = 390;
+      int bars_needed = ATR_MEDIAN_DAYS * bars_per_trading_day;
+
+      // Make sure we don't request more bars than available
+      int available_bars = Bars(_Symbol, _Period);
+      if (bars_needed > available_bars)
+         bars_needed = available_bars;
+
+      // Only proceed if we have enough data
+      if (bars_needed < 10)
       {
-         if (DEBUG_LEVEL >= 2)
-            Print("BULLISH BREAKOUT REJECTED: Angle ", DoubleToString(breakout_angle, 1), 
-                  "° < required ", DoubleToString(MIN_BREAKOUT_ANGLE, 1), "°");
-         // Don't reset counters - let it try again next tick with potentially better angle
+         if (DEBUG_LEVEL >= 1)
+            Print("Insufficient data for ATR median calculation. Need at least 10 bars, have ", bars_needed);
          return;
       }
-   }
-   
-   // STEP 4: Full trend alignment check (most expensive - array operations)
-   if (!IsTrendAlignmentBullish())
-   {
-      if (DEBUG_LEVEL >= 2)
-         Print("BULLISH BREAKOUT REJECTED: Trend alignment insufficient (", 
-               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
-      
-      // Check if trend is strongly bearish (major opposite signal)
-      if (IsTrendAlignmentBearish())
-      {
-         if (DEBUG_LEVEL >= 2)
-            Print("STRONG BEARISH TREND DETECTED - resetting bull counters");
-         bull_breakout_count = 0;
-         ResetBreakoutTracking();
-      }
-      // If trend is just weak/neutral, don't reset - let price action determine
-      return;
-   }
 
-   // All validations passed - execute trade
-   if (DEBUG_LEVEL >= 1)
-   {
-      string angle_info = "";
-      if (MIN_BREAKOUT_ANGLE > 0)
-      {
-         double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
-         angle_info = " | Angle: " + DoubleToString(breakout_angle, 1) + "°";
-      }
-      else
-      {
-         angle_info = " | Angle: DISABLED";
-      }
-      
-      if (MIN_BREAKOUT_ANGLE > 0)
-         Print("CONFIRMED BULL BREAKOUT + TREND + ANGLE AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY", angle_info);
-      else
-         Print("CONFIRMED BULL BREAKOUT + TREND AFTER ", bull_breakout_count, " CANDLES - EXECUTING BUY (angle disabled)");
-   }
+      // Get ATR values for the period
+      ArrayResize(atr_history, bars_needed);
 
-   SendOrder(ORDER_TYPE_BUY);
-   bull_breakout_count = 0; // Reset counter after trade
-   ResetBreakoutTracking(); // Reset tracking after trade
-}
-
-//+------------------------------------------------------------------+
-//| Process bearish breakout                                         |
-//+------------------------------------------------------------------+
-void ProcessBearishBreakout(double close, double buffer_points)
-{
-   // STEP 1: Critical trend requirement (fastest check - single comparison)
-   // Don't reset counters immediately - live price can fluctuate temporarily
-   if (price >= GetPreviousClose())
-   {
-      if (DEBUG_LEVEL >= 3)
-         Print("BEARISH BREAKOUT: Current price ", DoubleToString(price, _Digits), 
-               " >= previous close ", DoubleToString(GetPreviousClose(), _Digits), " - waiting for recovery");
-      
-      // Just return without incrementing - don't reset counters for temporary rises
-      return;
-   }
-   
-   // STEP 2: Confirmation candles check (very fast - avoid expensive calculations if not ready)
-   // Use bar time to ensure we only count once per bar for confirmation
-   static datetime last_bear_bar_time = 0;
-   datetime current_bar_time = iTime(_Symbol, PERIOD_M1, 0);
-   
-   bool is_new_bar = (current_bar_time != last_bear_bar_time);
-   if (is_new_bar)
-   {
-      bear_breakout_count++;
-      last_bear_bar_time = current_bar_time;
-   }
-   
-   bull_breakout_count = 0; // Reset bull count on bearish candle
-   
-   // Exit early if we don't have enough confirmations yet (avoid expensive checks)
-   if (bear_breakout_count < CONFIRMATION_CANDLES)
-   {
-      if (DEBUG_LEVEL >= 2)
-         Print("BEARISH BREAKOUT: Waiting for confirmations (", bear_breakout_count, "/", CONFIRMATION_CANDLES, ")");
-      return;
-   }
-   
-   // STEP 3: Angle validation (if enabled - moderate cost trigonometric calculations)
-   // Initialize breakout tracking on first detection
-   if (breakout_start_time == 0)
-   {
-      breakout_start_price = range_low - buffer_points; // Actual breakout level
-      breakout_start_time = TimeCurrent();
-   }
-   
-   if (MIN_BREAKOUT_ANGLE > 0)
-   {
-      // Calculate angle from breakout point to current price
-      double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
-      
-      if (breakout_angle < MIN_BREAKOUT_ANGLE)
+      if (CopyBuffer(atr_handle, 0, 0, bars_needed, atr_history) <= 0)
       {
-         if (DEBUG_LEVEL >= 2)
-            Print("BEARISH BREAKOUT REJECTED: Angle ", DoubleToString(breakout_angle, 1), 
-                  "° < required ", DoubleToString(MIN_BREAKOUT_ANGLE, 1), "°");
-         // Don't reset counters - let it try again next tick with potentially better angle
+         if (DEBUG_LEVEL >= 1)
+            Print("Error getting ATR history: ", GetLastError());
          return;
       }
+
+      // Sort the array to find median
+      ArraySort(atr_history);
+
+      // Median is the middle value (or average of the two middle values)
+      int middle = bars_needed / 2;
+      if (bars_needed % 2 == 0) // Even number of elements
+         atr_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
+      else // Odd number of elements
+         atr_median = atr_history[middle];
+
+      if (DEBUG_LEVEL >= 1)
+         Print("ATR median calculated: ", DoubleToString(atr_median, _Digits),
+               " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
    }
-   
-   // STEP 4: Full trend alignment check (most expensive - array operations)
-   if (!IsTrendAlignmentBearish())
+}
+
+//+------------------------------------------------------------------+
+//| Check if today is a NYSE holiday or early close                  |
+//+------------------------------------------------------------------+
+bool IsNYSEHoliday(datetime t)
+{
+   // Convert server time to NY time by applying the fixed offset
+   // NY_TIME_OFFSET is the difference between server and NY time (always 7 hours)
+   datetime ny_time = t - NY_TIME_OFFSET * 3600;
+
+   // Now get the date in NY time
+   MqlDateTime dt;
+   TimeToStruct(ny_time, dt);
+   int y = dt.year, m = dt.mon, d = dt.day;
+   int wd = dt.day_of_week; // 0=Sunday, 1=Monday, ...
+
+   // Always skip weekends in NY time
+   if (wd == 0 || wd == 6)
+      return true;
+
+   // 2025 NYSE Full Closures - checked using NY date
+   if (y == 2025)
    {
-      if (DEBUG_LEVEL >= 2)
-         Print("BEARISH BREAKOUT REJECTED: Trend alignment insufficient (", 
-               DoubleToString(TREND_THRESHOLD * 100, 1), "% threshold)");
-      
-      // Check if trend is strongly bullish (major opposite signal)
-      if (IsTrendAlignmentBullish())
+      if ((m == 1 && d == 1)      // New Year's Day (Wed)
+          || (m == 1 && d == 20)  // MLK Jr. Day (Mon)
+          || (m == 2 && d == 17)  // Presidents' Day (Mon)
+          || (m == 4 && d == 18)  // Good Friday (Fri)
+          || (m == 5 && d == 26)  // Memorial Day (Mon)
+          || (m == 6 && d == 19)  // Juneteenth (Thu)
+          || (m == 7 && d == 4)   // Independence Day (Fri)
+          || (m == 9 && d == 1)   // Labor Day (Mon)
+          || (m == 11 && d == 27) // Thanksgiving (Thu)
+          || (m == 12 && d == 25) // Christmas (Thu)
+      )
+         return true;
+
+      // Early Closures (1:00 p.m. ET)
+      if ((m == 7 && d == 3)      // Day before Independence Day (Thu)
+          || (m == 11 && d == 28) // Day after Thanksgiving (Fri)
+          || (m == 12 && d == 24) // Christmas Eve (Wed)
+      )
       {
-         if (DEBUG_LEVEL >= 2)
-            Print("STRONG BULLISH TREND DETECTED - resetting bear counters");
-         bear_breakout_count = 0;
-         ResetBreakoutTracking();
+         // You may want to skip trading or close positions early on these days
+         // For now, treat as full holiday (no trading)
+         return true;
       }
-      // If trend is just weak/neutral, don't reset - let price action determine
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Manage position held after hours                                 |
+//+------------------------------------------------------------------+
+void ManageAfterHoursPos()
+{
+   // Check if position still exists
+   if (!PositionSelectByTicket(ticket))
+   {
+      // If we're in AFTER_HOURS_POSITION state but the position doesn't exist,
+      // we must transition to IDLE immediately and clear the ticket
+      if (trade_state == STATE_AFTER_HOURS_POSITION)
+      {
+         Print("Position no longer exists - transitioning from AFTER_HOURS_POSITION to IDLE");
+         trade_state = STATE_IDLE;
+         if (LABEL_STATS)
+            ShowLabel(); // Update display immediately
+      }
+      ticket = 0;
       return;
    }
 
-   // All validations passed - execute trade
+   // Special check to detect time gaps (like weekends)
+   static datetime last_check_time = 0;
+   datetime current_time = TimeCurrent();
+
+   if (last_check_time > 0 && current_time - last_check_time > 7200) // Gap greater than 2 hours
+   {
+      Print("WARNING: Time gap detected in after-hours position management - possible weekend/holiday skip");
+      Print("Last check: ", TimeToString(last_check_time), ", Current: ", TimeToString(current_time),
+            ", Gap: ", (current_time - last_check_time) / 3600, " hours");
+   }
+
+   last_check_time = current_time;
+
+   // Log position details once per hour
+   static datetime last_after_hours_log = 0;
+   if (current_time - last_after_hours_log > 3600)
+   {
+      ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+
+      if (DEBUG_LEVEL >= 2)
+         Print("AFTER-HOURS POSITION STATUS: Type=",
+               (position_type == POSITION_TYPE_BUY ? "BUY" : "SELL"),
+               ", SL=", DoubleToString(sl, _Digits),
+               ", TP=", DoubleToString(tp, _Digits),
+               ", Current time: ", TimeToString(current_time),
+               ", Next session: ", TimeToString(next_session_start),
+               ", Time until next session: ",
+               (int)((next_session_start - current_time) / 60), " minutes");
+
+      last_after_hours_log = current_time;
+   }
+
+   // Check if we need to close position before next session
+   if (current_time >= next_session_start - CLOSE_MINUTES_BEFORE_NEXT_SESSION * 60)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("ManageAfterHoursPos: Closing position as we're approaching next session (",
+               CLOSE_MINUTES_BEFORE_NEXT_SESSION, " minutes before ", TimeToString(next_session_start), ")");
+
+      bool closed = ClosePos();
+
+      if (!closed && ticket != 0)
+      {
+         if (DEBUG_LEVEL >= 1)
+            Print("ManageAfterHoursPos: Failed to close position before next session. Will retry.");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate optimal slippage based on broker data                  |
+//+------------------------------------------------------------------+
+int GetSymbolSlippage()
+{
+   // Get broker-specific symbol information
+   double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   // Pure calculation based on broker data to get optimal slippage
+   // Goal: Gold should automatically get 30-40 points
+
+   int calculated_slippage;
+
+   if (digits == 2) // Gold and other 2-digit instruments (like XAUUSD)
+   {
+      // For gold: spread is typically 10-30 points
+      // Formula: spread * 1.5 + 20 points base
+      // Examples: spread=20 → 20*1.5+20 = 50 points
+      //          spread=15 → 15*1.5+20 = 42.5 = 43 points
+      //          spread=10 → 10*1.5+20 = 35 points
+      calculated_slippage = (int)(spread * 1.5 + 20);
+
+      if (DEBUG_LEVEL >= 1)
+         Print("Auto-detected 2-digit instrument like Gold: ", _Symbol);
+   }
+   else if (digits == 3) // JPY pairs
+   {
+      // JPY needs much higher slippage due to smaller increments
+      // Formula: spread * 8 + 50 points base
+      calculated_slippage = (int)(spread * 8 + 50);
+
+      if (DEBUG_LEVEL >= 1)
+         Print("Auto-detected 3 digit pair like JPY: ", _Symbol);
+   }
+   else if (digits == 4 || digits == 5) // Major forex pairs
+   {
+      // Formula: spread * 3 + 15 points base
+      calculated_slippage = (int)(spread * 3 + 15);
+
+      if (DEBUG_LEVEL >= 1)
+         Print("Auto-detected Major forex pair: ", _Symbol, " (digits=", digits, ")");
+   }
+   else // Unknown/exotic pairs
+   {
+      // Higher safety margin for unknowns
+      // Formula: spread * 5 + 30 points base
+      calculated_slippage = (int)(spread * 5 + 30);
+
+      if (DEBUG_LEVEL >= 1)
+         Print("Auto-detected Exotic/Unknown pair: ", _Symbol, " (digits=", digits, ")");
+   }
+
+   // Apply reasonable bounds
+   int min_slippage = 15;   // Never go below 15 points
+   int max_slippage = 2000; // Cap at 2000 points for safety
+
+   calculated_slippage = MathMax(min_slippage, MathMin(max_slippage, calculated_slippage));
+
+   // Safety check for invalid broker data
+   if (spread <= 0)
+   {
+      calculated_slippage = 40; // Safe fallback
+      if (DEBUG_LEVEL >= 1)
+         Print("WARNING: Invalid spread data, using fallback slippage");
+   }
+
    if (DEBUG_LEVEL >= 1)
    {
-      string angle_info = "";
-      if (MIN_BREAKOUT_ANGLE > 0)
-      {
-         double breakout_angle = CalculateBreakoutAngle(breakout_start_price, breakout_start_time, close);
-         angle_info = " | Angle: " + DoubleToString(breakout_angle, 1) + "°";
-      }
-      else
-      {
-         angle_info = " | Angle: DISABLED";
-      }
-      
-      if (MIN_BREAKOUT_ANGLE > 0)
-         Print("CONFIRMED BEAR BREAKOUT + TREND + ANGLE AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL", angle_info);
-      else
-         Print("CONFIRMED BEAR BREAKOUT + TREND AFTER ", bear_breakout_count, " CANDLES - EXECUTING SELL (angle disabled)");
+      Print("=== AUTO-SLIPPAGE CALCULATION ===");
+      Print("Symbol: ", _Symbol);
+      Print("Broker spread: ", DoubleToString(spread, 1), " points");
+      Print("Digits: ", digits);
+      Print("Calculated slippage: ", calculated_slippage, " points");
+      Print("================================");
    }
 
-   SendOrder(ORDER_TYPE_SELL);
-   bear_breakout_count = 0; // Reset counter after trade
-   ResetBreakoutTracking(); // Reset tracking after trade
+   return calculated_slippage;
 }
 
 //+------------------------------------------------------------------+
-//| Reset breakout counters only when strong opposite signals occur  |
+//| Efficient helper functions for optimized breakout validation     |
 //+------------------------------------------------------------------+
-void ResetBreakoutCounters(double close, double buffer_points)
+double GetPreviousClose()
 {
-   // Calculate breakout levels
-   double bull_breakout_level = CalculateBullBreakoutLevel();
-   double bear_breakout_level = CalculateBearBreakoutLevel();
-   
-   // Check for strong opposite direction signals
-   bool should_reset_bull_counters = false;
-   bool should_reset_bear_counters = false;
-   
-   // SIGNAL 1: Price crossed to opposite buffer zone (decisive opposite direction)
-   if (bull_breakout_count > 0 && close <= bear_breakout_level)
+   double closes[1];
+   if (CopyClose(_Symbol, PERIOD_M1, 1, 1, closes) <= 0)
    {
-      // Bullish breakout in progress, but price crossed to bearish zone
-      should_reset_bull_counters = true;
-      if (DEBUG_LEVEL >= 2)
-         Print("RESET BULL COUNTERS: Price crossed to bearish zone (", 
-               DoubleToString(close, _Digits), " <= ", DoubleToString(bear_breakout_level, _Digits), ")");
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting previous close price");
+      return 0.0; // Return 0 if error - will cause trend checks to fail safely
    }
-   
-   if (bear_breakout_count > 0 && close >= bull_breakout_level)
+   return closes[0];
+}
+
+bool IsTrendAlignmentBullish()
+{
+   // Get historical closes (excluding current price - we already checked that)
+   double closes[];
+   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
    {
-      // Bearish breakout in progress, but price crossed to bullish zone  
-      should_reset_bear_counters = true;
-      if (DEBUG_LEVEL >= 2)
-         Print("RESET BEAR COUNTERS: Price crossed to bullish zone (", 
-               DoubleToString(close, _Digits), " >= ", DoubleToString(bull_breakout_level, _Digits), ")");
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting close prices for bullish trend alignment");
+      return false;
    }
-   
-   // Apply resets
-   if (should_reset_bull_counters)
+
+   // Append current price to the array (resize and add at front)
+   ArrayResize(closes, TREND_CANDLES);
+   for (int i = TREND_CANDLES - 1; i > 0; i--)
    {
-      bull_breakout_count = 0;
-      if (breakout_start_time > 0 && bear_breakout_count == 0) // Only reset if not switching to opposite direction
-         ResetBreakoutTracking();
+      closes[i] = closes[i - 1]; // Shift existing closes to the right
    }
-   
-   if (should_reset_bear_counters)
+   closes[0] = price; // Add current price at front
+
+   int bullish_candles = 0;
+   int bearish_candles = 0;
+
+   // Analyze all moves including current price
+   for (int i = 0; i < TREND_CANDLES - 1; i++)
    {
-      bear_breakout_count = 0;
-      if (breakout_start_time > 0 && bull_breakout_count == 0) // Only reset if not switching to opposite direction
-         ResetBreakoutTracking();
+      if (closes[i] > closes[i + 1]) // Compare current with previous
+         bullish_candles++;
+      else if (closes[i] < closes[i + 1])
+         bearish_candles++;
+      // Equal closes are ignored (neutral)
    }
-   
-   // Log current state for debugging
-   if (DEBUG_LEVEL >= 3 && (bull_breakout_count > 0 || bear_breakout_count > 0))
+
+   int total_directional_candles = bullish_candles + bearish_candles;
+   if (total_directional_candles == 0)
+      return false;
+
+   double bullish_percentage = (double)bullish_candles / total_directional_candles;
+
+   if (DEBUG_LEVEL >= 2)
    {
-      Print("BREAKOUT TRACKING: Bull=", bull_breakout_count, ", Bear=", bear_breakout_count, 
-            ", Price=", DoubleToString(close, _Digits),
-            ", Bull level=", DoubleToString(bull_breakout_level, _Digits),
-            ", Bear level=", DoubleToString(bear_breakout_level, _Digits));
+      Print("BULLISH TREND ALIGNMENT: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ",
+            total_directional_candles, " directional moves (",
+            DoubleToString(bullish_percentage * 100, 1), "% bullish)");
    }
+
+   return bullish_percentage >= TREND_THRESHOLD;
+}
+
+bool IsTrendAlignmentBearish()
+{
+   // Get historical closes (excluding current price - we already checked that)
+   double closes[];
+   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Error getting close prices for bearish trend alignment");
+      return false;
+   }
+
+   // Append current price to the array (resize and add at front)
+   ArrayResize(closes, TREND_CANDLES);
+   for (int i = TREND_CANDLES - 1; i > 0; i--)
+   {
+      closes[i] = closes[i - 1]; // Shift existing closes to the right
+   }
+   closes[0] = price; // Add current price at front
+
+   int bullish_candles = 0;
+   int bearish_candles = 0;
+
+   // Analyze all moves including current price
+   for (int i = 0; i < TREND_CANDLES - 1; i++)
+   {
+      if (closes[i] > closes[i + 1]) // Compare current with previous
+         bullish_candles++;
+      else if (closes[i] < closes[i + 1])
+         bearish_candles++;
+      // Equal closes are ignored (neutral)
+   }
+
+   int total_directional_candles = bullish_candles + bearish_candles;
+   if (total_directional_candles == 0)
+      return false;
+
+   double bearish_percentage = (double)bearish_candles / total_directional_candles;
+
+   if (DEBUG_LEVEL >= 2)
+   {
+      Print("BEARISH TREND ALIGNMENT: ", bearish_candles, " bearish, ", bullish_candles, " bullish out of ",
+            total_directional_candles, " directional moves (",
+            DoubleToString(bearish_percentage * 100, 1), "% bearish)");
+   }
+
+   return bearish_percentage >= TREND_THRESHOLD;
+}
+
+
+//+------------------------------------------------------------------+
+//| Calculate angle between two price points over time               |
+//+------------------------------------------------------------------+
+double CalculateSlopeAngleFromSeconds(double price_start, double price_end, double elapsed_seconds)
+{
+   // Calculate percentage change to make it scale-independent
+   double percentage_change = MathAbs(price_end - price_start) / price_start * 100.0;
+
+   // Convert seconds directly to hours
+   double time_duration_hours = elapsed_seconds / 3600.0;
+
+   // Avoid division by zero
+   if (time_duration_hours <= 0.0)
+      return 0.0;
+
+   // Calculate slope as percentage change per hour
+   double slope = percentage_change / time_duration_hours;
+
+   // Convert to angle in degrees
+   double angle_radians = MathArctan(slope);
+   double angle_degrees = angle_radians * 180.0 / M_PI;
+
+   return angle_degrees;
 }
 
 //+------------------------------------------------------------------+
-//| Reset angle-based breakout tracking                              |
+//| Calculate angle from breakout point to current price             |
+//+------------------------------------------------------------------+
+double CalculateBreakoutAngle(double start_price, datetime start_time, double current_price)
+{
+   if (start_time == 0 || start_price == 0)
+      return 0.0;
+
+   double elapsed_seconds = (double)(TimeCurrent() - start_time);
+   return CalculateSlopeAngleFromSeconds(start_price, current_price, elapsed_seconds);
+}
+
+
+//+------------------------------------------------------------------+
+//| Reset breakout tracking variables                                |
 //+------------------------------------------------------------------+
 void ResetBreakoutTracking()
 {
@@ -1915,193 +2170,7 @@ void ShowLabel()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate ATR and median ATR                                     |
-//+------------------------------------------------------------------+
-void UpdateATR()
-{
-   // Calculate current ATR value using the global handle
-   double atr_buff[];
-
-   if (CopyBuffer(atr_handle, 0, 0, 2, atr_buff) <= 0)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("ATR error: ", GetLastError());
-      return;
-   }
-
-   // Get current ATR value (from previous completed bar)
-   atr_value = atr_buff[1];
-
-   // Calculate median ATR if we don't have it yet or need to recalculate
-   if (atr_median <= 0 && USE_VOLATILITY_FILTER)
-   {
-      // For median calculation we need a longer ATR history
-      // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 390 one-minute bars per day
-      int bars_per_trading_day = 390;
-      int bars_needed = ATR_MEDIAN_DAYS * bars_per_trading_day;
-
-      // Make sure we don't request more bars than available
-      int available_bars = Bars(_Symbol, _Period);
-      if (bars_needed > available_bars)
-         bars_needed = available_bars;
-
-      // Only proceed if we have enough data
-      if (bars_needed < 10)
-      {
-         if (DEBUG_LEVEL >= 1)
-            Print("Insufficient data for ATR median calculation. Need at least 10 bars, have ", bars_needed);
-         return;
-      }
-
-      // Get ATR values for the period
-      ArrayResize(atr_history, bars_needed);
-
-      if (CopyBuffer(atr_handle, 0, 0, bars_needed, atr_history) <= 0)
-      {
-         if (DEBUG_LEVEL >= 1)
-            Print("Error getting ATR history: ", GetLastError());
-         return;
-      }
-
-      // Sort the array to find median
-      ArraySort(atr_history);
-
-      // Median is the middle value (or average of the two middle values)
-      int middle = bars_needed / 2;
-      if (bars_needed % 2 == 0) // Even number of elements
-         atr_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
-      else // Odd number of elements
-         atr_median = atr_history[middle];
-
-      if (DEBUG_LEVEL >= 1)
-         Print("ATR median calculated: ", DoubleToString(atr_median, _Digits),
-               " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Check if today is a NYSE holiday or early close                  |
-//+------------------------------------------------------------------+
-bool IsNYSEHoliday(datetime t)
-{
-   // Convert server time to NY time by applying the fixed offset
-   // NY_TIME_OFFSET is the difference between server and NY time (always 7 hours)
-   datetime ny_time = t - NY_TIME_OFFSET * 3600;
-
-   // Now get the date in NY time
-   MqlDateTime dt;
-   TimeToStruct(ny_time, dt);
-   int y = dt.year, m = dt.mon, d = dt.day;
-   int wd = dt.day_of_week; // 0=Sunday, 1=Monday, ...
-
-   // Always skip weekends in NY time
-   if (wd == 0 || wd == 6)
-      return true;
-
-   // 2025 NYSE Full Closures - checked using NY date
-   if (y == 2025)
-   {
-      if ((m == 1 && d == 1)      // New Year's Day (Wed)
-          || (m == 1 && d == 20)  // MLK Jr. Day (Mon)
-          || (m == 2 && d == 17)  // Presidents' Day (Mon)
-          || (m == 4 && d == 18)  // Good Friday (Fri)
-          || (m == 5 && d == 26)  // Memorial Day (Mon)
-          || (m == 6 && d == 19)  // Juneteenth (Thu)
-          || (m == 7 && d == 4)   // Independence Day (Fri)
-          || (m == 9 && d == 1)   // Labor Day (Mon)
-          || (m == 11 && d == 27) // Thanksgiving (Thu)
-          || (m == 12 && d == 25) // Christmas (Thu)
-      )
-         return true;
-
-      // Early Closures (1:00 p.m. ET)
-      if ((m == 7 && d == 3)      // Day before Independence Day (Thu)
-          || (m == 11 && d == 28) // Day after Thanksgiving (Fri)
-          || (m == 12 && d == 24) // Christmas Eve (Wed)
-      )
-      {
-         // You may want to skip trading or close positions early on these days
-         // For now, treat as full holiday (no trading)
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Manage position held after hours                                 |
-//+------------------------------------------------------------------+
-void ManageAfterHoursPos()
-{
-   // Check if position still exists
-   if (!PositionSelectByTicket(ticket))
-   {
-      // If we're in AFTER_HOURS_POSITION state but the position doesn't exist,
-      // we must transition to IDLE immediately and clear the ticket
-      if (trade_state == STATE_AFTER_HOURS_POSITION)
-      {
-         Print("Position no longer exists - transitioning from AFTER_HOURS_POSITION to IDLE");
-         trade_state = STATE_IDLE;
-         if (LABEL_STATS)
-            ShowLabel(); // Update display immediately
-      }
-      ticket = 0;
-      return;
-   }
-
-   // Special check to detect time gaps (like weekends)
-   static datetime last_check_time = 0;
-   datetime current_time = TimeCurrent();
-
-   if (last_check_time > 0 && current_time - last_check_time > 7200) // Gap greater than 2 hours
-   {
-      Print("WARNING: Time gap detected in after-hours position management - possible weekend/holiday skip");
-      Print("Last check: ", TimeToString(last_check_time), ", Current: ", TimeToString(current_time),
-            ", Gap: ", (current_time - last_check_time) / 3600, " hours");
-   }
-
-   last_check_time = current_time;
-
-   // Log position details once per hour
-   static datetime last_after_hours_log = 0;
-   if (current_time - last_after_hours_log > 3600)
-   {
-      ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      double sl = PositionGetDouble(POSITION_SL);
-      double tp = PositionGetDouble(POSITION_TP);
-
-      if (DEBUG_LEVEL >= 2)
-         Print("AFTER-HOURS POSITION STATUS: Type=",
-               (position_type == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-               ", SL=", DoubleToString(sl, _Digits),
-               ", TP=", DoubleToString(tp, _Digits),
-               ", Current time: ", TimeToString(current_time),
-               ", Next session: ", TimeToString(next_session_start),
-               ", Time until next session: ",
-               (int)((next_session_start - current_time) / 60), " minutes");
-
-      last_after_hours_log = current_time;
-   }
-
-   // Check if we need to close position before next session
-   if (current_time >= next_session_start - CLOSE_MINUTES_BEFORE_NEXT_SESSION * 60)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("ManageAfterHoursPos: Closing position as we're approaching next session (",
-               CLOSE_MINUTES_BEFORE_NEXT_SESSION, " minutes before ", TimeToString(next_session_start), ")");
-
-      bool closed = ClosePos();
-
-      if (!closed && ticket != 0)
-      {
-         if (DEBUG_LEVEL >= 1)
-            Print("ManageAfterHoursPos: Failed to close position before next session. Will retry.");
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Tester function for optimization                                 |
+//| Optimization function for backtesting                           |
 //+------------------------------------------------------------------+
 double OnTester()
 {
@@ -2112,11 +2181,11 @@ double OnTester()
    double net_profit = TesterStatistics(STAT_PROFIT);
    double max_drawdown = TesterStatistics(STAT_BALANCE_DD);
    double initial_deposit = TesterStatistics(STAT_INITIAL_DEPOSIT);
-   
+
    // Avoid division by zero and reject invalid data
-   if (total_trades < 5 || initial_deposit <= 0)
+   if (total_trades < 100 || initial_deposit <= 0)
       return 0.0;
-   
+
    // Immediately reject zero or negative profit strategies
    if (net_profit <= 0.0)
    {
@@ -2124,379 +2193,51 @@ double OnTester()
          Print("OPTIMIZATION REJECTED: Zero or negative profit (", DoubleToString(net_profit, 2), ")");
       return 0.0;
    }
-   
+
    double roi_percent = (net_profit / initial_deposit) * 100.0;
    double drawdown_percent = (max_drawdown / initial_deposit) * 100.0;
+
+   // PROFIT-FOCUSED FITNESS: Heavily weight profit, consider drawdown secondarily
    
-   // SIMPLE FITNESS: High profit + Low drawdown + More trades
+   // Start with raw profit as base score
+   double profit_score = net_profit;
    
-   // Base score: Profit adjusted for drawdown
-   double profit_score;
-   if (drawdown_percent > 0.1)  // Only adjust if meaningful drawdown (>0.1%)
-      profit_score = net_profit / drawdown_percent;  // Dollar profit per % drawdown
-   else
-      profit_score = net_profit * 100.0;  // Zero/tiny drawdown = multiply profit by 100 (huge bonus)
+   // Square the profit to give even more weight to profitable strategies
+   double weighted_profit = profit_score * profit_score;
    
-   // Trade multiplier: More trades = better (with diminishing returns)
-   double trade_multiplier = MathLog(total_trades + 1);  // Log scale to prevent explosion
+   // Apply a softer drawdown penalty (square root to reduce impact)
+   double drawdown_factor = 1.0;
+   if (drawdown_percent > 0.1) // Only apply penalty for meaningful drawdown
+   {
+      // Convert to a factor that reduces as drawdown increases, but less aggressively
+      drawdown_factor = 1.0 / MathSqrt(1.0 + drawdown_percent);
+   }
    
-   // Final fitness: Profit efficiency × Trade activity
-   double fitness = profit_score * trade_multiplier;
+   // Apply very minimal trade count consideration
+   // Just enough to prefer strategies with more trades when profit/drawdown are similar
+   double trade_factor = 1.0 + MathLog(total_trades / 50.0) * 0.1; // Max ~20% impact
    
+   // Final fitness: Heavily weighted profit × mild drawdown penalty × minimal trade factor
+   double fitness = weighted_profit * drawdown_factor * trade_factor;
+
    // Debug output for optimization
    if (DEBUG_LEVEL >= 1)
    {
-      Print("=== SIMPLE OPTIMIZATION RESULTS ===");
+      Print("=== PROFIT-FOCUSED OPTIMIZATION RESULTS ===");
       Print("Total Trades: ", (int)total_trades);
       Print("Net Profit: $", DoubleToString(net_profit, 2));
       Print("ROI: ", DoubleToString(roi_percent, 2), "%");
       Print("Max Drawdown: ", DoubleToString(drawdown_percent, 2), "%");
-      Print("Profit Score: ", DoubleToString(profit_score, 2));
-      Print("Trade Multiplier: ", DoubleToString(trade_multiplier, 2));
+      Print("Base Profit: ", DoubleToString(profit_score, 2));
+      Print("Weighted Profit: ", DoubleToString(weighted_profit, 2));
+      Print("Drawdown Factor: ", DoubleToString(drawdown_factor, 4));
+      Print("Trade Factor: ", DoubleToString(trade_factor, 4));
       Print("FINAL FITNESS: ", DoubleToString(fitness, 2));
-      Print("===================================");
+      Print("============================================");
    }
-   
+
    return fitness;
 }
 
 //+------------------------------------------------------------------+
-//| Calculate optimal slippage based on broker data                  |
 //+------------------------------------------------------------------+
-int GetSymbolSlippage()
-{
-   // Get broker-specific symbol information
-   double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-
-   // Pure calculation based on broker data to get optimal slippage
-   // Goal: Gold should automatically get 30-40 points
-
-   int calculated_slippage;
-
-   if (digits == 2) // Gold and other 2-digit instruments (like XAUUSD)
-   {
-      // For gold: spread is typically 10-30 points
-      // Formula: spread * 1.5 + 20 points base
-      // Examples: spread=20 → 20*1.5+20 = 50 points
-      //          spread=15 → 15*1.5+20 = 42.5 = 43 points
-      //          spread=10 → 10*1.5+20 = 35 points
-      calculated_slippage = (int)(spread * 1.5 + 20);
-
-      if (DEBUG_LEVEL >= 1)
-         Print("Auto-detected 2-digit instrument like Gold: ", _Symbol);
-   }
-   else if (digits == 3) // JPY pairs
-   {
-      // JPY needs much higher slippage due to smaller increments
-      // Formula: spread * 8 + 50 points base
-      calculated_slippage = (int)(spread * 8 + 50);
-
-      if (DEBUG_LEVEL >= 1)
-         Print("Auto-detected 3 digit pair like JPY: ", _Symbol);
-   }
-   else if (digits == 4 || digits == 5) // Major forex pairs
-   {
-      // Formula: spread * 3 + 15 points base
-      calculated_slippage = (int)(spread * 3 + 15);
-
-      if (DEBUG_LEVEL >= 1)
-         Print("Auto-detected Major forex pair: ", _Symbol, " (digits=", digits, ")");
-   }
-   else // Unknown/exotic pairs
-   {
-      // Higher safety margin for unknowns
-      // Formula: spread * 5 + 30 points base
-      calculated_slippage = (int)(spread * 5 + 30);
-
-      if (DEBUG_LEVEL >= 1)
-         Print("Auto-detected Exotic/Unknown pair: ", _Symbol, " (digits=", digits, ")");
-   }
-
-   // Apply reasonable bounds
-   int min_slippage = 15;   // Never go below 15 points
-   int max_slippage = 2000; // Cap at 2000 points for safety
-
-   calculated_slippage = MathMax(min_slippage, MathMin(max_slippage, calculated_slippage));
-
-   // Safety check for invalid broker data
-   if (spread <= 0)
-   {
-      calculated_slippage = 40; // Safe fallback
-      if (DEBUG_LEVEL >= 1)
-         Print("WARNING: Invalid spread data, using fallback slippage");
-   }
-
-   if (DEBUG_LEVEL >= 1)
-   {
-      Print("=== AUTO-SLIPPAGE CALCULATION ===");
-      Print("Symbol: ", _Symbol);
-      Print("Broker spread: ", DoubleToString(spread, 1), " points");
-      Print("Digits: ", digits);
-      Print("Calculated slippage: ", calculated_slippage, " points");
-      Print("================================");
-   }
-
-   return calculated_slippage;
-}
-
-//+------------------------------------------------------------------+
-//| Efficient helper functions for optimized breakout validation     |
-//+------------------------------------------------------------------+
-double GetPreviousClose()
-{
-   double closes[1];
-   if (CopyClose(_Symbol, PERIOD_M1, 1, 1, closes) <= 0)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("Error getting previous close price");
-      return 0.0; // Return 0 if error - will cause trend checks to fail safely
-   }
-   return closes[0];
-}
-
-bool IsTrendAlignmentBullish()
-{
-   // Get historical closes (excluding current price - we already checked that)
-   double closes[];
-   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("Error getting close prices for bullish trend alignment");
-      return false;
-   }
-   
-   // Append current price to the array (resize and add at front)
-   ArrayResize(closes, TREND_CANDLES);
-   for (int i = TREND_CANDLES - 1; i > 0; i--)
-   {
-      closes[i] = closes[i-1]; // Shift existing closes to the right
-   }
-   closes[0] = price; // Add current price at front
-   
-   int bullish_candles = 0;
-   int bearish_candles = 0;
-   
-   // Analyze all moves including current price
-   for (int i = 0; i < TREND_CANDLES - 1; i++)
-   {
-      if (closes[i] > closes[i+1]) // Compare current with previous
-         bullish_candles++;
-      else if (closes[i] < closes[i+1])
-         bearish_candles++;
-      // Equal closes are ignored (neutral)
-   }
-   
-   int total_directional_candles = bullish_candles + bearish_candles;
-   if (total_directional_candles == 0) return false;
-   
-   double bullish_percentage = (double)bullish_candles / total_directional_candles;
-   
-   if (DEBUG_LEVEL >= 2)
-   {
-      Print("BULLISH TREND ALIGNMENT: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ", 
-            total_directional_candles, " directional moves (", 
-            DoubleToString(bullish_percentage * 100, 1), "% bullish)");
-   }
-   
-   return bullish_percentage >= TREND_THRESHOLD;
-}
-
-bool IsTrendAlignmentBearish()
-{
-   // Get historical closes (excluding current price - we already checked that)
-   double closes[];
-   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("Error getting close prices for bearish trend alignment");
-      return false;
-   }
-   
-   // Append current price to the array (resize and add at front)
-   ArrayResize(closes, TREND_CANDLES);
-   for (int i = TREND_CANDLES - 1; i > 0; i--)
-   {
-      closes[i] = closes[i-1]; // Shift existing closes to the right
-   }
-   closes[0] = price; // Add current price at front
-   
-   int bullish_candles = 0;
-   int bearish_candles = 0;
-   
-   // Analyze all moves including current price
-   for (int i = 0; i < TREND_CANDLES - 1; i++)
-   {
-      if (closes[i] > closes[i+1]) // Compare current with previous
-         bullish_candles++;
-      else if (closes[i] < closes[i+1])
-         bearish_candles++;
-      // Equal closes are ignored (neutral)
-   }
-   
-   int total_directional_candles = bullish_candles + bearish_candles;
-   if (total_directional_candles == 0) return false;
-   
-   double bearish_percentage = (double)bearish_candles / total_directional_candles;
-   
-   if (DEBUG_LEVEL >= 2)
-   {
-      Print("BEARISH TREND ALIGNMENT: ", bearish_candles, " bearish, ", bullish_candles, " bullish out of ", 
-            total_directional_candles, " directional moves (", 
-            DoubleToString(bearish_percentage * 100, 1), "% bearish)");
-   }
-   
-   return bearish_percentage >= TREND_THRESHOLD;
-}
-
-//+------------------------------------------------------------------+
-//| Detect trend direction based on recent candle closes             |
-//+------------------------------------------------------------------+
-bool IsTrendBullish()
-{
-   // Get historical closes 
-   double closes[];
-   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("Error getting close prices for trend detection");
-      return false; // Default to no trend if data unavailable
-   }
-   
-   // CRITICAL: Current price must be > previous close for bullish trend
-   if (price <= closes[0])
-   {
-      if (DEBUG_LEVEL >= 2)
-         Print("BULLISH TREND REJECTED: Current price ", DoubleToString(price, _Digits), 
-               " <= previous close ", DoubleToString(closes[0], _Digits));
-      return false;
-   }
-   
-   // Append current price to the array (resize and add at front)
-   ArrayResize(closes, TREND_CANDLES);
-   for (int i = TREND_CANDLES - 1; i > 0; i--)
-   {
-      closes[i] = closes[i-1]; // Shift existing closes to the right
-   }
-   closes[0] = price; // Add current price at front
-   
-   int bullish_candles = 0;
-   int bearish_candles = 0;
-   
-   // Analyze all moves including current price
-   for (int i = 0; i < TREND_CANDLES - 1; i++)
-   {
-      if (closes[i] > closes[i+1]) // Compare current with previous
-         bullish_candles++;
-      else if (closes[i] < closes[i+1])
-         bearish_candles++;
-      // Equal closes are ignored (neutral)
-   }
-   
-   int total_directional_candles = bullish_candles + bearish_candles;
-   if (total_directional_candles == 0) return false; // No trend if all closes are equal
-   
-   double bullish_percentage = (double)bullish_candles / total_directional_candles;
-   
-   if (DEBUG_LEVEL >= 2)
-   {
-      Print("BULLISH TREND ANALYSIS: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ", 
-            total_directional_candles, " directional moves (", 
-            DoubleToString(bullish_percentage * 100, 1), "% bullish)");
-   }
-   
-   return bullish_percentage >= TREND_THRESHOLD;
-}
-
-bool IsTrendBearish()
-{
-   // Get historical closes
-   double closes[];
-   if (CopyClose(_Symbol, PERIOD_M1, 1, TREND_CANDLES - 1, closes) != TREND_CANDLES - 1)
-   {
-      if (DEBUG_LEVEL >= 1)
-         Print("Error getting close prices for trend detection");
-      return false; // Default to no trend if data unavailable
-   }
-   
-   // CRITICAL: Current price must be < previous close for bearish trend
-   if (price >= closes[0])
-   {
-      if (DEBUG_LEVEL >= 2)
-         Print("BEARISH TREND REJECTED: Current price ", DoubleToString(price, _Digits), 
-               " >= previous close ", DoubleToString(closes[0], _Digits));
-      return false;
-   }
-   
-   // Append current price to the array (resize and add at front)
-   ArrayResize(closes, TREND_CANDLES);
-   for (int i = TREND_CANDLES - 1; i > 0; i--)
-   {
-      closes[i] = closes[i-1]; // Shift existing closes to the right
-   }
-   closes[0] = price; // Add current price at front
-   
-   int bullish_candles = 0;
-   int bearish_candles = 0;
-   
-   // Analyze all moves including current price
-   for (int i = 0; i < TREND_CANDLES - 1; i++)
-   {
-      if (closes[i] > closes[i+1]) // Compare current with previous
-         bullish_candles++;
-      else if (closes[i] < closes[i+1])
-         bearish_candles++;
-      // Equal closes are ignored (neutral)
-   }
-   
-   int total_directional_candles = bullish_candles + bearish_candles;
-   if (total_directional_candles == 0) return false; // No trend if all closes are equal
-   
-   double bearish_percentage = (double)bearish_candles / total_directional_candles;
-   
-   if (DEBUG_LEVEL >= 2)
-   {
-      Print("BEARISH TREND ANALYSIS: ", bearish_candles, " bearish, ", bullish_candles, " bullish out of ", 
-            total_directional_candles, " directional moves (", 
-            DoubleToString(bearish_percentage * 100, 1), "% bearish)");
-   }
-   
-   return bearish_percentage >= TREND_THRESHOLD;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate angle between two price points over time               |
-//+------------------------------------------------------------------+
-double CalculateSlopeAngleFromSeconds(double price_start, double price_end, double elapsed_seconds)
-{
-   // Calculate percentage change to make it scale-independent
-   double percentage_change = MathAbs(price_end - price_start) / price_start * 100.0;
-
-   // Convert seconds directly to hours
-   double time_duration_hours = elapsed_seconds / 3600.0;
-
-   // Avoid division by zero
-   if (time_duration_hours <= 0.0)
-      return 0.0;
-
-   // Calculate slope as percentage change per hour
-   double slope = percentage_change / time_duration_hours;
-
-   // Convert to angle in degrees
-   double angle_radians = MathArctan(slope);
-   double angle_degrees = angle_radians * 180.0 / M_PI;
-
-   return angle_degrees;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate angle from breakout point to current price             |
-//+------------------------------------------------------------------+
-double CalculateBreakoutAngle(double start_price, datetime start_time, double current_price)
-{
-   if (start_time == 0 || start_price == 0)
-      return 0.0;
-      
-   double elapsed_seconds = (double)(TimeCurrent() - start_time);
-   return CalculateSlopeAngleFromSeconds(start_price, current_price, elapsed_seconds);
-}
