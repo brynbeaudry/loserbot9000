@@ -1202,8 +1202,31 @@ void UpdateATR()
    // Get current ATR value (from previous completed bar)
    atr_value = atr_buff[1];
 
-   // Calculate median ATR if we don't have it yet or need to recalculate
-   if (atr_median <= 0 && USE_VOLATILITY_FILTER)
+   // Calculate or recalculate median ATR if needed
+   static datetime last_median_calculation = 0;
+   const int MEDIAN_RECALC_HOURS = 168; // Recalculate weekly (7 days × 24 hours)
+   
+   bool should_calculate_median = false;
+   
+   if (USE_VOLATILITY_FILTER)
+   {
+      // Initial calculation if never done
+      if (atr_median <= 0)
+      {
+         should_calculate_median = true;
+         if (DEBUG_LEVEL >= 1)
+            Print("Initial ATR median calculation triggered");
+      }
+      // Periodic recalculation (weekly)
+      else if (TimeCurrent() - last_median_calculation > MEDIAN_RECALC_HOURS * 3600)
+      {
+         should_calculate_median = true;
+         if (DEBUG_LEVEL >= 1)
+            Print("Periodic ATR median recalculation triggered (", MEDIAN_RECALC_HOURS, " hours elapsed)");
+      }
+   }
+   
+   if (should_calculate_median)
    {
       // For median calculation we need a longer ATR history
       // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 390 one-minute bars per day
@@ -1238,14 +1261,28 @@ void UpdateATR()
 
       // Median is the middle value (or average of the two middle values)
       int middle = bars_needed / 2;
+      double new_median;
       if (bars_needed % 2 == 0) // Even number of elements
-         atr_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
+         new_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
       else // Odd number of elements
-         atr_median = atr_history[middle];
+         new_median = atr_history[middle];
 
-      if (DEBUG_LEVEL >= 1)
-         Print("ATR median calculated: ", DoubleToString(atr_median, _Digits),
+      // Log the change if this is an update
+      if (atr_median > 0 && DEBUG_LEVEL >= 1)
+      {
+         double change_pct = ((new_median - atr_median) / atr_median) * 100.0;
+         Print("ATR median updated: ", DoubleToString(atr_median, _Digits), 
+               " → ", DoubleToString(new_median, _Digits),
+               " (", (change_pct >= 0 ? "+" : ""), DoubleToString(change_pct, 1), "%)");
+      }
+      else if (DEBUG_LEVEL >= 1)
+      {
+         Print("ATR median calculated: ", DoubleToString(new_median, _Digits),
                " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
+      }
+      
+      atr_median = new_median;
+      last_median_calculation = TimeCurrent();
    }
 }
 
