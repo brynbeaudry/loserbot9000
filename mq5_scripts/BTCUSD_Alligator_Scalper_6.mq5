@@ -11,6 +11,7 @@
 //|                         TODO LIST                                |
 //+------------------------------------------------------------------+
 // ✅ COMPLETED: Changed bar-based sleep/mouth tracking to time-based (minutes)
+// ✅ COMPLETED: Reorganized state management with formal state machine
 // ⏳ REMAINING: Convert GATOR_HORIZONTAL_CHECK_BARS and BREAKOUT_TREND_CONSISTENCY_BARS to time-based
 
 //============================================================================
@@ -50,6 +51,7 @@ input int BREAKOUT_TREND_CONSISTENCY_BARS = 3; // BREAKOUT_TREND_CONSISTENCY_BAR
 input double MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER = 1.5; // MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER: ATR multiplier for minimum dollar distance price must move from jaw
 // Trading Controls
 input double MIN_SIGNAL_COOLDOWN_MINUTES = 3.0; // MIN_SIGNAL_COOLDOWN_MINUTES: Minimum minutes between signals (allows fractions)
+input bool STRICT_BREAKOUT_TIMING = false;  // STRICT_BREAKOUT_TIMING: Only trade breakouts while alligator is still sleeping (reduces late entries)
 input bool SHOW_INFO_PANEL = true;     // SHOW_INFO_PANEL: Show information panel on chart
 input int DEBUG_LEVEL = 1;             // DEBUG_LEVEL: Debug verbosity level (0=none, 1=basic, 2=detailed)
 
@@ -66,7 +68,7 @@ double price = 0;                    // Current price
 double lips = 0, teeth = 0, jaw = 0; // Alligator lines
 double atr_value = 0;                // Current ATR value
 
-// Trading state enum (must be declared first)
+// Trading state enums
 enum TrendDirection
 {
    NO_TREND = 0,
@@ -74,36 +76,39 @@ enum TrendDirection
    BEARISH_TREND = 2
 };
 
-// Alligator state tracking
-bool is_sleeping = false;          // Are lines close together?
-bool is_bullish_awake = false;     // Proper bullish alignment?
-bool is_bearish_awake = false;     // Proper bearish alignment?
-bool lines_are_horizontal = false; // Are lines relatively flat?
-datetime sleep_start_time = 0;     // When did alligator start sleeping?
-// sleep_bar_count removed - now using time-based tracking
+enum AlligatorState
+{
+   STATE_SLEEPING = 0,           // Alligator is sleeping (lines horizontal & close)
+   STATE_READY_TO_MONITOR = 1,   // Slept long enough, ready to monitor breakouts
+   STATE_MONITORING_BREAKOUT = 2, // Actively monitoring for breakout signals
+   STATE_TRADE_EXECUTED = 3,     // Trade placed, waiting for mouth to open
+   STATE_POSITION_ACTIVE = 4,    // Position active with mouth open
+   STATE_WAITING_FOR_SLEEP = 5   // Position closed, waiting for alligator to sleep
+};
+
+// Centralized state management
+AlligatorState current_state = STATE_SLEEPING;
+datetime state_start_time = 0;       // When current state began
+TrendDirection position_direction = NO_TREND;
+
+// Alligator analysis results
+bool lines_are_horizontal = false;
+bool lines_are_diverging = false;
+bool is_bullish_awake = false;
+bool is_bearish_awake = false;
 
 // Breakout tracking
-bool monitoring_breakout = false;             // Are we monitoring for breakout signals?
-double price_history[];                       // Array to track price history for breakout detection
+bool price_beyond_jaw = false;
+datetime breakout_start_time = 0;
+double breakout_start_price = 0;
+TrendDirection breakout_direction = NO_TREND;
+double price_history[];
 
-// Actual breakout tracking (when price moves beyond jaw)
-bool price_beyond_jaw = false;                // Has price moved beyond jaw?
-datetime breakout_start_time = 0;             // When price first went beyond jaw
-double breakout_start_price = 0;              // Price when it first crossed jaw
-TrendDirection breakout_direction = NO_TREND; // Direction of the breakout
-
-// Position and mouth opening tracking
+// Position tracking
 ulong current_position_ticket = 0;
-datetime entry_time = 0;             // When we entered the trade
-bool waiting_for_mouth_open = false; // Are we waiting for mouth to open?
-bool mouth_has_opened = false;       // Has mouth opened after entry?
 int daily_trade_count = 0;
 datetime last_trade_date = 0;
 datetime last_signal_time = 0;
-
-// Trading state variables
-TrendDirection current_trend = NO_TREND;
-TrendDirection position_direction = NO_TREND;
 
 //============================================================================
 //                         INITIALIZATION
@@ -139,6 +144,10 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   // Initialize state machine
+   current_state = STATE_SLEEPING;
+   state_start_time = TimeCurrent();
+   
    // Reset counters
    ResetDailyTrades();
 
@@ -157,9 +166,10 @@ int OnInit()
    Print("Gator horizontal check period: ", GATOR_HORIZONTAL_CHECK_BARS, " bars");
    Print("Line distance threshold: $", MAX_LINE_SPREAD_DOLLARS, " (max dollar distance between any line pair for sleeping)");
    Print("--- Trading Logic ---");
-   Print("Cycle: Sleep → Monitor → Breakout → Trade → Position Mgmt → Exit → Wait for Sleep");
+   Print("State Machine: Sleep → Ready → Monitor → Trade → Position → Wait → Sleep");
    Print("Breakout entry: Price angle from jaw during monitoring phase");
    Print("Mouth opening: Lines must be aligned AND diverging during MAX_MOUTH_OPENING_MINUTES");
+   Print("Strict breakout timing: ", STRICT_BREAKOUT_TIMING ? "ON (miss boat if mouth opens before trade)" : "OFF (continue monitoring after mouth opens)");
    Print("--- Price Breakout Validation ---");
    Print("Minimum breakout slope: ", MIN_BREAKOUT_SLOPE, "° angle from actual jaw crossing point");
    Print("Trend consistency window: ", BREAKOUT_TREND_CONSISTENCY_BARS, " bars (for recent trend validation)");
@@ -206,19 +216,11 @@ void OnTick()
       return;
    }
 
-   // Analyze alligator state
-   AnalyzeAlligatorState();
+   // Analyze alligator conditions (independent of state)
+   AnalyzeAlligatorConditions();
 
-   // Handle existing position
-   if (current_position_ticket != 0)
-   {
-      ManageOpenPosition();
-   }
-   else
-   {
-      // Look for new trading opportunities
-      CheckForTradeSignals();
-   }
+   // Process state machine
+   ProcessStateMachine();
 
    // Update display
    if (SHOW_INFO_PANEL)
@@ -263,237 +265,218 @@ bool UpdateMarketData()
 }
 
 //============================================================================
-//                      ALLIGATOR STATE ANALYSIS
+//                      ALLIGATOR CONDITIONS ANALYSIS
 //============================================================================
 
-void AnalyzeAlligatorState()
+void AnalyzeAlligatorConditions()
 {
-   // Check if lines are horizontal (low slope) AND close together - this determines sleeping
-   bool lines_horizontal_by_angle = CheckLinesAreHorizontal(MAX_LINE_SLOPE);
-   bool lines_close_by_spread = CheckLinesAreCloseBySpread();
-   lines_are_horizontal = lines_horizontal_by_angle && lines_close_by_spread;
+   // Analyze line positioning and slopes (independent of state)
+   lines_are_horizontal = CheckLinesAreHorizontal(MAX_LINE_SLOPE) && CheckLinesAreCloseBySpread();
+   lines_are_diverging = CheckLinesAreDiverging();
+   
+   // Determine awake states (requires alignment AND divergence, NOT sleeping)
+   bool has_bullish_alignment = (price > lips && lips > teeth && teeth > jaw);
+   bool has_bearish_alignment = (price < lips && lips < teeth && teeth < jaw);
+   
+   is_bullish_awake = has_bullish_alignment && lines_are_diverging && !lines_are_horizontal;
+   is_bearish_awake = has_bearish_alignment && lines_are_diverging && !lines_are_horizontal;
+}
 
-   // Check if lines are sloping away from each other (diverging slopes) - this determines awaking
-   bool lines_are_diverging = CheckLinesAreDiverging();
+//============================================================================
+//                         STATE MACHINE PROCESSING
+//============================================================================
 
-   // Update sleeping state and tracking (TIME-BASED)
-   static bool ready_notification_sent = false;
+void ProcessStateMachine()
+{
+   double state_duration_minutes = (TimeCurrent() - state_start_time) / 60.0;
+   
+   switch (current_state)
+   {
+      case STATE_SLEEPING:
+         ProcessSleepingState(state_duration_minutes);
+         break;
+         
+      case STATE_READY_TO_MONITOR:
+         ProcessReadyToMonitorState();
+         break;
+         
+      case STATE_MONITORING_BREAKOUT:
+         ProcessMonitoringBreakoutState();
+         break;
+         
+      case STATE_TRADE_EXECUTED:
+         ProcessTradeExecutedState(state_duration_minutes);
+         break;
+         
+      case STATE_POSITION_ACTIVE:
+         ProcessPositionActiveState();
+         break;
+         
+      case STATE_WAITING_FOR_SLEEP:
+         ProcessWaitingForSleepState();
+         break;
+   }
+}
 
+void ProcessSleepingState(double state_duration_minutes)
+{
+   if (!lines_are_horizontal)
+   {
+      // Lines no longer sleeping - reset to beginning
+      TransitionToState(STATE_SLEEPING, "Lines awakened - restarting sleep cycle");
+      return;
+   }
+   
+   if (state_duration_minutes >= MIN_SLEEPING_MINUTES)
+   {
+      TransitionToState(STATE_READY_TO_MONITOR, "Slept long enough - ready to monitor");
+   }
+}
+
+void ProcessReadyToMonitorState()
+{
    if (lines_are_horizontal)
    {
-      if (!is_sleeping)
-      {
-         // Just started sleeping
-         is_sleeping = true;
-         sleep_start_time = TimeCurrent();
-         ready_notification_sent = false;
-         if (DEBUG_LEVEL >= 1)
-            Print("😴 ALLIGATOR SLEEPING: Lines are horizontal");
-      }
-      else
-      {
-         // Continue sleeping - check if we've reached minimum duration
-         double sleep_duration_minutes = (TimeCurrent() - sleep_start_time) / 60.0;
-         
-         // Notify when ready for breakout monitoring (only once)
-         if (sleep_duration_minutes >= MIN_SLEEPING_MINUTES && !ready_notification_sent && DEBUG_LEVEL >= 1)
-         {
-            Print("✅ BREAKOUT MONITORING ACTIVE: Slept for ", DoubleToString(sleep_duration_minutes, 2), " minutes - ready for breakouts");
-            ready_notification_sent = true;
-         }
-      }
+      // Still sleeping, start monitoring
+      TransitionToState(STATE_MONITORING_BREAKOUT, "Starting breakout monitoring");
    }
    else
    {
-      // Not sleeping anymore - reset everything
-      if (is_sleeping && DEBUG_LEVEL >= 1)
-         Print("👁️ ALLIGATOR AWAKENING: Lines no longer horizontal - breakout monitoring reset");
-
-      is_sleeping = false;
-      sleep_start_time = 0;
-      ready_notification_sent = false;
+      // No longer sleeping - go back to sleep
+      TransitionToState(STATE_SLEEPING, "No longer sleeping - restarting sleep cycle");
    }
+}
 
-   // IMPORTANT: Sleep conditions take precedence over awake conditions
-   // Only check for awake states if the alligator is NOT sleeping
-   if (is_sleeping)
+void ProcessMonitoringBreakoutState()
+{
+   // Check if alligator woke up (mouth opened) while we were monitoring
+   if (STRICT_BREAKOUT_TIMING && (is_bullish_awake || is_bearish_awake))
    {
-      // If sleeping, force awake states to false regardless of line alignment or divergence
-      is_bullish_awake = false;
-      is_bearish_awake = false;
-      current_trend = NO_TREND;
+      // Alligator woke up before we could execute trade - missed the boat
+      TransitionToState(STATE_WAITING_FOR_SLEEP, "Alligator woke up during monitoring - missed the boat (strict timing)");
+      ResetBreakoutTracking();
+      return;
    }
-   else
-   {
-      // Only when NOT sleeping, check for proper alligator alignment
-      // Awake state requires both alignment AND divergence
-      bool has_bullish_alignment = (price > lips && lips > teeth && teeth > jaw);
-      bool has_bearish_alignment = (price < lips && lips < teeth && teeth < jaw);
-      
-      // Lines must be diverging for true "awake" state (mouth opening)
-      is_bullish_awake = has_bullish_alignment && lines_are_diverging;
-      is_bearish_awake = has_bearish_alignment && lines_are_diverging;
-
-      // Determine current trend
-      if (is_bullish_awake)
-         current_trend = BULLISH_TREND;
-      else if (is_bearish_awake)
-         current_trend = BEARISH_TREND;
-      else
-         current_trend = NO_TREND;
-   }
-
-   // Start breakout monitoring when alligator ready (TIME-BASED)
-   double sleep_duration_minutes = is_sleeping && sleep_start_time > 0 ? (TimeCurrent() - sleep_start_time) / 60.0 : 0.0;
-   bool sleep_duration_met = (sleep_duration_minutes >= MIN_SLEEPING_MINUTES);
    
-   if (sleep_duration_met && current_position_ticket == 0)
+   // Continue monitoring for breakout
+   // In non-strict mode, we continue even if alligator wakes up
+   CheckPriceBreakoutFromJaw();
+}
+
+void ProcessTradeExecutedState(double state_duration_minutes)
+{
+   // Check if position still exists
+   if (!PositionSelectByTicket(current_position_ticket))
    {
-      if (!monitoring_breakout)
+      // Position closed before mouth opened
+      TransitionToState(STATE_WAITING_FOR_SLEEP, "Position closed before mouth opened");
+      ResetPositionTracking();
+      return;
+   }
+   
+   // Check if mouth opened (alligator awake in our direction)
+   bool mouth_opened = false;
+   if (position_direction == BULLISH_TREND && is_bullish_awake)
+      mouth_opened = true;
+   else if (position_direction == BEARISH_TREND && is_bearish_awake)
+      mouth_opened = true;
+   
+   if (mouth_opened)
+   {
+      TransitionToState(STATE_POSITION_ACTIVE, "Mouth opened - position now active");
+   }
+   else if (state_duration_minutes >= MAX_MOUTH_OPENING_MINUTES)
+   {
+      // Timeout - close position
+      ClosePosition("Mouth failed to open within timeout");
+      TransitionToState(STATE_WAITING_FOR_SLEEP, "Mouth opening timeout");
+   }
+}
+
+void ProcessPositionActiveState()
+{
+   // Check if position still exists
+   if (!PositionSelectByTicket(current_position_ticket))
+   {
+      // Position closed (SL/TP hit)
+      TransitionToState(STATE_WAITING_FOR_SLEEP, "Position closed by SL/TP");
+      ResetPositionTracking();
+      return;
+   }
+   
+   // Check exit conditions
+   bool should_exit = false;
+   string exit_reason = "";
+   
+   // Check if alligator went back to sleep or lost proper awake state
+   bool still_awake = false;
+   if (position_direction == BULLISH_TREND && is_bullish_awake)
+      still_awake = true;
+   else if (position_direction == BEARISH_TREND && is_bearish_awake)
+      still_awake = true;
+      
+   if (!still_awake)
+   {
+      should_exit = true;
+      if (lines_are_horizontal)
+         exit_reason = "Alligator went back to sleep";
+      else
+         exit_reason = "Alligator mouth closed - lost alignment or divergence";
+   }
+   // Check if price crossed back through lips (momentum reversal)
+   else if (position_direction == BULLISH_TREND && price < lips)
+   {
+      should_exit = true;
+      exit_reason = "Price closed below lips - bullish momentum lost";
+   }
+   else if (position_direction == BEARISH_TREND && price > lips)
+   {
+      should_exit = true;
+      exit_reason = "Price closed above lips - bearish momentum lost";
+   }
+   
+   if (should_exit)
+   {
+      ClosePosition(exit_reason);
+      TransitionToState(STATE_WAITING_FOR_SLEEP, "Position manually closed");
+   }
+}
+
+void ProcessWaitingForSleepState()
+{
+   if (lines_are_horizontal)
+   {
+      TransitionToState(STATE_SLEEPING, "Alligator returned to sleep");
+   }
+}
+
+void TransitionToState(AlligatorState new_state, string reason)
+{
+   if (new_state != current_state)
+   {
+      if (DEBUG_LEVEL >= 1)
       {
-         monitoring_breakout = true;
-         if (DEBUG_LEVEL >= 1)
-            Print("🎯 BREAKOUT MONITORING STARTED: Ready for price angle detection");
+         string old_state_name = GetStateName(current_state);
+         string new_state_name = GetStateName(new_state);
+         Print("🔄 STATE TRANSITION: ", old_state_name, " → ", new_state_name, " (", reason, ")");
       }
       
-      CheckPriceBreakoutFromJaw();
+      current_state = new_state;
+      state_start_time = TimeCurrent();
    }
-   else if (monitoring_breakout && current_position_ticket != 0)
+}
+
+string GetStateName(AlligatorState state)
+{
+   switch (state)
    {
-      // Stop monitoring we have a position
-      monitoring_breakout = false;
-      ResetBreakoutTracking(); // Reset tracking when monitoring stops
-      if (DEBUG_LEVEL >= 1)
-         Print("🛑 BREAKOUT MONITORING STOPPED: Conditions no longer met");
-   }
-
-   // Simple status at DEBUG_LEVEL 1 (TIME-BASED)
-   if (DEBUG_LEVEL >= 1)
-   {
-      static datetime last_simple_debug = 0;
-      static string last_status = "";
-      if (TimeCurrent() - last_simple_debug > 60) // Every 60 seconds
-      {
-         string current_status = "";
-         double current_sleep_minutes = is_sleeping && sleep_start_time > 0 ? (TimeCurrent() - sleep_start_time) / 60.0 : 0.0;
-
-         if (is_sleeping && current_sleep_minutes >= MIN_SLEEPING_MINUTES)
-         {
-            if (monitoring_breakout)
-               current_status = "🎯 MONITORING: Sleeping " + DoubleToString(current_sleep_minutes, 1) + " mins - watching for breakout";
-            else
-               current_status = "😴 READY: Sleeping " + DoubleToString(current_sleep_minutes, 1) + " mins - will monitor when no position";
-         }
-         else if (is_sleeping)
-         {
-            double remaining_minutes = MIN_SLEEPING_MINUTES - current_sleep_minutes;
-            current_status = "😴 SLEEPING: " + DoubleToString(current_sleep_minutes, 1) + "/" + DoubleToString(MIN_SLEEPING_MINUTES, 1) +
-                             " mins - need " + DoubleToString(remaining_minutes, 1) + " more";
-         }
-         else
-         {
-            current_status = "👁️ AWAKE: Lines not sleeping - monitoring paused";
-         }
-
-         // Only print if status changed
-         if (current_status != last_status)
-         {
-            Print("📊 ALLIGATOR STATUS: ", current_status);
-            last_status = current_status;
-         }
-         last_simple_debug = TimeCurrent();
-      }
-   }
-
-   // Debug output
-   if (DEBUG_LEVEL >= 2)
-   {
-      static datetime last_debug = 0;
-      if (TimeCurrent() - last_debug > 30) // Every 30 seconds
-      {
-         Print("=== ALLIGATOR STRATEGY STATUS ===");
-         Print("💰 Price: ", DoubleToString(price, _Digits));
-         Print("📊 Lines: Lips=", DoubleToString(lips, _Digits),
-               " | Teeth=", DoubleToString(teeth, _Digits),
-               " | Jaw=", DoubleToString(jaw, _Digits));
-         
-         // Show individual line distances
-         double lips_teeth_distance = MathAbs(lips - teeth);
-         double teeth_jaw_distance = MathAbs(teeth - jaw);
-         double lips_jaw_distance = MathAbs(lips - jaw);
-         Print("📏 Line distances: Lips↔Teeth=$", DoubleToString(lips_teeth_distance, 2), 
-               " | Teeth↔Jaw=$", DoubleToString(teeth_jaw_distance, 2), 
-               " | Lips↔Jaw=$", DoubleToString(lips_jaw_distance, 2), " (max: $", MAX_LINE_SPREAD_DOLLARS, ")");
-
-         // Main status explanation (TIME-BASED)
-         if (is_sleeping)
-         {
-            double current_sleep_minutes = (TimeCurrent() - sleep_start_time) / 60.0;
-            if (current_sleep_minutes >= MIN_SLEEPING_MINUTES)
-               Print("😴 SLEEPING: ", DoubleToString(current_sleep_minutes, 1), " minutes ✅ READY for breakout");
-            else
-               Print("😴 SLEEPING: ", DoubleToString(current_sleep_minutes, 1), "/", DoubleToString(MIN_SLEEPING_MINUTES, 1), " minutes ⏳ Need more sleep");
-         }
-         else
-         {
-            string awake_reason = "";
-            if (!lines_horizontal_by_angle && !lines_close_by_spread)
-               awake_reason = "Lines not horizontal AND distances too wide";
-            else if (!lines_horizontal_by_angle)
-               awake_reason = "Lines not horizontal";
-            else if (!lines_close_by_spread)
-            {
-               // Show which specific distances are too wide
-               double lips_teeth_dist = MathAbs(lips - teeth);
-               double teeth_jaw_dist = MathAbs(teeth - jaw);
-               double lips_jaw_dist = MathAbs(lips - jaw);
-               
-               string wide_pairs = "";
-               if (lips_teeth_dist > MAX_LINE_SPREAD_DOLLARS) wide_pairs += "Lips↔Teeth ";
-               if (teeth_jaw_dist > MAX_LINE_SPREAD_DOLLARS) wide_pairs += "Teeth↔Jaw ";
-               if (lips_jaw_dist > MAX_LINE_SPREAD_DOLLARS) wide_pairs += "Lips↔Jaw ";
-               
-               awake_reason = "Line distances too wide (" + wide_pairs + ")";
-            }
-            
-            Print("👁️ AWAKE: ", awake_reason, " - monitoring paused");
-         }
-
-         // Breakout monitoring status (TIME-BASED)
-         if (monitoring_breakout)
-         {
-            Print("🎯 ACTIVE MONITORING: Watching for price breakout signals");
-         }
-         else
-         {
-            double current_sleep_minutes = is_sleeping && sleep_start_time > 0 ? (TimeCurrent() - sleep_start_time) / 60.0 : 0.0;
-            bool sleep_duration_met = (current_sleep_minutes >= MIN_SLEEPING_MINUTES);
-            
-            if (sleep_duration_met && current_position_ticket != 0)
-            {
-               Print("💼 POSITION ACTIVE: Monitoring paused during trade management");
-            }
-            else if (sleep_duration_met)
-            {
-               Print("😴 READY: Will start monitoring when conditions met");
-            }
-            else
-            {
-               double remaining_minutes = MIN_SLEEPING_MINUTES - current_sleep_minutes;
-               Print("🛑 NOT MONITORING: Need ", DoubleToString(remaining_minutes, 1), " more sleep minutes");
-            }
-         }
-
-         // Additional info
-         if (is_sleeping)
-            Print("💤 SLEEPING: Divergence irrelevant (sleep takes precedence)");
-         else if (lines_are_diverging)
-            Print("📈 Lines diverging: YES (mouth opening possible)");
-         else
-            Print("📈 Lines diverging: NO (mouth closed/closing)");
-
-         last_debug = TimeCurrent();
-      }
+      case STATE_SLEEPING: return "SLEEPING";
+      case STATE_READY_TO_MONITOR: return "READY_TO_MONITOR";
+      case STATE_MONITORING_BREAKOUT: return "MONITORING_BREAKOUT";
+      case STATE_TRADE_EXECUTED: return "TRADE_EXECUTED";
+      case STATE_POSITION_ACTIVE: return "POSITION_ACTIVE";
+      case STATE_WAITING_FOR_SLEEP: return "WAITING_FOR_SLEEP";
+      default: return "UNKNOWN";
    }
 }
 
@@ -590,7 +573,7 @@ bool CheckLinesAreDiverging()
 void CheckPriceBreakoutFromJaw()
 {
    // Only check when actively monitoring
-   if (!monitoring_breakout)
+   if (current_state != STATE_MONITORING_BREAKOUT)
       return;
 
    // Update price history array with current LIVE price + recent bar closes
@@ -761,15 +744,8 @@ bool ValidatePriceTrendConsistency(TrendDirection direction)
 //                         TRADE SIGNAL DETECTION
 //============================================================================
 
-void CheckForTradeSignals()
-{
-   // The new system uses breakout detection instead of simple signals
-   // Trading signals are now generated by ExecuteBreakoutTrade()
-   // which is called from MonitorBreakoutProgress()
-
-   // This function is kept for compatibility but does nothing
-   // All trading decisions are now made in the advanced alligator analysis
-}
+// Trade signals are now handled by the state machine in ProcessStateMachine()
+// Breakout detection happens in CheckPriceBreakoutFromJaw() when in STATE_MONITORING_BREAKOUT
 
 void ExecuteBreakoutTrade(TrendDirection direction)
 {
@@ -788,11 +764,6 @@ void ExecuteBreakoutTrade(TrendDirection direction)
          Print("🟢 EXECUTING BULLISH BREAKOUT TRADE");
 
       ExecuteBuyTrade();
-
-      // Set up mouth opening monitoring
-      entry_time = TimeCurrent();
-      waiting_for_mouth_open = true;
-      mouth_has_opened = false;
    }
    else if (direction == BEARISH_TREND)
    {
@@ -800,22 +771,16 @@ void ExecuteBreakoutTrade(TrendDirection direction)
          Print("🔴 EXECUTING BEARISH BREAKOUT TRADE");
 
       ExecuteSellTrade();
-
-      // Set up mouth opening monitoring
-      entry_time = TimeCurrent();
-      waiting_for_mouth_open = true;
-      mouth_has_opened = false;
    }
 
    last_signal_time = TimeCurrent();
-
-   // Stop breakout monitoring after trade execution
-   monitoring_breakout = false;
    ResetBreakoutTracking(); // Reset tracking after trade execution
 
-   // Switch to position management phase
-   if (DEBUG_LEVEL >= 1)
-      Print("🔄 PHASE SWITCH: Trade executed → Position management active (monitoring stopped)");
+   // Transition to trade executed state for mouth opening monitoring
+   if (current_position_ticket != 0)
+   {
+      TransitionToState(STATE_TRADE_EXECUTED, "Trade executed - waiting for mouth to open");
+   }
 }
 
 //============================================================================
@@ -942,167 +907,15 @@ void ExecuteSellTrade()
 //                        POSITION MANAGEMENT
 //============================================================================
 
-void ManageOpenPosition()
-{
-   // Check if position still exists
-   if (!PositionSelectByTicket(current_position_ticket))
-   {
-      // Position was closed (by SL/TP or manually)
-      if (DEBUG_LEVEL >= 1)
-         Print("Position closed: ", current_position_ticket);
-
-      ResetPositionTracking();
-      return;
-   }
-
-   bool should_exit = false;
-   string exit_reason = "";
-   datetime current_time = TimeCurrent();
-
-   // PHASE 1: Waiting for mouth to open after breakout entry (TIME-BASED)
-   if (waiting_for_mouth_open && !mouth_has_opened)
-   {
-      double minutes_since_entry = (current_time - entry_time) / 60.0;
-      bool lines_are_diverging = CheckLinesAreDiverging();
-
-      // Check if mouth has opened (alligator is properly awake)
-      // Note: is_bullish_awake and is_bearish_awake already include divergence check
-      // and sleep conditions take precedence (if sleeping, these are false)
-      bool mouth_opened = false;
-      if (position_direction == BULLISH_TREND && is_bullish_awake)
-      {
-         mouth_opened = true;
-      }
-      else if (position_direction == BEARISH_TREND && is_bearish_awake)
-      {
-         mouth_opened = true;
-      }
-
-      if (mouth_opened)
-      {
-         mouth_has_opened = true;
-         waiting_for_mouth_open = false;
-
-         if (DEBUG_LEVEL >= 1)
-         {
-            Print("✅ MOUTH OPENED: Alligator confirmed awake AND diverging after ", DoubleToString(minutes_since_entry, 1), " minutes");
-            Print("  📊 Line alignment: ", (position_direction == BULLISH_TREND) ? "Bullish" : "Bearish", " ✓");
-            Print("  📈 Lines diverging: YES ✓");
-         }
-      }
-      else if (minutes_since_entry >= MAX_MOUTH_OPENING_MINUTES)
-      {
-         // Mouth didn't open in time - exit trade
-         should_exit = true;
-         string alignment_status = "";
-         if (position_direction == BULLISH_TREND)
-            alignment_status = is_bullish_awake ? "Awake ✓" : "Not awake ❌";
-         else
-            alignment_status = is_bearish_awake ? "Awake ✓" : "Not awake ❌";
-
-         exit_reason = "Mouth failed to open within " + DoubleToString(MAX_MOUTH_OPENING_MINUTES, 1) + " minutes (" +
-                       alignment_status + (is_sleeping ? " - Sleeping" : " - Not sleeping") + ")";
-      }
-      // Don't exit just because alligator is sleeping - wait for full window
-      else
-      {
-         // Debug waiting progress (TIME-BASED)
-         if (DEBUG_LEVEL >= 1)
-         {
-            static datetime last_waiting_debug = 0;
-            if (current_time - last_waiting_debug > 60) // Every 60 seconds
-            {
-               string alignment_status = "";
-               if (position_direction == BULLISH_TREND)
-                  alignment_status = is_bullish_awake ? "Awake ✓" : "Not awake ❌";
-               else
-                  alignment_status = is_bearish_awake ? "Awake ✓" : "Not awake ❌";
-
-               Print("⏳ WAITING FOR MOUTH OPENING: ", DoubleToString(minutes_since_entry, 1), "/", DoubleToString(MAX_MOUTH_OPENING_MINUTES, 1), " minutes");
-               Print("  📊 Alligator state: ", alignment_status, (is_sleeping ? " (Sleeping)" : " (Not sleeping)"));
-               last_waiting_debug = current_time;
-            }
-         }
-      }
-   }
-
-   // PHASE 2: Mouth has opened - monitor for closure or price reversal
-   else if (mouth_has_opened)
-   {
-      // Check if alligator went back to sleep or lost proper awake state
-      bool still_awake = false;
-      if (position_direction == BULLISH_TREND && is_bullish_awake)
-         still_awake = true;
-      else if (position_direction == BEARISH_TREND && is_bearish_awake)
-         still_awake = true;
-         
-      if (!still_awake)
-      {
-         should_exit = true;
-         if (is_sleeping)
-            exit_reason = "Alligator went back to sleep - mouth closed";
-         else
-            exit_reason = "Alligator mouth closed - lost proper alignment or divergence";
-      }
-      // Check if price crossed back through lips (momentum reversal)
-      else if (position_direction == BULLISH_TREND && price < lips)
-      {
-         should_exit = true;
-         exit_reason = "Price closed below lips - bullish momentum lost";
-      }
-      else if (position_direction == BEARISH_TREND && price > lips)
-      {
-         should_exit = true;
-         exit_reason = "Price closed above lips - bearish momentum lost";
-      }
-   }
-
-   // Execute exit if needed
-   if (should_exit)
-   {
-      ClosePosition(exit_reason);
-   }
-
-   // Debug position status
-   if (DEBUG_LEVEL >= 2)
-   {
-      static datetime last_position_debug = 0;
-      if (current_time - last_position_debug > 30) // Every 30 seconds
-      {
-         string direction = (position_direction == BULLISH_TREND) ? "LONG" : "SHORT";
-         double profit = PositionGetDouble(POSITION_PROFIT);
-         double minutes_in_trade = (current_time - entry_time) / 60.0;
-
-         Print("=== POSITION STATUS ===");
-         Print("Direction: ", direction, " | P&L: $", DoubleToString(profit, 2));
-         Print("Minutes in trade: ", DoubleToString(minutes_in_trade, 1));
-         Print("Waiting for mouth: ", waiting_for_mouth_open ? "YES" : "NO");
-         Print("Mouth opened: ", mouth_has_opened ? "YES" : "NO");
-
-         if (waiting_for_mouth_open)
-         {
-            Print("Mouth opening requirements:");
-            Print("  Alligator state: Bullish=", is_bullish_awake ? "Awake ✓" : "Not awake ❌", " | Bearish=", is_bearish_awake ? "Awake ✓" : "Not awake ❌");
-            Print("  Overall sleeping: ", is_sleeping ? "YES (blocks awake)" : "NO");
-         }
-         else
-         {
-            Print("Current mouth state: Bullish=", is_bullish_awake ? "AWAKE" : "ASLEEP/CLOSED",
-                  " | Bearish=", is_bearish_awake ? "AWAKE" : "ASLEEP/CLOSED");
-         }
-
-         last_position_debug = current_time;
-      }
-   }
-}
+// Position management is now handled by the state machine in ProcessStateMachine()
+// Individual states handle their own position logic:
+// - STATE_TRADE_EXECUTED: Waits for mouth to open
+// - STATE_POSITION_ACTIVE: Monitors for exit conditions
 
 void ResetPositionTracking()
 {
    current_position_ticket = 0;
    position_direction = NO_TREND;
-   entry_time = 0;
-   waiting_for_mouth_open = false;
-   mouth_has_opened = false;
 }
 
 void ClosePosition(string reason)
@@ -1285,11 +1098,11 @@ string GetErrorDescription(int error_code)
 
 void ShowInfoPanel()
 {
-   // Alligator status (TIME-BASED)
+   // Alligator status based on conditions
    string gator_status = "";
-   if (is_sleeping)
+   if (lines_are_horizontal)
    {
-      double current_sleep_minutes = sleep_start_time > 0 ? (TimeCurrent() - sleep_start_time) / 60.0 : 0.0;
+      double current_sleep_minutes = (TimeCurrent() - state_start_time) / 60.0;
       string sleep_info = "";
       if (current_sleep_minutes >= MIN_SLEEPING_MINUTES)
          sleep_info = " (READY " + DoubleToString(current_sleep_minutes, 1) + "/" + DoubleToString(MIN_SLEEPING_MINUTES, 1) + ")";
@@ -1305,48 +1118,7 @@ void ShowInfoPanel()
    else
       gator_status = "😐 LINES SEPARATING";
 
-   // Breakout monitoring status
-   string breakout_status = "";
-   if (monitoring_breakout)
-   {
-      // Show breakout tracking info if price is beyond jaw
-      string slope_info = "";
-      double required_distance = MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER * atr_value;
-      double current_distance = MathAbs(price - jaw);
-      
-      if (price_beyond_jaw && breakout_start_time > 0)
-      {
-         double elapsed_seconds = (double)(TimeCurrent() - breakout_start_time);
-         if (elapsed_seconds > 0)
-         {
-            double current_slope = CalculateSlopeAngleFromSeconds(breakout_start_price, price, elapsed_seconds);
-            slope_info = " | Tracking: " + DoubleToString(current_slope, 1) + "°/" + DoubleToString(MIN_BREAKOUT_SLOPE, 1) + "°";
-         }
-      }
-      
-      slope_info += " | Dist: " + DoubleToString(current_distance, 1) + "/" + DoubleToString(required_distance, 1);
-      
-      breakout_status = "🎯 ACTIVE MONITORING" + slope_info;
-   }
-   else if (current_position_ticket != 0)
-   {
-      breakout_status = "💼 POSITION ACTIVE: Monitoring paused";
-   }
-   else
-   {
-      double current_sleep_minutes = is_sleeping && sleep_start_time > 0 ? (TimeCurrent() - sleep_start_time) / 60.0 : 0.0;
-      if (current_sleep_minutes >= MIN_SLEEPING_MINUTES)
-      {
-         breakout_status = "😴 READY: Will monitor when no position";
-      }
-      else
-      {
-         double remaining_minutes = MIN_SLEEPING_MINUTES - current_sleep_minutes;
-         breakout_status = "⏳ Need " + DoubleToString(remaining_minutes, 1) + " more sleep minutes";
-      }
-   }
-
-   // Position status
+   // Position status based on current state
    string position_status = "No Position";
    if (current_position_ticket != 0)
    {
@@ -1354,13 +1126,13 @@ void ShowInfoPanel()
       string direction = (position_direction == BULLISH_TREND) ? "LONG" : "SHORT";
       position_status = direction + " | P&L: $" + DoubleToString(profit, 2);
 
-      if (waiting_for_mouth_open)
+      if (current_state == STATE_TRADE_EXECUTED)
       {
-         double minutes_waiting = (TimeCurrent() - entry_time) / 60.0;
+         double minutes_waiting = (TimeCurrent() - state_start_time) / 60.0;
          position_status += " | Waiting for mouth (" + DoubleToString(minutes_waiting, 1) + "/" +
                             DoubleToString(MAX_MOUTH_OPENING_MINUTES, 1) + ")";
       }
-      else if (mouth_has_opened)
+      else if (current_state == STATE_POSITION_ACTIVE)
       {
          position_status += " | Mouth OPEN";
       }
@@ -1368,14 +1140,14 @@ void ShowInfoPanel()
 
    string info = StringFormat(
        "🐊 ADVANCED ALLIGATOR SCALPER | Trades: %d/%d\n" +
+           "State: %s\n" +
            "Gator: %s\n" +
-           "Breakout: %s\n" +
            "Position: %s\n" +
            "Price: $%s | Lips: $%s | Teeth: $%s | Jaw: $%s\n" +
-           "ATR: $%s | Risk: %.1f%% | Reward: %.1f:1",
+           "ATR: $%s | Risk: %.1f%% | Reward: %.1f:1 | Strict: %s",
        daily_trade_count, MAX_DAILY_TRADES,
+       GetStateName(current_state),
        gator_status,
-       breakout_status,
        position_status,
        DoubleToString(price, 2),
        DoubleToString(lips, 2),
@@ -1383,7 +1155,8 @@ void ShowInfoPanel()
        DoubleToString(jaw, 2),
        DoubleToString(atr_value, 2),
        RISK_PERCENT,
-       REWARD_RATIO);
+       REWARD_RATIO,
+       STRICT_BREAKOUT_TIMING ? "YES" : "NO");
 
    Comment(info);
 }
@@ -1399,11 +1172,14 @@ double OnTester()
 {
    // Get backtest statistics
    double total_trades = TesterStatistics(STAT_TRADES);
+   double profit_trades = TesterStatistics(STAT_PROFIT_TRADES);
+   double loss_trades = TesterStatistics(STAT_LOSS_TRADES);
    double gross_profit = TesterStatistics(STAT_GROSS_PROFIT);
    double gross_loss = TesterStatistics(STAT_GROSS_LOSS);
    double net_profit = TesterStatistics(STAT_PROFIT);
    double max_drawdown = TesterStatistics(STAT_BALANCE_DD);
    double initial_deposit = TesterStatistics(STAT_INITIAL_DEPOSIT);
+   double profit_factor = TesterStatistics(STAT_PROFIT_FACTOR);
    
    // Avoid division by zero and reject invalid data
    if (total_trades < 5 || initial_deposit <= 0)
@@ -1417,36 +1193,58 @@ double OnTester()
       return 0.0;
    }
    
+   // Calculate additional metrics
+   double win_rate = (profit_trades / total_trades) * 100.0;
    double roi_percent = (net_profit / initial_deposit) * 100.0;
    double drawdown_percent = (max_drawdown / initial_deposit) * 100.0;
    
-   // SIMPLE FITNESS: High profit + Low drawdown + More trades
+   // Reject strategies with poor win rates (less than 30%)
+   if (win_rate < 30.0)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("OPTIMIZATION REJECTED: Win rate too low (", DoubleToString(win_rate, 1), "%)");
+      return 0.0;
+   }
+   
+   // ENHANCED FITNESS: Profit + Win Rate + Low Drawdown + Trade Volume
    
    // Base score: Profit adjusted for drawdown
    double profit_score;
-   if (drawdown_percent > 0.1)  // Only adjust if meaningful drawdown (>0.1%)
-      profit_score = net_profit / drawdown_percent;  // Dollar profit per % drawdown
+   if (drawdown_percent > 0.1)
+      profit_score = net_profit / drawdown_percent;
    else
-      profit_score = net_profit * 100.0;  // Zero/tiny drawdown = multiply profit by 100 (huge bonus)
+      profit_score = net_profit * 100.0;
    
-   // Trade multiplier: More trades = better (with diminishing returns)
-   double trade_multiplier = MathLog(total_trades + 1);  // Log scale to prevent explosion
+   // Win rate bonus: Higher win rates get multiplier boost
+   double win_rate_multiplier = 1.0 + (win_rate - 50.0) / 100.0;  // 50% = 1.0x, 60% = 1.1x, 70% = 1.2x
+   if (win_rate_multiplier < 0.5) win_rate_multiplier = 0.5;  // Minimum 0.5x
    
-   // Final fitness: Profit efficiency × Trade activity
-   double fitness = profit_score * trade_multiplier;
+   // Profit factor bonus: PF > 1.5 gets bonus
+   double pf_multiplier = 1.0;
+   if (profit_factor > 1.5)
+      pf_multiplier = 1.0 + (profit_factor - 1.5) * 0.2;  // Each 0.1 above 1.5 adds 2% bonus
+   
+   // Trade volume multiplier
+   double trade_multiplier = MathLog(total_trades + 1);
+   
+   // Final fitness: Profit efficiency × Win rate × Profit factor × Trade volume
+   double fitness = profit_score * win_rate_multiplier * pf_multiplier * trade_multiplier;
    
    // Debug output for optimization
    if (DEBUG_LEVEL >= 1)
    {
-      Print("=== SIMPLE OPTIMIZATION RESULTS ===");
-      Print("Total Trades: ", (int)total_trades);
-      Print("Net Profit: $", DoubleToString(net_profit, 2));
-      Print("ROI: ", DoubleToString(roi_percent, 2), "%");
+      Print("=== ENHANCED OPTIMIZATION RESULTS ===");
+      Print("Total Trades: ", (int)total_trades, " | Wins: ", (int)profit_trades, " | Losses: ", (int)loss_trades);
+      Print("Win Rate: ", DoubleToString(win_rate, 1), "% | Profit Factor: ", DoubleToString(profit_factor, 2));
+      Print("Net Profit: $", DoubleToString(net_profit, 2), " | ROI: ", DoubleToString(roi_percent, 2), "%");
       Print("Max Drawdown: ", DoubleToString(drawdown_percent, 2), "%");
+      Print("--- Fitness Components ---");
       Print("Profit Score: ", DoubleToString(profit_score, 2));
+      Print("Win Rate Multiplier: ", DoubleToString(win_rate_multiplier, 2), "x");
+      Print("Profit Factor Multiplier: ", DoubleToString(pf_multiplier, 2), "x");
       Print("Trade Multiplier: ", DoubleToString(trade_multiplier, 2));
       Print("FINAL FITNESS: ", DoubleToString(fitness, 2));
-      Print("===================================");
+      Print("=====================================");
    }
    
    return fitness;

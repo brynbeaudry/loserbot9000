@@ -63,6 +63,10 @@ input uchar BOX_OPACITY = 20;     // Box opacity (0-255)
 input bool LABEL_STATS = true;    // Show info label
 input int DEBUG_LEVEL = 0;        // Debug level: 0=none, 1=basic, 2=detailed
 
+// 7) Dynamic Stop Loss Management
+input bool ENABLE_BREAKEVEN_SL = true;     // Enable stop-loss move to break-even
+input double BREAKEVEN_TRIGGER_MULT = 0.5; // Move SL to BE when profit = this × range_size
+
 //---------------  INTERNAL STATE  ---------------------------//
 enum TradeState
 {
@@ -118,6 +122,9 @@ int atr_handle = INVALID_HANDLE;
 double price = 0;
 
 // Time variables are now defined in the TIME VARIABLES section
+
+// Break-even tracking
+bool moved_to_breakeven = false;
 
 //+------------------------------------------------------------------+
 //| Time utility functions                                           |
@@ -369,10 +376,12 @@ int OnInit()
       Print("Stop Loss Strategy: ", sl_strategy);
 
       Print("Volatility Filter: ", USE_VOLATILITY_FILTER ? "Enabled" : "Disabled");
+      Print("Break-Even SL: ", ENABLE_BREAKEVEN_SL ? "Enabled" : "Disabled");
+      if (ENABLE_BREAKEVEN_SL)
+         Print("  - Trigger: ", DoubleToString(BREAKEVEN_TRIGGER_MULT, 1), "× range size profit");
       Print("=================================");
    }
 
-   // Calculate ATR
    // Initialize ATR handle for efficient indicator access
    atr_handle = iATR(_Symbol, _Period, ATR_PERIOD);
    if (atr_handle == INVALID_HANDLE)
@@ -383,23 +392,6 @@ int OnInit()
    }
 
    UpdateATR();
-
-   // Add volume indicator to chart
-   int volume_indicator = iVolumes(_Symbol, PERIOD_CURRENT, VOLUME_TICK);
-   if (volume_indicator != INVALID_HANDLE)
-   {
-      // Add to separate window below main chart
-      if (!ChartIndicatorAdd(0, 1, volume_indicator))
-      {
-         if (DEBUG_LEVEL >= 1)
-            Print("Failed to add volume indicator to chart. Error: ", GetLastError());
-      }
-      else
-      {
-         if (DEBUG_LEVEL >= 2)
-            Print("Volume indicator added to chart successfully");
-      }
-   }
 
    // Verify test data is available during session hours
    ValidateTestData();
@@ -855,6 +847,10 @@ void ResetSession()
    // Reset breakout tracking (counters removed - using simple buffer crossing)
 
    box_drawn = false;
+   
+   // Reset break-even tracking
+   moved_to_breakeven = false;
+   
    ObjectsDeleteAll(0, box_name);
    ObjectsDeleteAll(0, hl_name);
    ObjectsDeleteAll(0, ll_name);
@@ -1037,7 +1033,7 @@ void CheckBreakout()
    else if (price <= bear_breakout_level && price <= close)
    {
       if (ValidateBreakout(false)) // false = bearish
-      {
+   {
          ProcessBreakout(false, close, buffer_points);
       }
    }
@@ -1243,8 +1239,8 @@ void UpdateATR()
       {
          if (DEBUG_LEVEL >= 1)
             Print("Insufficient data for ATR median calculation. Need at least 10 bars, have ", bars_needed);
-         return;
-      }
+      return;
+   }
 
       // Get ATR values for the period
       ArrayResize(atr_history, bars_needed);
@@ -1353,8 +1349,8 @@ void ManageAfterHoursPos()
             ShowLabel(); // Update display immediately
       }
       ticket = 0;
-      return;
-   }
+         return;
+      }
 
    // Special check to detect time gaps (like weekends)
    static datetime last_check_time = 0;
@@ -1430,7 +1426,7 @@ int GetSymbolSlippage()
       //          spread=10 → 10*1.5+20 = 35 points
       calculated_slippage = (int)(spread * 1.5 + 20);
 
-      if (DEBUG_LEVEL >= 1)
+   if (DEBUG_LEVEL >= 1)
          Print("Auto-detected 2-digit instrument like Gold: ", _Symbol);
    }
    else if (digits == 3) // JPY pairs
@@ -1540,7 +1536,7 @@ bool IsTrendAlignmentBullish()
 
    double bullish_percentage = (double)bullish_candles / total_directional_candles;
 
-   if (DEBUG_LEVEL >= 2)
+      if (DEBUG_LEVEL >= 2)
    {
       Print("BULLISH TREND ALIGNMENT: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ",
             total_directional_candles, " directional moves (",
@@ -1707,6 +1703,7 @@ void SendOrder(ENUM_ORDER_TYPE type)
    ticket = res.order;
    trades_today++;
    trade_state = STATE_IN_POSITION;
+   moved_to_breakeven = false; // Reset break-even flag for new position
    if (LABEL_STATS)
       ShowLabel(); // Update display immediately
 
@@ -1778,45 +1775,17 @@ double CalculateLotSize(double entry_price, double stop_loss)
    
    // Calculate stop loss distance in points
    double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
-   string symbol = _Symbol;
    
-   // Calculate lots based on instrument type
-   double lots = 0;
+   // Use broker-specific contract specifications instead of hardcoded values
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    
-   // Convert symbol to uppercase for case-insensitive comparison
-   string symbol_upper = symbol;
-   StringToUpper(symbol_upper);
+   // Calculate the actual point value from broker data
+   double point_value = tick_value * (_Point / tick_size);
    
-   if (StringFind(symbol_upper, "XAUUSD") >= 0 || StringFind(symbol_upper, "GOLD") >= 0)
-   {
-      // Gold: Each point = $1 for CFD
-      double point_value = 1.0;
-      lots = risk_amt / (sl_dist_pts * point_value);
-   }
-   else if (StringFind(symbol_upper, "NAS100") >= 0 || StringFind(symbol_upper, "NAS") >= 0 ||
-            StringFind(symbol_upper, "SP500") >= 0 || StringFind(symbol_upper, "SPX") >= 0 || 
-            StringFind(symbol_upper, "DJ30") >= 0 || StringFind(symbol_upper, "DOW") >= 0)
-   {
-      // Index CFDs: Each point = $1 for CFD at PU Prime
-      double point_value = 1.0;
-      lots = risk_amt / (sl_dist_pts * point_value);
-   }
-   else if (StringFind(symbol_upper, "EURUSD") >= 0 || StringFind(symbol_upper, "GBPUSD") >= 0 || 
-            StringFind(symbol_upper, "AUDUSD") >= 0 || StringFind(symbol_upper, "NZDUSD") >= 0)
-   {
-      // USD pairs: Each pip = $10 per standard lot
-      double sl_dist_pips = sl_dist_pts / 10.0;
-      double pip_value = 10.0;
-      lots = risk_amt / (sl_dist_pips * pip_value);
-   }
-   else if (StringFind(symbol_upper, "USDJPY") >= 0)
-   {
-      // JPY pairs: Each pip = ¥1000 per standard lot
-      double sl_dist_pips = sl_dist_pts / 100.0;
-      double pip_value = (1000.0 / entry_price);
-      lots = risk_amt / (sl_dist_pips * pip_value);
-   }
-   
+   // Calculate lots using broker's actual specifications
+   double lots = risk_amt / (sl_dist_pts * point_value);
+
    // Normalize lot size to broker requirements
    // First round to lot_step precision
    int lot_step_decimals = 0;
@@ -1826,61 +1795,50 @@ double CalculateLotSize(double entry_price, double stop_loss)
       lot_step_decimals++;
       temp_step *= 10;
    }
-   
+
    lots = NormalizeDouble(lots / lot_step, lot_step_decimals) * lot_step;
    lots = NormalizeDouble(lots, lot_step_decimals); // Ensure final value is properly rounded
-   
+
    // Ensure minimum lot size
    lots = MathMax(lots, lot_min);
-   
+
    // Debug logging
-   if (DEBUG_LEVEL >= 1) // Changed to level 1 to see more info about lot calculations
+   if (DEBUG_LEVEL >= 1)
    {
-      Print("=== LOT SIZE CALCULATION ===");
+      Print("=== BROKER-BASED LOT SIZE CALCULATION ===");
+      Print("Symbol: ", _Symbol);
       Print("Account equity: $", DoubleToString(account_equity, 2));
       Print("Risk amount: $", DoubleToString(risk_amt, 2));
       Print("Stop loss distance in points: ", DoubleToString(sl_dist_pts, 1));
-      Print("Lot step decimals: ", lot_step_decimals);
+      Print("Broker tick value: $", DoubleToString(tick_value, 4));
+      Print("Broker tick size: ", DoubleToString(tick_size, _Digits));
+      Print("Calculated point value: $", DoubleToString(point_value, 4));
       Print("Raw lot size: ", DoubleToString(lots, lot_step_decimals));
       Print("Normalized lot size: ", DoubleToString(lots, lot_step_decimals));
       Print("Minimum lot: ", DoubleToString(lot_min, lot_step_decimals));
       Print("Lot step: ", DoubleToString(lot_step, lot_step_decimals));
       Print("Actual risk: $", DoubleToString(CalculateActualRisk(lots, entry_price, stop_loss), 2));
-      Print("========================");
+      Print("=========================================");
    }
-   
+
    return lots;
 }
 
 // Calculate actual risk amount for verification
 double CalculateActualRisk(double lots, double entry_price, double stop_loss)
 {
-   string symbol = _Symbol;
-   string symbol_upper = symbol;
-   StringToUpper(symbol_upper);
    double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
-   double actual_risk = 0;
    
-   if (StringFind(symbol_upper, "XAUUSD") >= 0 || StringFind(symbol_upper, "GOLD") >= 0)
-   {
-      actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
-   }
-   else if (StringFind(symbol_upper, "NAS100") >= 0 || StringFind(symbol_upper, "NAS") >= 0 ||
-            StringFind(symbol_upper, "SP500") >= 0 || StringFind(symbol_upper, "SPX") >= 0 || 
-            StringFind(symbol_upper, "DJ30") >= 0 || StringFind(symbol_upper, "DOW") >= 0)
-   {
-      actual_risk = lots * sl_dist_pts * 1.0; // $1 per point
-   }
-   else if (StringFind(symbol_upper, "EURUSD") >= 0 || StringFind(symbol_upper, "GBPUSD") >= 0 || 
-            StringFind(symbol_upper, "AUDUSD") >= 0 || StringFind(symbol_upper, "NZDUSD") >= 0)
-   {
-      actual_risk = lots * (sl_dist_pts / 10.0) * 10.0; // $10 per pip
-   }
-   else if (StringFind(symbol_upper, "USDJPY") >= 0)
-   {
-      actual_risk = lots * (sl_dist_pts / 100.0) * (1000.0 / entry_price);
-   }
+   // Use broker-specific contract specifications
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    
+   // Calculate the actual point value from broker data
+   double point_value = tick_value * (_Point / tick_size);
+   
+   // Calculate actual risk using broker specifications
+   double actual_risk = lots * sl_dist_pts * point_value;
+
    return actual_risk;
 }
 
@@ -1996,6 +1954,9 @@ void ManagePos()
    double sl = PositionGetDouble(POSITION_SL);
    double tp = PositionGetDouble(POSITION_TP);
    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+
+   // Manage break-even stop loss
+   ManageBreakEvenSL(position_type, open_price, sl, tp);
 
    // Get current time
    datetime current_time = TimeCurrent();
@@ -2258,7 +2219,7 @@ double OnTester()
    double fitness = weighted_profit * drawdown_factor * trade_factor;
 
    // Debug output for optimization
-   if (DEBUG_LEVEL >= 1)
+      if (DEBUG_LEVEL >= 1)
    {
       Print("=== PROFIT-FOCUSED OPTIMIZATION RESULTS ===");
       Print("Total Trades: ", (int)total_trades);
@@ -2276,5 +2237,92 @@ double OnTester()
    return fitness;
 }
 
+
+
 //+------------------------------------------------------------------+
+//| Validate breakout conditions (unified for both directions)       |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Manage break-even stop loss                                      |
+//+------------------------------------------------------------------+
+void ManageBreakEvenSL(ENUM_POSITION_TYPE position_type, double entry_price, double current_sl, double current_tp)
+{
+   // Skip if break-even is disabled or already moved
+   if (!ENABLE_BREAKEVEN_SL || moved_to_breakeven)
+      return;
+      
+   // Check for edge case: if SL strategy is CLOSE and SL is already at entry, skip
+   if (STOP_LOSS_STRATEGY == SL_CLOSE && MathAbs(current_sl - entry_price) < _Point)
+   {
+   if (DEBUG_LEVEL >= 2)
+         Print("Break-even skipped: SL strategy is CLOSE and SL already at entry");
+      moved_to_breakeven = true; // Mark as moved to avoid repeated checks
+      return;
+   }
+   
+   // Calculate trigger level based on position direction
+   double trigger_distance = BREAKEVEN_TRIGGER_MULT * range_size;
+   double trigger_level;
+   
+   if (position_type == POSITION_TYPE_BUY)
+   {
+      trigger_level = entry_price + trigger_distance;
+   }
+   else // POSITION_TYPE_SELL
+   {
+      trigger_level = entry_price - trigger_distance;
+   }
+   
+   // Get current price
+   double current_price = (position_type == POSITION_TYPE_BUY) ? 
+                         SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   // Check if trigger level is reached
+   bool trigger_reached = false;
+   if (position_type == POSITION_TYPE_BUY && current_price >= trigger_level)
+      trigger_reached = true;
+   else if (position_type == POSITION_TYPE_SELL && current_price <= trigger_level)
+      trigger_reached = true;
+      
+   if (trigger_reached)
+   {
+      // Modify stop loss to break-even (entry price)
+      MqlTradeRequest mod = {};
+      MqlTradeResult res = {};
+      
+      mod.action = TRADE_ACTION_SLTP;
+      mod.position = ticket;
+      mod.sl = entry_price;
+      mod.tp = current_tp;
+      
+      if (OrderSend(mod, res))
+      {
+         if (res.retcode == 10009) // Success
+         {
+            moved_to_breakeven = true;
+            string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
+            
+      if (DEBUG_LEVEL >= 1)
+               Print("BREAK-EVEN ACTIVATED: ", direction, " position SL moved to entry (",
+                     DoubleToString(entry_price, _Digits), ") after +",
+                     DoubleToString(BREAKEVEN_TRIGGER_MULT, 1), "× range profit");
+         }
+         else
+   {
+      if (DEBUG_LEVEL >= 1)
+               Print("Break-even SL modification failed: ", GetErrorDescription(res.retcode));
+         }
+      }
+      else
+   {
+      if (DEBUG_LEVEL >= 1)
+            Print("Break-even SL modification request failed: ", GetLastError());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate stop loss based on strategy                            |
 //+------------------------------------------------------------------+
