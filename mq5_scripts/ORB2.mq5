@@ -36,11 +36,6 @@ input SLPlacement STOP_LOSS_STRATEGY = SL_OUTER; // Stop loss placement strategy
 input double RISK_PER_TRADE_PCT = 1.0; // % equity risk
 input int MAX_TRADES_PER_DAY = 2;      // Max trades per day
 
-// Add back the global variables for broker lot constraints
-// Broker lot size constraints
-double lot_min = 0;  // Will be set from broker
-double lot_step = 0; // Will be set from broker
-
 // 4) Volatility filter
 input bool USE_VOLATILITY_FILTER = true; // Enable volatility filter
 input double ATR_THRESHOLD_PCT = 80.0;   // ATR Threshold Percentage - Keep 80% for balanced trading; lower to 70% for more signals; raise to 90% for stronger breakouts only
@@ -112,6 +107,11 @@ datetime active_trading_session = 0; // Timestamp of the trading session we're c
 double breakout_start_price = 0;  // Price when breakout started
 datetime breakout_start_time = 0; // Time when breakout started
 bool currently_in_breakout = false; // Track if we're currently in a breakout state
+
+// Add back the global variables for broker lot constraints
+// Broker lot size constraints
+double lot_min = 0;  // Will be set from broker
+double lot_step = 0; // Will be set from broker
 
 // ATR history for median calculation
 double atr_history[];

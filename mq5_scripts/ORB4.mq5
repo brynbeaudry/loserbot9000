@@ -14,14 +14,14 @@ enum SessionType
    CLASSIC_NYSE = 0, // Classic NYSE (09:30 - 10:00 NY)
    EARLY_US = 1      // Early US (08:00 - 08:30 NY)
 };
-input SessionType SESSION_TYPE = CLASSIC_NYSE; // Session window to use
-input int SESSION_OR_MINUTES = 30;             // Opening-range length (minutes)
-input int NY_SESSION_CLOSE_HOUR = 16;          // NY Close hour (default 16:00 NY)
+input SessionType SESSION_TYPE = CLASSIC_NYSE; // SESSION_TYPE: Session window to use
+input int SESSION_OR_MINUTES = 30;             // SESSION_OR_MINUTES: Opening-range length (minutes)
+input int NY_SESSION_CLOSE_HOUR = 16;          // NY_SESSION_CLOSE_HOUR: NY Close hour (default 16:00 NY)
 
 // 2) Breakout / risk
-input double RANGE_BUFFER_MULT = 0.2; // Buffer as range fraction (replaces ATR buffer)
-input int TREND_CANDLES = 15;         // Number of candles for trend detection
-input double TREND_THRESHOLD = 0.6;   // Trend confirmation threshold (0.6 = 60% of candles must be in trend direction)
+input double RANGE_BUFFER_MULT = 0.2; // RANGE_BUFFER_MULT: Buffer as range fraction (replaces ATR buffer)
+input int TREND_CANDLES = 15;         // TREND_CANDLES: Number of candles for trend detection
+input double TREND_THRESHOLD = 0.6;   // TREND_THRESHOLD: Trend confirmation threshold (0.6 = 60% of candles must be in trend direction)
 
 // Stop loss placement strategy
 enum SLPlacement
@@ -30,37 +30,39 @@ enum SLPlacement
    SL_MIDDLE = 1, // Middle of the range (moderate)
    SL_CLOSE = 2   // Close to breakout point (tight, aggressive)
 };
-input SLPlacement STOP_LOSS_STRATEGY = SL_OUTER; // Stop loss placement strategy
+input SLPlacement STOP_LOSS_STRATEGY = SL_OUTER; // STOP_LOSS_STRATEGY: Stop loss placement strategy
 
 // 3) Money-management
-input double RISK_PER_TRADE_PCT = 1.0; // % equity risk
-input int MAX_TRADES_PER_DAY = 2;      // Max trades per day
+input double RISK_PER_TRADE_PCT = 1.0; // RISK_PER_TRADE_PCT: % equity risk
+input int MAX_TRADES_PER_DAY = 2;      // MAX_TRADES_PER_DAY: Max trades per day
 
 // 4) Volatility filter
-input bool USE_VOLATILITY_FILTER = true; // Enable volatility filter
-input double ATR_THRESHOLD_PCT = 80.0;   // ATR Threshold Percentage - Keep 80% for balanced trading; lower to 70% for more signals; raise to 90% for stronger breakouts only
-input int ATR_PERIOD = 14;               // ATR Period - Keep 14 for standard volatility; lower to 7 for faster response; raise to 21 for smoother readings
-input int ATR_MEDIAN_DAYS = 120;         // ATR Median Days - Keep 120 days (6 months) for stable markets; lower to 60-90 days for adapting to changing regimes
+input bool USE_VOLATILITY_FILTER = true; // USE_VOLATILITY_FILTER: Enable volatility filter
+input double ATR_THRESHOLD_PCT = 80.0;   // ATR_THRESHOLD_PCT: ATR Threshold Percentage - Keep 80% for balanced trading; lower to 70% for more signals; raise to 90% for stronger breakouts only
+input int ATR_PERIOD = 14;               // ATR_PERIOD: ATR Period - Keep 14 for standard volatility; lower to 7 for faster response; raise to 21 for smoother readings
+input int ATR_MEDIAN_DAYS = 120;         // ATR_MEDIAN_DAYS: ATR Median Days - Keep 120 days (6 months) for stable markets; lower to 60-90 days for adapting to changing regimes
 
 // 5) Range Multiple Target
 // This multiplies the opening range size (high-low) to determine TP distance from entry:
 // For buy orders: TP = entry + (range_size × RANGE_MULT)
 // For sell orders: TP = entry - (range_size × RANGE_MULT)
 //
-input double RANGE_MULT = 1.0;                     // Keep 1.0 for balanced risk:reward; lower to 0.5-0.8 for faster but smaller profits; raise to 1.5-2.0 for larger but slower profits
-input double MIN_BREAKOUT_ANGLE = 75.0;            // Minimum angle from breakout point to current price (degrees, 0=disabled)
-input bool ALLOW_TP_AFTER_HOURS = false;           // Allow positions to reach TP after session close (will close before next session)
-input int CLOSE_MINUTES_BEFORE_NEXT_SESSION = 120; // Minutes before next session to close after-hours positions (only applies if ALLOW_TP_AFTER_HOURS is true)
+input double RANGE_MULT = 1.0;                     // RANGE_MULT: Keep 1.0 for balanced risk:reward; lower to 0.5-0.8 for faster but smaller profits; raise to 1.5-2.0 for larger but slower profits
+input double MIN_BREAKOUT_ANGLE = 75.0;            // MIN_BREAKOUT_ANGLE: Minimum angle from breakout point to current price (degrees, 0=disabled)
+input bool ALLOW_TP_AFTER_HOURS = false;           // ALLOW_TP_AFTER_HOURS: Allow positions to reach TP after session close (will close before next session)
+input int CLOSE_MINUTES_BEFORE_NEXT_SESSION = 120; // CLOSE_MINUTES_BEFORE_NEXT_SESSION: Minutes before next session to close after-hours positions (only applies if ALLOW_TP_AFTER_HOURS is true)
 
 // 6) Visuals
-input color BOX_COLOR = 0x0000FF; // Box color (Blue)
-input uchar BOX_OPACITY = 20;     // Box opacity (0-255)
-input bool LABEL_STATS = true;    // Show info label
-input int DEBUG_LEVEL = 0;        // Debug level: 0=none, 1=basic, 2=detailed
+input color BOX_COLOR = 0x0000FF; // BOX_COLOR: Box color (Blue) - set to clrNONE to disable all drawing
+input uchar BOX_OPACITY = 20;     // BOX_OPACITY: Box opacity (0-255)
+input bool LABEL_STATS = true;    // LABEL_STATS: Show info label
+input int DEBUG_LEVEL = 0;        // DEBUG_LEVEL: Debug level: 0=none, 1=basic, 2=detailed
+input bool BACKTEST_SPEED_OPTIMIZATION = true; // BACKTEST_SPEED_OPTIMIZATION: Speed optimization (true=enabled, false=disabled)
 
-// 7) Dynamic Stop Loss Management
-input bool ENABLE_BREAKEVEN_SL = true;     // Enable stop-loss move to break-even
-input double BREAKEVEN_TRIGGER_MULT = 0.5; // Move SL to BE when profit = this × range_size
+// 7) Trailing Stop Loss Management
+input double TRAILING_START_MULT = 0.75;   // TRAILING_START_MULT: Start trailing when profit = this × range_size (0=disabled)
+input double TRAILING_STEP_MULT = 0.25;    // TRAILING_STEP_MULT: Trail in steps of this × range_size
+input double TRAILING_DISTANCE_MULT = 0.5; // TRAILING_DISTANCE_MULT: Keep SL this distance × range_size from current price
 
 //---------------  INTERNAL STATE  ---------------------------//
 enum TradeState
@@ -128,8 +130,11 @@ double price = 0;
 
 // Time variables are now defined in the TIME VARIABLES section
 
-// Break-even tracking
-bool moved_to_breakeven = false;
+// Trailing stop loss tracking
+bool trailing_active = false;        // Is trailing stop currently active
+double trailing_highest_price = 0;   // Highest price reached (for long positions)
+double trailing_lowest_price = 0;    // Lowest price reached (for short positions)
+double trailing_last_sl_level = 0;   // Last trailing SL level set
 
 //+------------------------------------------------------------------+
 //| Time utility functions                                           |
@@ -142,35 +147,6 @@ datetime DateOfDay(datetime t)
    dt.min = 0;
    dt.sec = 0;
    return StructToTime(dt);
-}
-
-bool IsNYDST(datetime ts)
-{
-   MqlDateTime dt;
-   TimeToStruct(ts, dt);
-   int year = dt.year;
-
-   // DST start = 2nd Sunday in March at 2 AM
-   datetime march1 = StringToTime(StringFormat("%d.03.01 02:00", year));
-
-   // Get day of week (0-Sunday, 1-Monday, etc.)
-   MqlDateTime march_dt;
-   TimeToStruct(march1, march_dt);
-   int w_m1 = march_dt.day_of_week;
-
-   datetime dstStart = march1 + ((7 - w_m1) % 7 + 7) * 86400;
-
-   // DST end = 1st Sunday in November at 2 AM
-   datetime nov1 = StringToTime(StringFormat("%d.11.01 02:00", year));
-
-   // Get day of week
-   MqlDateTime nov_dt;
-   TimeToStruct(nov1, nov_dt);
-   int w_n1 = nov_dt.day_of_week;
-
-   datetime dstEnd = nov1 + ((7 - w_n1) % 7) * 86400;
-
-   return (ts >= dstStart && ts < dstEnd);
 }
 
 //+------------------------------------------------------------------+
@@ -381,9 +357,13 @@ int OnInit()
       Print("Stop Loss Strategy: ", sl_strategy);
 
       Print("Volatility Filter: ", USE_VOLATILITY_FILTER ? "Enabled" : "Disabled");
-      Print("Break-Even SL: ", ENABLE_BREAKEVEN_SL ? "Enabled" : "Disabled");
-      if (ENABLE_BREAKEVEN_SL)
-         Print("  - Trigger: ", DoubleToString(BREAKEVEN_TRIGGER_MULT, 1), "× range size profit");
+      Print("Trailing SL: ", TRAILING_START_MULT > 0 ? "Enabled" : "Disabled");
+      if (TRAILING_START_MULT > 0)
+      {
+         Print("  - Start: ", DoubleToString(TRAILING_START_MULT, 1), "× range size profit");
+         Print("  - Step: ", DoubleToString(TRAILING_STEP_MULT, 1), "× range size increments");
+         Print("  - Distance: ", DoubleToString(TRAILING_DISTANCE_MULT, 1), "× range size from peak");
+      }
       Print("=================================");
    }
 
@@ -501,11 +481,46 @@ void OnTick()
    // Get current time - use once for efficiency
    datetime current_time = TimeCurrent();
 
-   // Note: We now use tick-based breakout detection for faster response
-
    // Recalculate session times - critical for accurate after-hours position management
    // Must run on every tick for reliability
    ComputeSession();
+
+   // SPEED OPTIMIZATION: Skip ticks outside relevant trading periods
+   if (BACKTEST_SPEED_OPTIMIZATION && ticket == 0 && trade_state == STATE_IDLE)
+   {
+      // Skip if on NYSE holiday (already computed)
+      if (IsNYSEHoliday(current_time))
+         return;
+      
+      // Skip ticks when we're well outside the relevant trading window
+      // Factor in TP after-hours settings to determine when we can actually skip ticks
+      datetime effective_close_time;
+      
+      if (ALLOW_TP_AFTER_HOURS)
+      {
+         // If after-hours TP is enabled, positions can stay open until close to next session
+         // So we can only skip ticks very close to next session start
+         effective_close_time = next_session_start - CLOSE_MINUTES_BEFORE_NEXT_SESSION * 60;
+      }
+      else
+      {
+         // If after-hours TP is disabled, positions close at session end
+         // So we can skip ticks shortly after session end
+         effective_close_time = current_session_end;
+      }
+      
+      datetime buffer_after_close = 1800; // 30 minutes after effective close
+      datetime buffer_before_open = 1800; // 30 minutes before session start
+      
+      // Skip ticks in the dead zone between effective close + buffer and next session - buffer
+      if (current_time > (effective_close_time + buffer_after_close) && 
+          current_time < (next_session_start - buffer_before_open))
+      {
+         return;
+      }
+   }
+
+   // Note: We now use tick-based breakout detection for faster response
 
    // 2. SESSION MANAGEMENT
    // Detect new trading sessions
@@ -854,8 +869,11 @@ void ResetSession()
 
    box_drawn = false;
    
-   // Reset break-even tracking
-   moved_to_breakeven = false;
+   // Reset trailing stop loss tracking
+   trailing_active = false;
+   trailing_highest_price = 0;
+   trailing_lowest_price = 0;
+   trailing_last_sl_level = 0;
    
    // Reset NYSE ATR collection for fresh session data
    nyse_atr_collection_count = 0;
@@ -914,6 +932,13 @@ void DrawBox()
 {
    if (box_drawn)
       return;
+
+   // Skip drawing if box color is set to none
+   if (BOX_COLOR == clrNONE)
+   {
+      box_drawn = true; // Mark as drawn to prevent repeated calls
+      return;
+   }
 
    long chart_id = 0;
    datetime t0 = current_session_start;
@@ -1786,7 +1811,13 @@ void SendOrder(ENUM_ORDER_TYPE type)
    ticket = res.order;
    trades_today++;
    trade_state = STATE_IN_POSITION;
-   moved_to_breakeven = false; // Reset break-even flag for new position
+   
+   // Reset trailing stop loss variables for new position
+   trailing_active = false;
+   trailing_highest_price = 0;
+   trailing_lowest_price = 0;
+   trailing_last_sl_level = 0;
+   
    if (LABEL_STATS)
       ShowLabel(); // Update display immediately
 
@@ -2118,8 +2149,8 @@ void ManagePos()
    double tp = PositionGetDouble(POSITION_TP);
    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
 
-   // Manage break-even stop loss
-   ManageBreakEvenSL(position_type, open_price, sl, tp);
+   // Manage trailing stop loss
+   ManageTrailingSL(position_type, open_price, sl, tp);
 
    // Get current time
    datetime current_time = TimeCurrent();
@@ -2235,7 +2266,15 @@ void ShowLabel()
       if (PositionSelectByTicket(ticket))
       {
          ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         status = "In " + (ptype == POSITION_TYPE_BUY ? "LONG" : "SHORT") + " position";
+         string position_status = "In " + (ptype == POSITION_TYPE_BUY ? "LONG" : "SHORT") + " position";
+         
+         // Add trailing stop status
+         if (TRAILING_START_MULT > 0 && trailing_active)
+         {
+            position_status += " (TRAILING)";
+         }
+         
+         status = position_status;
       }
       else
       {
@@ -2407,25 +2446,21 @@ double OnTester()
 //+------------------------------------------------------------------+
 
 //+------------------------------------------------------------------+
-//| Manage break-even stop loss                                      |
+//| Manage trailing stop loss                                        |
 //+------------------------------------------------------------------+
-void ManageBreakEvenSL(ENUM_POSITION_TYPE position_type, double entry_price, double current_sl, double current_tp)
+void ManageTrailingSL(ENUM_POSITION_TYPE position_type, double entry_price, double current_sl, double current_tp)
 {
-   // Skip if break-even is disabled or already moved
-   if (!ENABLE_BREAKEVEN_SL || moved_to_breakeven)
+   // Skip if trailing stop is disabled (TRAILING_START_MULT = 0)
+   if (TRAILING_START_MULT <= 0)
       return;
       
-   // Check for edge case: if SL strategy is CLOSE and SL is already at entry, skip
-   if (STOP_LOSS_STRATEGY == SL_CLOSE && MathAbs(current_sl - entry_price) < _Point)
-   {
-   if (DEBUG_LEVEL >= 2)
-         Print("Break-even skipped: SL strategy is CLOSE and SL already at entry");
-      moved_to_breakeven = true; // Mark as moved to avoid repeated checks
-      return;
-   }
+   // Get current price
+   double current_price = (position_type == POSITION_TYPE_BUY) ? 
+                         SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
    // Calculate trigger level based on position direction
-   double trigger_distance = BREAKEVEN_TRIGGER_MULT * range_size;
+   double trigger_distance = TRAILING_START_MULT * range_size;
    double trigger_level;
    
    if (position_type == POSITION_TYPE_BUY)
@@ -2437,51 +2472,116 @@ void ManageBreakEvenSL(ENUM_POSITION_TYPE position_type, double entry_price, dou
       trigger_level = entry_price - trigger_distance;
    }
    
-   // Get current price
-   double current_price = (position_type == POSITION_TYPE_BUY) ? 
-                         SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
-                         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   
-   // Check if trigger level is reached
-   bool trigger_reached = false;
-   if (position_type == POSITION_TYPE_BUY && current_price >= trigger_level)
-      trigger_reached = true;
-   else if (position_type == POSITION_TYPE_SELL && current_price <= trigger_level)
-      trigger_reached = true;
-      
-   if (trigger_reached)
+   // Check if we should start trailing (profit threshold reached)
+   if (!trailing_active)
    {
-      // Modify stop loss to break-even (entry price)
-      MqlTradeRequest mod = {};
-      MqlTradeResult res = {};
+      bool should_start_trailing = false;
       
-      mod.action = TRADE_ACTION_SLTP;
-      mod.position = ticket;
-      mod.sl = entry_price;
-      mod.tp = current_tp;
-      
-      if (OrderSend(mod, res))
+      if (position_type == POSITION_TYPE_BUY && current_price >= trigger_level)
       {
-         if (res.retcode == 10009) // Success
-         {
-            moved_to_breakeven = true;
-            string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
-            
-      if (DEBUG_LEVEL >= 1)
-               Print("BREAK-EVEN ACTIVATED: ", direction, " position SL moved to entry (",
-                     DoubleToString(entry_price, _Digits), ") after +",
-                     DoubleToString(BREAKEVEN_TRIGGER_MULT, 1), "× range profit");
-         }
-         else
+         should_start_trailing = true;
+         trailing_highest_price = current_price;
+      }
+      else if (position_type == POSITION_TYPE_SELL && current_price <= trigger_level)
+      {
+         should_start_trailing = true;
+         trailing_lowest_price = current_price;
+      }
+      
+      if (should_start_trailing)
+      {
+         trailing_active = true;
+         trailing_last_sl_level = current_sl;
+         
+         string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
+         if (DEBUG_LEVEL >= 1)
+            Print("TRAILING STOP ACTIVATED: ", direction, " position reached +",
+                  DoubleToString(TRAILING_START_MULT, 1), "× range profit trigger");
+         return; // Don't trail on first activation, just mark as active
+      }
+   }
+   
+   // If trailing is active, manage the trailing stop
+   if (trailing_active)
    {
-      if (DEBUG_LEVEL >= 1)
-               Print("Break-even SL modification failed: ", GetErrorDescription(res.retcode));
+      bool should_update_sl = false;
+      double new_sl_level = current_sl;
+      
+      if (position_type == POSITION_TYPE_BUY)
+      {
+         // Update highest price reached
+         if (current_price > trailing_highest_price)
+         {
+            trailing_highest_price = current_price;
+         }
+         
+         // Calculate new SL level based on trailing distance
+         double trailing_distance = TRAILING_DISTANCE_MULT * range_size;
+         double potential_sl = trailing_highest_price - trailing_distance;
+         
+         // Only update if the new SL is higher than current and represents a meaningful step
+         double step_size = TRAILING_STEP_MULT * range_size;
+         if (potential_sl > current_sl && (potential_sl - trailing_last_sl_level) >= step_size)
+         {
+            new_sl_level = potential_sl;
+            should_update_sl = true;
          }
       }
-      else
-   {
-      if (DEBUG_LEVEL >= 1)
-            Print("Break-even SL modification request failed: ", GetLastError());
+      else // POSITION_TYPE_SELL
+      {
+         // Update lowest price reached
+         if (current_price < trailing_lowest_price)
+         {
+            trailing_lowest_price = current_price;
+         }
+         
+         // Calculate new SL level based on trailing distance
+         double trailing_distance = TRAILING_DISTANCE_MULT * range_size;
+         double potential_sl = trailing_lowest_price + trailing_distance;
+         
+         // Only update if the new SL is lower than current and represents a meaningful step
+         double step_size = TRAILING_STEP_MULT * range_size;
+         if (potential_sl < current_sl && (trailing_last_sl_level - potential_sl) >= step_size)
+         {
+            new_sl_level = potential_sl;
+            should_update_sl = true;
+         }
+      }
+      
+      // Execute the trailing stop update
+      if (should_update_sl)
+      {
+         MqlTradeRequest mod = {};
+         MqlTradeResult res = {};
+         
+         mod.action = TRADE_ACTION_SLTP;
+         mod.position = ticket;
+         mod.sl = new_sl_level;
+         mod.tp = current_tp;
+         
+         if (OrderSend(mod, res))
+         {
+            if (res.retcode == 10009) // Success
+            {
+               trailing_last_sl_level = new_sl_level;
+               string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
+               
+               if (DEBUG_LEVEL >= 1)
+                  Print("TRAILING STOP UPDATED: ", direction, " SL moved to ",
+                        DoubleToString(new_sl_level, _Digits), " (distance: ",
+                        DoubleToString(TRAILING_DISTANCE_MULT, 1), "× range from peak)");
+            }
+            else
+            {
+               if (DEBUG_LEVEL >= 1)
+                  Print("Trailing SL modification failed: ", GetErrorDescription(res.retcode));
+            }
+         }
+         else
+         {
+            if (DEBUG_LEVEL >= 1)
+               Print("Trailing SL modification request failed: ", GetLastError());
+         }
       }
    }
 }

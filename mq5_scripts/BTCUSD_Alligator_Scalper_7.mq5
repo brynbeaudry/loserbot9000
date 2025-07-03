@@ -12,7 +12,7 @@
 //+------------------------------------------------------------------+
 // ✅ COMPLETED: Changed bar-based sleep/mouth tracking to time-based (minutes)
 // ✅ COMPLETED: Reorganized state management with formal state machine
-// ⏳ REMAINING: Convert GATOR_HORIZONTAL_CHECK_BARS and BREAKOUT_TREND_CONSISTENCY_BARS to time-based
+// ⏳ REMAINING: Do both strategies, one where you can catch the breakout with zero trend candles if the breakout is strong, and one where you can catch the breakout with a few trend candles if the breakout is weak.
 
 //============================================================================
 //                           USER SETTINGS
