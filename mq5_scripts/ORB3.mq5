@@ -113,11 +113,15 @@ double breakout_start_price = 0;  // Price when breakout started
 datetime breakout_start_time = 0; // Time when breakout started
 bool currently_in_breakout = false; // Track if we're currently in a breakout state
 
-// ATR history for median calculation
+// ATR history for median calculation (NYSE session only)
 double atr_history[];
 
 // ATR handle for efficient indicator access
 int atr_handle = INVALID_HANDLE;
+
+// NYSE session ATR collection
+double nyse_session_atr_values[];
+int nyse_atr_collection_count = 0;
 
 // Current live price for trend detection (set in CheckBreakout)
 double price = 0;
@@ -853,6 +857,10 @@ void ResetSession()
    // Reset break-even tracking
    moved_to_breakeven = false;
    
+   // Reset NYSE ATR collection for fresh session data
+   nyse_atr_collection_count = 0;
+   ArrayFree(nyse_session_atr_values);
+   
    ObjectsDeleteAll(0, box_name);
    ObjectsDeleteAll(0, hl_name);
    ObjectsDeleteAll(0, ll_name);
@@ -1220,8 +1228,11 @@ void UpdateATR()
 
    // Get current ATR value (from previous completed bar)
    atr_value = atr_buff[1];
+   
+   // Collect ATR values only during NYSE session hours for better median calculation
+   CollectNYSESessionATR();
 
-   // Calculate or recalculate median ATR if needed
+   // Calculate or recalculate median ATR if needed (using NYSE session data only)
    static datetime last_median_calculation = 0;
    const int MEDIAN_RECALC_HOURS = 168; // Recalculate weekly (7 days × 24 hours)
    
@@ -1234,74 +1245,124 @@ void UpdateATR()
       {
          should_calculate_median = true;
          if (DEBUG_LEVEL >= 1)
-            Print("Initial ATR median calculation triggered");
+            Print("Initial NYSE session ATR median calculation triggered");
       }
       // Periodic recalculation (weekly)
       else if (TimeCurrent() - last_median_calculation > MEDIAN_RECALC_HOURS * 3600)
       {
          should_calculate_median = true;
          if (DEBUG_LEVEL >= 1)
-            Print("Periodic ATR median recalculation triggered (", MEDIAN_RECALC_HOURS, " hours elapsed)");
+            Print("Periodic NYSE session ATR median recalculation triggered (", MEDIAN_RECALC_HOURS, " hours elapsed)");
       }
    }
    
    if (should_calculate_median)
    {
-      // For median calculation we need a longer ATR history
-      // NY trading session: 9:30 AM - 4:00 PM = 6.5 hours = 390 one-minute bars per day
-      int bars_per_trading_day = 390;
-      int bars_needed = ATR_MEDIAN_DAYS * bars_per_trading_day;
+      CalculateNYSESessionATRMedian();
+      last_median_calculation = TimeCurrent();
+   }
+}
 
-      // Make sure we don't request more bars than available
-      int available_bars = Bars(_Symbol, _Period);
-      if (bars_needed > available_bars)
-         bars_needed = available_bars;
+//+------------------------------------------------------------------+
+//| Collect ATR values only during NYSE trading sessions             |
+//+------------------------------------------------------------------+
+void CollectNYSESessionATR()
+{
+   // Only collect during NYSE session hours
+   datetime current_time = TimeCurrent();
+   if (!IsWithinSessionHours(current_time))
+      return;
+      
+   // Avoid collecting the same ATR value multiple times during the same minute
+   static datetime last_collection_time = 0;
+   static int last_collection_minute = -1;
+   
+   MqlDateTime dt;
+   TimeToStruct(current_time, dt);
+   int current_minute = dt.hour * 60 + dt.min;
+   
+   // Only collect once per minute and avoid duplicate collections
+   if (current_minute == last_collection_minute || current_time - last_collection_time < 60)
+      return;
+      
+   // Expand the collection array if needed
+   nyse_atr_collection_count++;
+   ArrayResize(nyse_session_atr_values, nyse_atr_collection_count);
+   
+   // Store the current ATR value
+   nyse_session_atr_values[nyse_atr_collection_count - 1] = atr_value;
+   
+   last_collection_time = current_time;
+   last_collection_minute = current_minute;
+   
+   if (DEBUG_LEVEL >= 3)
+      Print("NYSE ATR collected: ", DoubleToString(atr_value, _Digits), 
+            " (total collected: ", nyse_atr_collection_count, ")");
+}
 
-      // Only proceed if we have enough data
-      if (bars_needed < 10)
-      {
-         if (DEBUG_LEVEL >= 1)
-            Print("Insufficient data for ATR median calculation. Need at least 10 bars, have ", bars_needed);
+//+------------------------------------------------------------------+
+//| Calculate median from NYSE session ATR values only               |
+//+------------------------------------------------------------------+
+void CalculateNYSESessionATRMedian()
+{
+   // Need sufficient NYSE session data for reliable median
+   int min_required_samples = 50; // At least 50 session ATR values
+   
+   if (nyse_atr_collection_count < min_required_samples)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("Insufficient NYSE session ATR data for median calculation. Have ", 
+               nyse_atr_collection_count, ", need ", min_required_samples);
       return;
    }
-
-      // Get ATR values for the period
-      ArrayResize(atr_history, bars_needed);
-
-      if (CopyBuffer(atr_handle, 0, 0, bars_needed, atr_history) <= 0)
+   
+   // Create a copy for sorting (don't modify the original collection)
+   ArrayResize(atr_history, nyse_atr_collection_count);
+   ArrayCopy(atr_history, nyse_session_atr_values);
+   
+   // Sort the array to find median
+   ArraySort(atr_history);
+   
+   // Calculate median
+   int middle = nyse_atr_collection_count / 2;
+   double new_median;
+   if (nyse_atr_collection_count % 2 == 0) // Even number of elements
+      new_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
+   else // Odd number of elements
+      new_median = atr_history[middle];
+   
+   // Log the change if this is an update
+   if (atr_median > 0 && DEBUG_LEVEL >= 1)
+   {
+      double change_pct = ((new_median - atr_median) / atr_median) * 100.0;
+      Print("NYSE Session ATR median updated: ", DoubleToString(atr_median, _Digits), 
+            " → ", DoubleToString(new_median, _Digits),
+            " (", (change_pct >= 0 ? "+" : ""), DoubleToString(change_pct, 1), "%)");
+   }
+   else if (DEBUG_LEVEL >= 1)
+   {
+      Print("NYSE Session ATR median calculated: ", DoubleToString(new_median, _Digits),
+            " from ", nyse_atr_collection_count, " NYSE session samples");
+   }
+   
+   atr_median = new_median;
+   
+   // Optionally trim the collection to prevent unlimited growth
+   // Keep only the most recent samples
+   int max_samples = 500; // Keep last 500 session ATR values
+   if (nyse_atr_collection_count > max_samples)
+   {
+      // Shift array to keep only recent values
+      int samples_to_remove = nyse_atr_collection_count - max_samples;
+      for (int i = 0; i < max_samples; i++)
       {
-         if (DEBUG_LEVEL >= 1)
-            Print("Error getting ATR history: ", GetLastError());
-         return;
+         nyse_session_atr_values[i] = nyse_session_atr_values[i + samples_to_remove];
       }
-
-      // Sort the array to find median
-      ArraySort(atr_history);
-
-      // Median is the middle value (or average of the two middle values)
-      int middle = bars_needed / 2;
-      double new_median;
-      if (bars_needed % 2 == 0) // Even number of elements
-         new_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
-      else // Odd number of elements
-         new_median = atr_history[middle];
-
-      // Log the change if this is an update
-      if (atr_median > 0 && DEBUG_LEVEL >= 1)
-      {
-         double change_pct = ((new_median - atr_median) / atr_median) * 100.0;
-         Print("ATR median updated: ", DoubleToString(atr_median, _Digits), 
-               " → ", DoubleToString(new_median, _Digits),
-               " (", (change_pct >= 0 ? "+" : ""), DoubleToString(change_pct, 1), "%)");
-      }
-      else if (DEBUG_LEVEL >= 1)
-      {
-         Print("ATR median calculated: ", DoubleToString(new_median, _Digits),
-               " from ", bars_needed, " bars (", ATR_MEDIAN_DAYS, " trading days)");
-      }
+      nyse_atr_collection_count = max_samples;
+      ArrayResize(nyse_session_atr_values, nyse_atr_collection_count);
       
-      atr_median = new_median;
-      last_median_calculation = TimeCurrent();
+      if (DEBUG_LEVEL >= 2)
+         Print("NYSE ATR collection trimmed to most recent ", max_samples, " samples");
    }
 }
 

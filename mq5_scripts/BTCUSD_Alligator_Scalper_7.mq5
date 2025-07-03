@@ -47,7 +47,7 @@ input double MAX_LINE_SPREAD_DOLLARS = 50.0;       // MAX_LINE_SPREAD_DOLLARS: M
 
 // Breakout Validation
 input double MIN_BREAKOUT_SLOPE = 45;   // MIN_BREAKOUT_SLOPE: Minimum slope angle from jaw (degrees) for valid breakout
-input int BREAKOUT_TREND_CONSISTENCY_BARS = 3; // BREAKOUT_TREND_CONSISTENCY_BARS: Number of recent bars analyzed to validate price movement direction matches breakout
+input int BREAKOUT_TREND_CONSISTENCY_BARS = 3; // BREAKOUT_TREND_CONSISTENCY_BARS: Number of recent bars analyzed to validate price movement direction matches breakout (0 = disable trend consistency, use distance-only)
 input double MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER = 1.5; // MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER: ATR multiplier for minimum dollar distance price must move from jaw
 // Trading Controls
 input double MIN_SIGNAL_COOLDOWN_MINUTES = 3.0; // MIN_SIGNAL_COOLDOWN_MINUTES: Minimum minutes between signals (allows fractions)
@@ -206,7 +206,10 @@ int OnInit()
    Print("Strict breakout timing: ", STRICT_BREAKOUT_TIMING ? "ON (miss boat if mouth opens before trade)" : "OFF (continue monitoring after mouth opens)");
    Print("--- Price Breakout Validation ---");
    Print("Minimum breakout slope: ", MIN_BREAKOUT_SLOPE, "° angle from actual jaw crossing point");
-   Print("Trend consistency window: ", BREAKOUT_TREND_CONSISTENCY_BARS, " bars (for recent trend validation)");
+   if (BREAKOUT_TREND_CONSISTENCY_BARS > 0)
+      Print("Trend consistency window: ", BREAKOUT_TREND_CONSISTENCY_BARS, " bars (for recent trend validation)");
+   else
+      Print("Trend consistency: DISABLED (0 bars) - using distance-only validation");
    Print("ATR distance multiplier: ", MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER);
    Print("Logic: Track from jaw crossing → Validate slope from actual start point");
    Print("==============================================");
@@ -622,11 +625,15 @@ void CheckPriceBreakoutFromJaw()
 
    // Update price history array with current LIVE price + recent bar closes
    // This enables trend consistency validation that includes real-time market action
-   UpdatePriceHistory();
-
-   // Check if we have enough price data for trend consistency
-   if (ArraySize(price_history) < BREAKOUT_TREND_CONSISTENCY_BARS)
-      return;
+   // Only update if trend consistency is enabled (BREAKOUT_TREND_CONSISTENCY_BARS > 0)
+   if (BREAKOUT_TREND_CONSISTENCY_BARS > 0)
+   {
+      UpdatePriceHistory();
+      
+      // Check if we have enough price data for trend consistency
+      if (ArraySize(price_history) < BREAKOUT_TREND_CONSISTENCY_BARS)
+         return;
+   }
 
    // Step 1: Check if price has moved beyond jaw (start tracking if not already)
    TrendDirection current_direction = NO_TREND;
@@ -669,7 +676,12 @@ void CheckPriceBreakoutFromJaw()
          double required_distance = MIN_ATR_BREAKOUT_DISTANCE_MULTIPLIER * atr_for_validation;
 
          // Check trend consistency using recent price history (includes current LIVE price)
-         bool trend_consistent = ValidatePriceTrendConsistency(breakout_direction);
+         // Skip trend consistency check if BREAKOUT_TREND_CONSISTENCY_BARS is 0
+         bool trend_consistent = true; // Default to true when trend consistency is disabled
+         if (BREAKOUT_TREND_CONSISTENCY_BARS > 0)
+         {
+            trend_consistent = ValidatePriceTrendConsistency(breakout_direction);
+         }
 
          // Check all breakout conditions
          bool slope_valid = (actual_slope_angle >= MIN_BREAKOUT_SLOPE);
@@ -687,7 +699,10 @@ void CheckPriceBreakoutFromJaw()
                Print("  Distance from jaw: ", DoubleToString(price_distance_from_jaw, 2), " (min: ", DoubleToString(required_distance, 2), ")");
                Print("  ATR for validation: $", DoubleToString(atr_for_validation, 2), 
                      (breakout_start_atr > 0) ? " (captured at breakout start)" : " (using current ATR as fallback)");
-               Print("  Trend consistency: ✓ (recent ", BREAKOUT_TREND_CONSISTENCY_BARS, "-bar history confirms direction)");
+               if (BREAKOUT_TREND_CONSISTENCY_BARS > 0)
+                  Print("  Trend consistency: ✓ (recent ", BREAKOUT_TREND_CONSISTENCY_BARS, "-bar history confirms direction)");
+               else
+                  Print("  Trend consistency: DISABLED (BREAKOUT_TREND_CONSISTENCY_BARS=0 - using distance-only validation)");
             }
             
             ExecuteBreakoutTrade(breakout_direction);
@@ -703,7 +718,10 @@ void CheckPriceBreakoutFromJaw()
                Print("  ATR for validation: $", DoubleToString(atr_for_validation, 2), 
                      (breakout_start_atr > 0) ? " (from breakout start)" : " (current ATR fallback)");
             }
-            if (!trend_consistent) Print("  Trend consistency: ❌");
+            if (!trend_consistent && BREAKOUT_TREND_CONSISTENCY_BARS > 0) 
+               Print("  Trend consistency: ❌");
+            else if (BREAKOUT_TREND_CONSISTENCY_BARS == 0)
+               Print("  Trend consistency: DISABLED");
          }
       }
    }
@@ -1280,8 +1298,36 @@ double OnTester()
    double profit_factor = TesterStatistics(STAT_PROFIT_FACTOR);
    
    // Avoid division by zero and reject invalid data
-   if (total_trades < 5 || initial_deposit <= 0)
+   if (total_trades < 1 || initial_deposit <= 0)
       return 0.0;
+   
+   // Target number of trades for optimization
+   double target_trades = 70.0;
+   
+   // Calculate trade volume penalty/bonus
+   double trade_penalty_multiplier = 1.0;
+   
+   if (total_trades < target_trades)
+   {
+      // Progressive penalty: the further below target, the worse the penalty
+      // Penalty ranges from 0.1x (far below) to 1.0x (at target)
+      double trade_ratio = total_trades / target_trades;
+      trade_penalty_multiplier = 0.1 + (0.9 * trade_ratio); // Scales from 0.1 to 1.0
+      
+      if (DEBUG_LEVEL >= 1)
+         Print("TRADE VOLUME PENALTY: ", (int)total_trades, " trades < ", (int)target_trades, 
+               " target. Penalty multiplier: ", DoubleToString(trade_penalty_multiplier, 2), "x");
+   }
+   else if (total_trades > target_trades)
+   {
+      // Small bonus for exceeding target (up to 1.2x multiplier)
+      double excess_ratio = (total_trades - target_trades) / target_trades;
+      trade_penalty_multiplier = 1.0 + MathMin(0.2, excess_ratio * 0.1); // Max 1.2x bonus
+      
+      if (DEBUG_LEVEL >= 1)
+         Print("TRADE VOLUME BONUS: ", (int)total_trades, " trades > ", (int)target_trades, 
+               " target. Bonus multiplier: ", DoubleToString(trade_penalty_multiplier, 2), "x");
+   }
    
    // Immediately reject zero or negative profit strategies
    if (net_profit <= 0.0)
@@ -1322,11 +1368,11 @@ double OnTester()
    if (profit_factor > 1.5)
       pf_multiplier = 1.0 + (profit_factor - 1.5) * 0.2;  // Each 0.1 above 1.5 adds 2% bonus
    
-   // Trade volume multiplier
+   // Trade volume multiplier (logarithmic scaling for additional trades)
    double trade_multiplier = MathLog(total_trades + 1);
    
-   // Final fitness: Profit efficiency × Win rate × Profit factor × Trade volume
-   double fitness = profit_score * win_rate_multiplier * pf_multiplier * trade_multiplier;
+   // Final fitness: Profit efficiency × Win rate × Profit factor × Trade volume × Trade target penalty/bonus
+   double fitness = profit_score * win_rate_multiplier * pf_multiplier * trade_multiplier * trade_penalty_multiplier;
    
    // Debug output for optimization
    if (DEBUG_LEVEL >= 1)
@@ -1340,7 +1386,8 @@ double OnTester()
       Print("Profit Score: ", DoubleToString(profit_score, 2));
       Print("Win Rate Multiplier: ", DoubleToString(win_rate_multiplier, 2), "x");
       Print("Profit Factor Multiplier: ", DoubleToString(pf_multiplier, 2), "x");
-      Print("Trade Multiplier: ", DoubleToString(trade_multiplier, 2));
+      Print("Trade Volume Multiplier: ", DoubleToString(trade_multiplier, 2));
+      Print("Trade Target Penalty/Bonus: ", DoubleToString(trade_penalty_multiplier, 2), "x");
       Print("FINAL FITNESS: ", DoubleToString(fitness, 2));
       Print("=====================================");
    }
