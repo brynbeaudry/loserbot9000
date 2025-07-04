@@ -53,16 +53,17 @@ input bool ALLOW_TP_AFTER_HOURS = false;           // ALLOW_TP_AFTER_HOURS: Allo
 input int CLOSE_MINUTES_BEFORE_NEXT_SESSION = 120; // CLOSE_MINUTES_BEFORE_NEXT_SESSION: Minutes before next session to close after-hours positions (only applies if ALLOW_TP_AFTER_HOURS is true)
 
 // 6) Visuals
-input color BOX_COLOR = 0x0000FF; // BOX_COLOR: Box color (Blue) - set to clrNONE to disable all drawing
-input uchar BOX_OPACITY = 20;     // BOX_OPACITY: Box opacity (0-255)
-input bool LABEL_STATS = true;    // LABEL_STATS: Show info label
-input int DEBUG_LEVEL = 0;        // DEBUG_LEVEL: Debug level: 0=none, 1=basic, 2=detailed
+input color BOX_COLOR = 0x0000FF;              // BOX_COLOR: Box color (Blue) - set to clrNONE to disable all drawing
+input uchar BOX_OPACITY = 20;                  // BOX_OPACITY: Box opacity (0-255)
+input bool LABEL_STATS = true;                 // LABEL_STATS: Show info label
+input int DEBUG_LEVEL = 0;                     // DEBUG_LEVEL: Debug level: 0=none, 1=basic, 2=detailed
 input bool BACKTEST_SPEED_OPTIMIZATION = true; // BACKTEST_SPEED_OPTIMIZATION: Speed optimization (true=enabled, false=disabled)
 
 // 7) Trailing Stop Loss Management
 input double TRAILING_START_MULT = 0.75;   // TRAILING_START_MULT: Start trailing when profit = this × range_size (0=disabled)
 input double TRAILING_STEP_MULT = 0.25;    // TRAILING_STEP_MULT: Trail in steps of this × range_size
 input double TRAILING_DISTANCE_MULT = 0.5; // TRAILING_DISTANCE_MULT: Keep SL this distance × range_size from current price
+input double BREAKEVEN_TRIGGER_MULT = 0.5; // BREAKEVEN_TRIGGER_MULT: Move SL to BE when profit = this × range_size (0=disabled)
 
 //---------------  INTERNAL STATE  ---------------------------//
 enum TradeState
@@ -106,8 +107,8 @@ datetime active_trading_session = 0; // Timestamp of the trading session we're c
 // REMOVED: breakout counters - using simple buffer crossing instead
 
 // Angle-based breakout tracking
-double breakout_start_price = 0;  // Price when breakout started
-datetime breakout_start_time = 0; // Time when breakout started
+double breakout_start_price = 0;    // Price when breakout started
+datetime breakout_start_time = 0;   // Time when breakout started
 bool currently_in_breakout = false; // Track if we're currently in a breakout state
 
 // ATR history for median calculation (NYSE session only)
@@ -131,10 +132,13 @@ double price = 0;
 // Time variables are now defined in the TIME VARIABLES section
 
 // Trailing stop loss tracking
-bool trailing_active = false;        // Is trailing stop currently active
-double trailing_highest_price = 0;   // Highest price reached (for long positions)
-double trailing_lowest_price = 0;    // Lowest price reached (for short positions)
-double trailing_last_sl_level = 0;   // Last trailing SL level set
+bool trailing_active = false;      // Is trailing stop currently active
+double trailing_highest_price = 0; // Highest price reached (for long positions)
+double trailing_lowest_price = 0;  // Lowest price reached (for short positions)
+double trailing_last_sl_level = 0; // Last trailing SL level set
+
+// Breakeven tracking
+bool moved_to_breakeven = false; // Track if we've already moved to breakeven
 
 //+------------------------------------------------------------------+
 //| Time utility functions                                           |
@@ -364,6 +368,9 @@ int OnInit()
          Print("  - Step: ", DoubleToString(TRAILING_STEP_MULT, 1), "× range size increments");
          Print("  - Distance: ", DoubleToString(TRAILING_DISTANCE_MULT, 1), "× range size from peak");
       }
+      Print("Breakeven SL: ", BREAKEVEN_TRIGGER_MULT > 0 ? "Enabled" : "Disabled");
+      if (BREAKEVEN_TRIGGER_MULT > 0)
+         Print("  - Trigger: ", DoubleToString(BREAKEVEN_TRIGGER_MULT, 1), "× range size profit");
       Print("=================================");
    }
 
@@ -491,11 +498,11 @@ void OnTick()
       // Skip if on NYSE holiday (already computed)
       if (IsNYSEHoliday(current_time))
          return;
-      
+
       // Skip ticks when we're well outside the relevant trading window
       // Factor in TP after-hours settings to determine when we can actually skip ticks
       datetime effective_close_time;
-      
+
       if (ALLOW_TP_AFTER_HOURS)
       {
          // If after-hours TP is enabled, positions can stay open until close to next session
@@ -508,12 +515,12 @@ void OnTick()
          // So we can skip ticks shortly after session end
          effective_close_time = current_session_end;
       }
-      
+
       datetime buffer_after_close = 1800; // 30 minutes after effective close
       datetime buffer_before_open = 1800; // 30 minutes before session start
-      
+
       // Skip ticks in the dead zone between effective close + buffer and next session - buffer
-      if (current_time > (effective_close_time + buffer_after_close) && 
+      if (current_time > (effective_close_time + buffer_after_close) &&
           current_time < (next_session_start - buffer_before_open))
       {
          return;
@@ -868,17 +875,20 @@ void ResetSession()
    ResetBreakoutTracking();
 
    box_drawn = false;
-   
+
    // Reset trailing stop loss tracking
    trailing_active = false;
    trailing_highest_price = 0;
    trailing_lowest_price = 0;
    trailing_last_sl_level = 0;
-   
+
+   // Reset breakeven tracking
+   moved_to_breakeven = false;
+
    // Reset NYSE ATR collection for fresh session data
    nyse_atr_collection_count = 0;
    ArrayFree(nyse_session_atr_values);
-   
+
    ObjectsDeleteAll(0, box_name);
    ObjectsDeleteAll(0, hl_name);
    ObjectsDeleteAll(0, ll_name);
@@ -1047,7 +1057,7 @@ void CheckBreakout()
 
    // Get current live price (for trend detection) and completed bar close (for breakout detection)
    price = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0; // Live mid price
-   double close = GetPreviousClose(); // Most recent completed bar close
+   double close = GetPreviousClose();                                                             // Most recent completed bar close
 
    // Calculate breakout levels using utility functions
    double bull_breakout_level = CalculateBullBreakoutLevel();
@@ -1065,9 +1075,9 @@ void CheckBreakout()
          // Price has gone back inside the buffer zone - reset tracking
          ResetBreakoutTracking();
          currently_in_breakout = false;
-         
+
          if (DEBUG_LEVEL >= 2)
-            Print("BREAKOUT RESET: Price returned inside buffer zone (", 
+            Print("BREAKOUT RESET: Price returned inside buffer zone (",
                   DoubleToString(price, _Digits), ")");
       }
    }
@@ -1084,7 +1094,7 @@ void CheckBreakout()
    else if (price <= bear_breakout_level && price <= close)
    {
       if (ValidateBreakout(false)) // false = bearish
-   {
+      {
          ProcessBreakout(false, close, buffer_points);
       }
    }
@@ -1127,7 +1137,7 @@ bool ValidateBreakout(bool is_bullish)
       {
          if (DEBUG_LEVEL >= 2)
             Print("STRONG OPPOSITE TREND DETECTED - resetting ", direction, " counters");
-         
+
          // Counter reset removed - using simple buffer crossing
          ResetBreakoutTracking();
       }
@@ -1140,7 +1150,7 @@ bool ValidateBreakout(bool is_bullish)
       string direction = is_bullish ? "BULLISH" : "BEARISH";
       Print(direction, " BREAKOUT with valid trend alignment - processing");
    }
-   
+
    return true;
 }
 
@@ -1156,15 +1166,14 @@ void ProcessBreakout(bool is_bullish, double close, double buffer_points)
          breakout_start_price = range_high + buffer_points;
       else
          breakout_start_price = range_low - buffer_points;
-      
+
       breakout_start_time = TimeCurrent();
       currently_in_breakout = true;
-      
+
       if (DEBUG_LEVEL >= 2)
-         Print("BREAKOUT TRACKING STARTED: ", (is_bullish ? "BULLISH" : "BEARISH"), 
+         Print("BREAKOUT TRACKING STARTED: ", (is_bullish ? "BULLISH" : "BEARISH"),
                " at price ", DoubleToString(breakout_start_price, _Digits));
    }
-
 
    // STEP 2: Angle validation (if enabled)
    if (MIN_BREAKOUT_ANGLE > 0)
@@ -1190,7 +1199,7 @@ void ProcessBreakout(bool is_bullish, double close, double buffer_points)
 void ExecuteBreakoutTrade(bool is_bullish, double close)
 {
    string direction = is_bullish ? "BULLISH" : "BEARISH";
-   
+
    if (DEBUG_LEVEL >= 1)
    {
       string angle_info = "";
@@ -1204,16 +1213,16 @@ void ExecuteBreakoutTrade(bool is_bullish, double close)
          angle_info = " | Angle: DISABLED";
       }
 
-      Print("CONFIRMED ", direction, " BREAKOUT + TREND + BUFFER CROSSING - EXECUTING ", 
+      Print("CONFIRMED ", direction, " BREAKOUT + TREND + BUFFER CROSSING - EXECUTING ",
             (is_bullish ? "BUY" : "SELL"), angle_info);
    }
 
    // Execute the trade
    ENUM_ORDER_TYPE order_type = is_bullish ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    SendOrder(order_type);
-   
+
    // Reset breakout tracking after trade
-         ResetBreakoutTracking();
+   ResetBreakoutTracking();
 }
 
 //+------------------------------------------------------------------+
@@ -1253,16 +1262,16 @@ void UpdateATR()
 
    // Get current ATR value (from previous completed bar)
    atr_value = atr_buff[1];
-   
+
    // Collect ATR values only during NYSE session hours for better median calculation
    CollectNYSESessionATR();
 
    // Calculate or recalculate median ATR if needed (using NYSE session data only)
    static datetime last_median_calculation = 0;
    const int MEDIAN_RECALC_HOURS = 168; // Recalculate weekly (7 days × 24 hours)
-   
+
    bool should_calculate_median = false;
-   
+
    if (USE_VOLATILITY_FILTER)
    {
       // Initial calculation if never done
@@ -1280,7 +1289,7 @@ void UpdateATR()
             Print("Periodic NYSE session ATR median recalculation triggered (", MEDIAN_RECALC_HOURS, " hours elapsed)");
       }
    }
-   
+
    if (should_calculate_median)
    {
       CalculateNYSESessionATRMedian();
@@ -1297,31 +1306,31 @@ void CollectNYSESessionATR()
    datetime current_time = TimeCurrent();
    if (!IsWithinSessionHours(current_time))
       return;
-      
+
    // Avoid collecting the same ATR value multiple times during the same minute
    static datetime last_collection_time = 0;
    static int last_collection_minute = -1;
-   
+
    MqlDateTime dt;
    TimeToStruct(current_time, dt);
    int current_minute = dt.hour * 60 + dt.min;
-   
+
    // Only collect once per minute and avoid duplicate collections
    if (current_minute == last_collection_minute || current_time - last_collection_time < 60)
       return;
-      
+
    // Expand the collection array if needed
    nyse_atr_collection_count++;
    ArrayResize(nyse_session_atr_values, nyse_atr_collection_count);
-   
+
    // Store the current ATR value
    nyse_session_atr_values[nyse_atr_collection_count - 1] = atr_value;
-   
+
    last_collection_time = current_time;
    last_collection_minute = current_minute;
-   
+
    if (DEBUG_LEVEL >= 3)
-      Print("NYSE ATR collected: ", DoubleToString(atr_value, _Digits), 
+      Print("NYSE ATR collected: ", DoubleToString(atr_value, _Digits),
             " (total collected: ", nyse_atr_collection_count, ")");
 }
 
@@ -1332,22 +1341,22 @@ void CalculateNYSESessionATRMedian()
 {
    // Need sufficient NYSE session data for reliable median
    int min_required_samples = 50; // At least 50 session ATR values
-   
+
    if (nyse_atr_collection_count < min_required_samples)
    {
       if (DEBUG_LEVEL >= 1)
-         Print("Insufficient NYSE session ATR data for median calculation. Have ", 
+         Print("Insufficient NYSE session ATR data for median calculation. Have ",
                nyse_atr_collection_count, ", need ", min_required_samples);
       return;
    }
-   
+
    // Create a copy for sorting (don't modify the original collection)
    ArrayResize(atr_history, nyse_atr_collection_count);
    ArrayCopy(atr_history, nyse_session_atr_values);
-   
+
    // Sort the array to find median
    ArraySort(atr_history);
-   
+
    // Calculate median
    int middle = nyse_atr_collection_count / 2;
    double new_median;
@@ -1355,12 +1364,12 @@ void CalculateNYSESessionATRMedian()
       new_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
    else // Odd number of elements
       new_median = atr_history[middle];
-   
+
    // Log the change if this is an update
    if (atr_median > 0 && DEBUG_LEVEL >= 1)
    {
       double change_pct = ((new_median - atr_median) / atr_median) * 100.0;
-      Print("NYSE Session ATR median updated: ", DoubleToString(atr_median, _Digits), 
+      Print("NYSE Session ATR median updated: ", DoubleToString(atr_median, _Digits),
             " → ", DoubleToString(new_median, _Digits),
             " (", (change_pct >= 0 ? "+" : ""), DoubleToString(change_pct, 1), "%)");
    }
@@ -1369,9 +1378,9 @@ void CalculateNYSESessionATRMedian()
       Print("NYSE Session ATR median calculated: ", DoubleToString(new_median, _Digits),
             " from ", nyse_atr_collection_count, " NYSE session samples");
    }
-   
+
    atr_median = new_median;
-   
+
    // Optionally trim the collection to prevent unlimited growth
    // Keep only the most recent samples
    int max_samples = 500; // Keep last 500 session ATR values
@@ -1385,7 +1394,7 @@ void CalculateNYSESessionATRMedian()
       }
       nyse_atr_collection_count = max_samples;
       ArrayResize(nyse_session_atr_values, nyse_atr_collection_count);
-      
+
       if (DEBUG_LEVEL >= 2)
          Print("NYSE ATR collection trimmed to most recent ", max_samples, " samples");
    }
@@ -1458,8 +1467,8 @@ void ManageAfterHoursPos()
             ShowLabel(); // Update display immediately
       }
       ticket = 0;
-         return;
-      }
+      return;
+   }
 
    // Special check to detect time gaps (like weekends)
    static datetime last_check_time = 0;
@@ -1535,7 +1544,7 @@ int GetSymbolSlippage()
       //          spread=10 → 10*1.5+20 = 35 points
       calculated_slippage = (int)(spread * 1.5 + 20);
 
-   if (DEBUG_LEVEL >= 1)
+      if (DEBUG_LEVEL >= 1)
          Print("Auto-detected 2-digit instrument like Gold: ", _Symbol);
    }
    else if (digits == 3) // JPY pairs
@@ -1645,7 +1654,7 @@ bool IsTrendAlignmentBullish()
 
    double bullish_percentage = (double)bullish_candles / total_directional_candles;
 
-      if (DEBUG_LEVEL >= 2)
+   if (DEBUG_LEVEL >= 2)
    {
       Print("BULLISH TREND ALIGNMENT: ", bullish_candles, " bullish, ", bearish_candles, " bearish out of ",
             total_directional_candles, " directional moves (",
@@ -1703,7 +1712,6 @@ bool IsTrendAlignmentBearish()
    return bearish_percentage >= TREND_THRESHOLD;
 }
 
-
 //+------------------------------------------------------------------+
 //| Calculate angle between two price points over time               |
 //+------------------------------------------------------------------+
@@ -1712,18 +1720,18 @@ double CalculateSlopeAngleFromSeconds(double price_start, double price_end, doub
    // Avoid division by zero
    if (elapsed_seconds <= 0.0)
       return 0.0;
-      
+
    // True geometric calculation: angle = atan(rise/run)
-   double price_change = MathAbs(price_end - price_start);  // Rise (dollars)
-   double time_change = elapsed_seconds;                    // Run (seconds)
-   
+   double price_change = MathAbs(price_end - price_start); // Rise (dollars)
+   double time_change = elapsed_seconds;                   // Run (seconds)
+
    // Geometric slope: dollars per second
    double slope = price_change / time_change;
-   
+
    // Convert to angle in degrees
    double angle_radians = MathArctan(slope);
    double angle_degrees = angle_radians * 180.0 / M_PI;
-   
+
    return angle_degrees;
 }
 
@@ -1738,7 +1746,6 @@ double CalculateBreakoutAngle(double start_price, datetime start_time, double cu
    double elapsed_seconds = (double)(TimeCurrent() - start_time);
    return CalculateSlopeAngleFromSeconds(start_price, current_price, elapsed_seconds);
 }
-
 
 //+------------------------------------------------------------------+
 //| Reset breakout tracking variables                                |
@@ -1811,13 +1818,16 @@ void SendOrder(ENUM_ORDER_TYPE type)
    ticket = res.order;
    trades_today++;
    trade_state = STATE_IN_POSITION;
-   
+
    // Reset trailing stop loss variables for new position
    trailing_active = false;
    trailing_highest_price = 0;
    trailing_lowest_price = 0;
    trailing_last_sl_level = 0;
-   
+
+   // Reset breakeven flag for new position
+   moved_to_breakeven = false;
+
    if (LABEL_STATS)
       ShowLabel(); // Update display immediately
 
@@ -1886,17 +1896,17 @@ double CalculateLotSize(double entry_price, double stop_loss)
    // Get account equity and calculate risk amount
    double account_equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double risk_amt = account_equity * RISK_PER_TRADE_PCT / 100.0;
-   
+
    // Calculate stop loss distance in points
    double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
-   
+
    // Use broker-specific contract specifications
    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   
+
    // Calculate point value with special handling for JPY pairs
    double point_value;
-   
+
    // Check if this is a JPY pair - they need special handling
    string symbol_upper = _Symbol;
    StringToUpper(symbol_upper);
@@ -1905,12 +1915,12 @@ double CalculateLotSize(double entry_price, double stop_loss)
       // For JPY pairs: Use broker data but be more careful about calculation
       // The broker's tick_value is usually per tick_size, so we need to scale it properly
       double base_point_value = tick_value * (_Point / tick_size);
-      
+
       // For JPY pairs, sometimes the broker calculation is off, so let's validate and adjust
       // A typical value for USDJPY should be around $0.001 per point for a mini lot
       // and around $0.01 per point for a standard lot
       point_value = base_point_value;
-      
+
       // Safety check: if the calculated value seems way off, apply a correction
       // For USDJPY, point value should typically be between $0.0001 and $0.1 per point
       if (point_value > 0.1 || point_value < 0.0001)
@@ -1924,20 +1934,20 @@ double CalculateLotSize(double entry_price, double stop_loss)
             // Typical pip value for 100,000 unit lot is about $6-10 depending on rate
             // So point value ≈ pip_value / 10
             double estimated_pip_value = lot_size * 0.01 / 150.0; // Assume ~150 rate
-            point_value = estimated_pip_value / 10.0; // 1 pip = 10 points
+            point_value = estimated_pip_value / 10.0;             // 1 pip = 10 points
          }
          else
          {
             // Final fallback
             point_value = 0.01; // Conservative estimate
          }
-         
+
          if (DEBUG_LEVEL >= 1)
             Print("JPY PAIR: Broker calculation seemed off, using fallback point value: $", DoubleToString(point_value, 6));
       }
-      
+
       if (DEBUG_LEVEL >= 1)
-         Print("JPY PAIR DETECTED: Using point value: $", DoubleToString(point_value, 6), 
+         Print("JPY PAIR DETECTED: Using point value: $", DoubleToString(point_value, 6),
                " (Base broker calc: $", DoubleToString(base_point_value, 6), ")");
    }
    else
@@ -1945,7 +1955,7 @@ double CalculateLotSize(double entry_price, double stop_loss)
       // Non-JPY pairs: use standard broker-based calculation
       point_value = tick_value * (_Point / tick_size);
    }
-   
+
    // Calculate lots using the correct point value
    double lots = risk_amt / (sl_dist_pts * point_value);
 
@@ -1991,14 +2001,14 @@ double CalculateLotSize(double entry_price, double stop_loss)
 double CalculateActualRisk(double lots, double entry_price, double stop_loss)
 {
    double sl_dist_pts = MathAbs(entry_price - stop_loss) / _Point;
-   
+
    // Use broker-specific contract specifications
    double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   
+
    // Calculate point value with same logic as CalculateLotSize
    double point_value;
-   
+
    // Check if this is a JPY pair - use same logic as lot sizing
    string symbol_upper = _Symbol;
    StringToUpper(symbol_upper);
@@ -2007,7 +2017,7 @@ double CalculateActualRisk(double lots, double entry_price, double stop_loss)
       // For JPY pairs: Use broker data but be more careful about calculation
       double base_point_value = tick_value * (_Point / tick_size);
       point_value = base_point_value;
-      
+
       // Safety check: if the calculated value seems way off, apply a correction
       if (point_value > 0.1 || point_value < 0.0001)
       {
@@ -2016,7 +2026,7 @@ double CalculateActualRisk(double lots, double entry_price, double stop_loss)
          if (lot_size > 0)
          {
             double estimated_pip_value = lot_size * 0.01 / 150.0; // Assume ~150 rate
-            point_value = estimated_pip_value / 10.0; // 1 pip = 10 points
+            point_value = estimated_pip_value / 10.0;             // 1 pip = 10 points
          }
          else
          {
@@ -2029,7 +2039,7 @@ double CalculateActualRisk(double lots, double entry_price, double stop_loss)
       // Non-JPY pairs: use standard broker-based calculation
       point_value = tick_value * (_Point / tick_size);
    }
-   
+
    // Calculate actual risk using the correct point value
    double actual_risk = lots * sl_dist_pts * point_value;
 
@@ -2149,6 +2159,9 @@ void ManagePos()
    double tp = PositionGetDouble(POSITION_TP);
    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
 
+   // Manage break-even stop loss
+   ManageBreakEvenSL(position_type, open_price, sl, tp);
+
    // Manage trailing stop loss
    ManageTrailingSL(position_type, open_price, sl, tp);
 
@@ -2267,13 +2280,13 @@ void ShowLabel()
       {
          ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
          string position_status = "In " + (ptype == POSITION_TYPE_BUY ? "LONG" : "SHORT") + " position";
-         
+
          // Add trailing stop status
          if (TRAILING_START_MULT > 0 && trailing_active)
          {
             position_status += " (TRAILING)";
          }
-         
+
          status = position_status;
       }
       else
@@ -2370,6 +2383,227 @@ void ShowLabel()
 }
 
 //+------------------------------------------------------------------+
+//| Validate breakout conditions (unified for both directions)       |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Manage trailing stop loss                                        |
+//+------------------------------------------------------------------+
+void ManageTrailingSL(ENUM_POSITION_TYPE position_type, double entry_price, double current_sl, double current_tp)
+{
+   // Skip if trailing stop is disabled (TRAILING_START_MULT = 0)
+   if (TRAILING_START_MULT <= 0)
+      return;
+
+   // Get current price
+   double current_price = (position_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Calculate trigger level based on position direction
+   double trigger_distance = TRAILING_START_MULT * range_size;
+   double trigger_level;
+
+   if (position_type == POSITION_TYPE_BUY)
+   {
+      trigger_level = entry_price + trigger_distance;
+   }
+   else // POSITION_TYPE_SELL
+   {
+      trigger_level = entry_price - trigger_distance;
+   }
+
+   // Check if we should start trailing (profit threshold reached)
+   if (!trailing_active)
+   {
+      bool should_start_trailing = false;
+
+      if (position_type == POSITION_TYPE_BUY && current_price >= trigger_level)
+      {
+         should_start_trailing = true;
+         trailing_highest_price = current_price;
+      }
+      else if (position_type == POSITION_TYPE_SELL && current_price <= trigger_level)
+      {
+         should_start_trailing = true;
+         trailing_lowest_price = current_price;
+      }
+
+      if (should_start_trailing)
+      {
+         trailing_active = true;
+         trailing_last_sl_level = current_sl;
+
+         string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
+         if (DEBUG_LEVEL >= 1)
+            Print("TRAILING STOP ACTIVATED: ", direction, " position reached +",
+                  DoubleToString(TRAILING_START_MULT, 1), "× range profit trigger");
+         return; // Don't trail on first activation, just mark as active
+      }
+   }
+
+   // If trailing is active, manage the trailing stop
+   if (trailing_active)
+   {
+      bool should_update_sl = false;
+      double new_sl_level = current_sl;
+
+      if (position_type == POSITION_TYPE_BUY)
+      {
+         // Update highest price reached
+         if (current_price > trailing_highest_price)
+         {
+            trailing_highest_price = current_price;
+         }
+
+         // Calculate new SL level based on trailing distance
+         double trailing_distance = TRAILING_DISTANCE_MULT * range_size;
+         double potential_sl = trailing_highest_price - trailing_distance;
+
+         // Only update if the new SL is higher than current and represents a meaningful step
+         double step_size = TRAILING_STEP_MULT * range_size;
+         if (potential_sl > current_sl && (potential_sl - trailing_last_sl_level) >= step_size)
+         {
+            new_sl_level = potential_sl;
+            should_update_sl = true;
+         }
+      }
+      else // POSITION_TYPE_SELL
+      {
+         // Update lowest price reached
+         if (current_price < trailing_lowest_price)
+         {
+            trailing_lowest_price = current_price;
+         }
+
+         // Calculate new SL level based on trailing distance
+         double trailing_distance = TRAILING_DISTANCE_MULT * range_size;
+         double potential_sl = trailing_lowest_price + trailing_distance;
+
+         // Only update if the new SL is lower than current and represents a meaningful step
+         double step_size = TRAILING_STEP_MULT * range_size;
+         if (potential_sl < current_sl && (trailing_last_sl_level - potential_sl) >= step_size)
+         {
+            new_sl_level = potential_sl;
+            should_update_sl = true;
+         }
+      }
+
+      // Execute the trailing stop update
+      if (should_update_sl)
+      {
+         MqlTradeRequest mod = {};
+         MqlTradeResult res = {};
+
+         mod.action = TRADE_ACTION_SLTP;
+         mod.position = ticket;
+         mod.sl = new_sl_level;
+         mod.tp = current_tp;
+
+         if (OrderSend(mod, res))
+         {
+            if (res.retcode == 10009) // Success
+            {
+               trailing_last_sl_level = new_sl_level;
+               string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
+
+               if (DEBUG_LEVEL >= 1)
+                  Print("TRAILING STOP UPDATED: ", direction, " SL moved to ",
+                        DoubleToString(new_sl_level, _Digits), " (distance: ",
+                        DoubleToString(TRAILING_DISTANCE_MULT, 1), "× range from peak)");
+            }
+            else
+            {
+               if (DEBUG_LEVEL >= 1)
+                  Print("Trailing SL modification failed: ", GetErrorDescription(res.retcode));
+            }
+         }
+         else
+         {
+            if (DEBUG_LEVEL >= 1)
+               Print("Trailing SL modification request failed: ", GetLastError());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage break-even stop loss                                      |
+//+------------------------------------------------------------------+
+void ManageBreakEvenSL(ENUM_POSITION_TYPE position_type, double entry_price, double current_sl, double current_tp)
+{
+   // Skip if break-even is disabled or already moved
+   if (BREAKEVEN_TRIGGER_MULT <= 0 || moved_to_breakeven)
+      return;
+
+   // Check for edge case: if SL strategy is CLOSE and SL is already at entry, skip
+   if (STOP_LOSS_STRATEGY == SL_CLOSE && MathAbs(current_sl - entry_price) < _Point)
+   {
+      if (DEBUG_LEVEL >= 2)
+         Print("Break-even skipped: SL strategy is CLOSE and SL already at entry");
+      moved_to_breakeven = true; // Mark as moved to avoid repeated checks
+      return;
+   }
+
+   // Calculate trigger level based on position direction
+   double trigger_distance = BREAKEVEN_TRIGGER_MULT * range_size;
+   double trigger_level;
+
+   if (position_type == POSITION_TYPE_BUY)
+   {
+      trigger_level = entry_price + trigger_distance;
+   }
+   else // POSITION_TYPE_SELL
+   {
+      trigger_level = entry_price - trigger_distance;
+   }
+
+   // Get current price
+   double current_price = (position_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Check if trigger level is reached
+   bool trigger_reached = false;
+   if (position_type == POSITION_TYPE_BUY && current_price >= trigger_level)
+      trigger_reached = true;
+   else if (position_type == POSITION_TYPE_SELL && current_price <= trigger_level)
+      trigger_reached = true;
+
+   if (trigger_reached)
+   {
+      // Modify stop loss to break-even (entry price)
+      MqlTradeRequest mod = {};
+      MqlTradeResult res = {};
+
+      mod.action = TRADE_ACTION_SLTP;
+      mod.position = ticket;
+      mod.sl = entry_price;
+      mod.tp = current_tp;
+
+      if (OrderSend(mod, res))
+      {
+         if (res.retcode == 10009) // Success
+         {
+            moved_to_breakeven = true;
+            string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
+
+            if (DEBUG_LEVEL >= 1)
+               Print("BREAK-EVEN ACTIVATED: ", direction, " position SL moved to entry (",
+                     DoubleToString(entry_price, _Digits), ") after +",
+                     DoubleToString(BREAKEVEN_TRIGGER_MULT, 1), "× range profit");
+         }
+         else
+         {
+            if (DEBUG_LEVEL >= 1)
+               Print("Break-even SL modification failed: ", GetErrorDescription(res.retcode));
+         }
+      }
+      else
+      {
+         if (DEBUG_LEVEL >= 1)
+            Print("Break-even SL modification request failed: ", GetLastError());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Optimization function for backtesting                           |
 //+------------------------------------------------------------------+
 double OnTester()
@@ -2398,13 +2632,13 @@ double OnTester()
    double drawdown_percent = (max_drawdown / initial_deposit) * 100.0;
 
    // PROFIT-FOCUSED FITNESS: Heavily weight profit, consider drawdown secondarily
-   
+
    // Start with raw profit as base score
    double profit_score = net_profit;
-   
+
    // Square the profit to give even more weight to profitable strategies
    double weighted_profit = profit_score * profit_score;
-   
+
    // Apply a softer drawdown penalty (square root to reduce impact)
    double drawdown_factor = 1.0;
    if (drawdown_percent > 0.1) // Only apply penalty for meaningful drawdown
@@ -2412,16 +2646,16 @@ double OnTester()
       // Convert to a factor that reduces as drawdown increases, but less aggressively
       drawdown_factor = 1.0 / MathSqrt(1.0 + drawdown_percent);
    }
-   
+
    // Apply very minimal trade count consideration
    // Just enough to prefer strategies with more trades when profit/drawdown are similar
    double trade_factor = 1.0 + MathLog(total_trades / 50.0) * 0.1; // Max ~20% impact
-   
+
    // Final fitness: Heavily weighted profit × mild drawdown penalty × minimal trade factor
    double fitness = weighted_profit * drawdown_factor * trade_factor;
 
    // Debug output for optimization
-      if (DEBUG_LEVEL >= 1)
+   if (DEBUG_LEVEL >= 1)
    {
       Print("=== PROFIT-FOCUSED OPTIMIZATION RESULTS ===");
       Print("Total Trades: ", (int)total_trades);
@@ -2438,154 +2672,3 @@ double OnTester()
 
    return fitness;
 }
-
-
-
-//+------------------------------------------------------------------+
-//| Validate breakout conditions (unified for both directions)       |
-//+------------------------------------------------------------------+
-
-//+------------------------------------------------------------------+
-//| Manage trailing stop loss                                        |
-//+------------------------------------------------------------------+
-void ManageTrailingSL(ENUM_POSITION_TYPE position_type, double entry_price, double current_sl, double current_tp)
-{
-   // Skip if trailing stop is disabled (TRAILING_START_MULT = 0)
-   if (TRAILING_START_MULT <= 0)
-      return;
-      
-   // Get current price
-   double current_price = (position_type == POSITION_TYPE_BUY) ? 
-                         SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
-                         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   
-   // Calculate trigger level based on position direction
-   double trigger_distance = TRAILING_START_MULT * range_size;
-   double trigger_level;
-   
-   if (position_type == POSITION_TYPE_BUY)
-   {
-      trigger_level = entry_price + trigger_distance;
-   }
-   else // POSITION_TYPE_SELL
-   {
-      trigger_level = entry_price - trigger_distance;
-   }
-   
-   // Check if we should start trailing (profit threshold reached)
-   if (!trailing_active)
-   {
-      bool should_start_trailing = false;
-      
-      if (position_type == POSITION_TYPE_BUY && current_price >= trigger_level)
-      {
-         should_start_trailing = true;
-         trailing_highest_price = current_price;
-      }
-      else if (position_type == POSITION_TYPE_SELL && current_price <= trigger_level)
-      {
-         should_start_trailing = true;
-         trailing_lowest_price = current_price;
-      }
-      
-      if (should_start_trailing)
-      {
-         trailing_active = true;
-         trailing_last_sl_level = current_sl;
-         
-         string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
-         if (DEBUG_LEVEL >= 1)
-            Print("TRAILING STOP ACTIVATED: ", direction, " position reached +",
-                  DoubleToString(TRAILING_START_MULT, 1), "× range profit trigger");
-         return; // Don't trail on first activation, just mark as active
-      }
-   }
-   
-   // If trailing is active, manage the trailing stop
-   if (trailing_active)
-   {
-      bool should_update_sl = false;
-      double new_sl_level = current_sl;
-      
-      if (position_type == POSITION_TYPE_BUY)
-      {
-         // Update highest price reached
-         if (current_price > trailing_highest_price)
-         {
-            trailing_highest_price = current_price;
-         }
-         
-         // Calculate new SL level based on trailing distance
-         double trailing_distance = TRAILING_DISTANCE_MULT * range_size;
-         double potential_sl = trailing_highest_price - trailing_distance;
-         
-         // Only update if the new SL is higher than current and represents a meaningful step
-         double step_size = TRAILING_STEP_MULT * range_size;
-         if (potential_sl > current_sl && (potential_sl - trailing_last_sl_level) >= step_size)
-         {
-            new_sl_level = potential_sl;
-            should_update_sl = true;
-         }
-      }
-      else // POSITION_TYPE_SELL
-      {
-         // Update lowest price reached
-         if (current_price < trailing_lowest_price)
-         {
-            trailing_lowest_price = current_price;
-         }
-         
-         // Calculate new SL level based on trailing distance
-         double trailing_distance = TRAILING_DISTANCE_MULT * range_size;
-         double potential_sl = trailing_lowest_price + trailing_distance;
-         
-         // Only update if the new SL is lower than current and represents a meaningful step
-         double step_size = TRAILING_STEP_MULT * range_size;
-         if (potential_sl < current_sl && (trailing_last_sl_level - potential_sl) >= step_size)
-         {
-            new_sl_level = potential_sl;
-            should_update_sl = true;
-         }
-      }
-      
-      // Execute the trailing stop update
-      if (should_update_sl)
-      {
-         MqlTradeRequest mod = {};
-         MqlTradeResult res = {};
-         
-         mod.action = TRADE_ACTION_SLTP;
-         mod.position = ticket;
-         mod.sl = new_sl_level;
-         mod.tp = current_tp;
-         
-         if (OrderSend(mod, res))
-         {
-            if (res.retcode == 10009) // Success
-            {
-               trailing_last_sl_level = new_sl_level;
-               string direction = (position_type == POSITION_TYPE_BUY) ? "LONG" : "SHORT";
-               
-               if (DEBUG_LEVEL >= 1)
-                  Print("TRAILING STOP UPDATED: ", direction, " SL moved to ",
-                        DoubleToString(new_sl_level, _Digits), " (distance: ",
-                        DoubleToString(TRAILING_DISTANCE_MULT, 1), "× range from peak)");
-            }
-            else
-            {
-               if (DEBUG_LEVEL >= 1)
-                  Print("Trailing SL modification failed: ", GetErrorDescription(res.retcode));
-            }
-         }
-         else
-         {
-            if (DEBUG_LEVEL >= 1)
-               Print("Trailing SL modification request failed: ", GetLastError());
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Calculate stop loss based on strategy                            |
-//+------------------------------------------------------------------+
