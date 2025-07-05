@@ -493,6 +493,7 @@ void OnTick()
    ComputeSession();
 
    // SPEED OPTIMIZATION: Skip ticks outside relevant trading periods
+   // Don't skip if we have after-hours positions that need monitoring
    if (BACKTEST_SPEED_OPTIMIZATION && ticket == 0 && trade_state == STATE_IDLE)
    {
       // Skip if on NYSE holiday (already computed)
@@ -1503,6 +1504,18 @@ void ManageAfterHoursPos()
 
       last_after_hours_log = current_time;
    }
+
+   // Continue managing position (trailing stops, breakeven) during after-hours
+   ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double sl = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP);
+   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+
+   // Manage break-even stop loss during after-hours
+   ManageBreakEvenSL(position_type, open_price, sl, tp);
+
+   // Manage trailing stop loss during after-hours  
+   ManageTrailingSL(position_type, open_price, sl, tp);
 
    // Check if we need to close position before next session
    if (current_time >= next_session_start - CLOSE_MINUTES_BEFORE_NEXT_SESSION * 60)
