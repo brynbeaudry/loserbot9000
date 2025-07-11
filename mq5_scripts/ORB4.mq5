@@ -1254,7 +1254,7 @@ void UpdateATR()
    // Calculate current ATR value using the global handle
    double atr_buff[];
 
-   if (CopyBuffer(atr_handle, 0, 0, 2, atr_buff) <= 0)
+   if (CopyBuffer(atr_handle, 0, 0, 3, atr_buff) <= 0)
    {
       if (DEBUG_LEVEL >= 1)
          Print("ATR error: ", GetLastError());
@@ -1262,14 +1262,40 @@ void UpdateATR()
    }
 
    // Get current ATR value (from previous completed bar)
-   atr_value = atr_buff[1];
+   // Use index 1 for the previous completed bar, fallback to index 0 if needed
+   if (ArraySize(atr_buff) >= 2)
+   {
+      atr_value = atr_buff[1];
+      
+      // Safety check: if previous bar ATR is invalid, use current bar
+      if (atr_value <= 0 && ArraySize(atr_buff) >= 1)
+      {
+         atr_value = atr_buff[0];
+         if (DEBUG_LEVEL >= 2)
+            Print("ATR fallback: Using current bar ATR (", DoubleToString(atr_value, _Digits), ")");
+      }
+   }
+   else
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("ATR buffer insufficient size: ", ArraySize(atr_buff));
+      return;
+   }
+   
+   // Final safety check: ensure ATR value is reasonable
+   if (atr_value <= 0)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("WARNING: Invalid ATR value (", DoubleToString(atr_value, _Digits), "), skipping ATR update");
+      return;
+   }
 
    // Collect ATR values only during NYSE session hours for better median calculation
    CollectNYSESessionATR();
 
    // Calculate or recalculate median ATR if needed (using NYSE session data only)
    static datetime last_median_calculation = 0;
-   const int MEDIAN_RECALC_HOURS = 168; // Recalculate weekly (7 days × 24 hours)
+   const int MEDIAN_RECALC_HOURS = 24; // Recalculate daily (24 hours) for better responsiveness to gold volatility changes
 
    bool should_calculate_median = false;
 
@@ -1282,12 +1308,12 @@ void UpdateATR()
          if (DEBUG_LEVEL >= 1)
             Print("Initial NYSE session ATR median calculation triggered");
       }
-      // Periodic recalculation (weekly)
+      // Periodic recalculation (daily)
       else if (TimeCurrent() - last_median_calculation > MEDIAN_RECALC_HOURS * 3600)
       {
          should_calculate_median = true;
          if (DEBUG_LEVEL >= 1)
-            Print("Periodic NYSE session ATR median recalculation triggered (", MEDIAN_RECALC_HOURS, " hours elapsed)");
+            Print("Daily NYSE session ATR median recalculation triggered (", MEDIAN_RECALC_HOURS, " hours elapsed)");
       }
    }
 
@@ -1310,15 +1336,31 @@ void CollectNYSESessionATR()
 
    // Avoid collecting the same ATR value multiple times during the same minute
    static datetime last_collection_time = 0;
-   static int last_collection_minute = -1;
-
+   
    MqlDateTime dt;
    TimeToStruct(current_time, dt);
-   int current_minute = dt.hour * 60 + dt.min;
+   
+   // Create a unique identifier for this minute that includes the date
+   // Format: YYYYMMDDHHMM (e.g., 202501151430 for Jan 15, 2025 at 14:30)
+   long current_minute_id = (long)dt.year * 100000000 + 
+                           (long)dt.mon * 1000000 + 
+                           (long)dt.day * 10000 + 
+                           (long)dt.hour * 100 + 
+                           (long)dt.min;
+   
+   static long last_collection_minute_id = 0;
 
    // Only collect once per minute and avoid duplicate collections
-   if (current_minute == last_collection_minute || current_time - last_collection_time < 60)
+   if (current_minute_id == last_collection_minute_id || current_time - last_collection_time < 60)
       return;
+   
+   // Additional safety check: ensure ATR value is valid
+   if (atr_value <= 0)
+   {
+      if (DEBUG_LEVEL >= 3)
+         Print("ATR collection skipped: Invalid ATR value (", DoubleToString(atr_value, _Digits), ")");
+      return;
+   }
 
    // Expand the collection array if needed
    nyse_atr_collection_count++;
@@ -1328,7 +1370,7 @@ void CollectNYSESessionATR()
    nyse_session_atr_values[nyse_atr_collection_count - 1] = atr_value;
 
    last_collection_time = current_time;
-   last_collection_minute = current_minute;
+   last_collection_minute_id = current_minute_id;
 
    if (DEBUG_LEVEL >= 3)
       Print("NYSE ATR collected: ", DoubleToString(atr_value, _Digits),
@@ -1348,6 +1390,28 @@ void CalculateNYSESessionATRMedian()
       if (DEBUG_LEVEL >= 1)
          Print("Insufficient NYSE session ATR data for median calculation. Have ",
                nyse_atr_collection_count, ", need ", min_required_samples);
+      
+      // Fallback: If we have some data but not enough for median, use simple average
+      if (nyse_atr_collection_count >= 10)
+      {
+         double sum = 0;
+         for (int i = 0; i < nyse_atr_collection_count; i++)
+         {
+            sum += nyse_session_atr_values[i];
+         }
+         atr_median = sum / nyse_atr_collection_count;
+         
+         if (DEBUG_LEVEL >= 1)
+            Print("Using ATR average as fallback: ", DoubleToString(atr_median, _Digits),
+                  " from ", nyse_atr_collection_count, " samples");
+      }
+      else
+      {
+         // Ultimate fallback: use current ATR value
+         atr_median = atr_value;
+         if (DEBUG_LEVEL >= 1)
+            Print("Using current ATR as fallback median: ", DoubleToString(atr_median, _Digits));
+      }
       return;
    }
 
@@ -1365,6 +1429,15 @@ void CalculateNYSESessionATRMedian()
       new_median = (atr_history[middle - 1] + atr_history[middle]) / 2.0;
    else // Odd number of elements
       new_median = atr_history[middle];
+
+   // Safety check: ensure median is reasonable
+   if (new_median <= 0)
+   {
+      if (DEBUG_LEVEL >= 1)
+         Print("WARNING: Calculated ATR median is invalid (", DoubleToString(new_median, _Digits), "), using current ATR");
+      atr_median = atr_value;
+      return;
+   }
 
    // Log the change if this is an update
    if (atr_median > 0 && DEBUG_LEVEL >= 1)

@@ -111,6 +111,10 @@ int daily_trade_count = 0;
 datetime last_trade_date = 0;
 datetime last_signal_time = 0;
 
+// Position exit tracking
+datetime lines_stopped_diverging_time = 0;  // When lines stopped meeting divergence criteria
+bool lines_were_diverging_properly = false; // Track if lines were previously diverging properly
+
 //============================================================================
 //                         INITIALIZATION
 //============================================================================
@@ -451,26 +455,22 @@ void ProcessPositionActiveState()
       return;
    }
    
-   // Check exit conditions
+   // COMPREHENSIVE EXIT LOGIC - Check all exit conditions in priority order
    bool should_exit = false;
    string exit_reason = "";
    
-   // Check if alligator went back to sleep or lost proper awake state
-   bool still_awake = false;
-   if (position_direction == BULLISH_TREND && is_bullish_awake)
-      still_awake = true;
-   else if (position_direction == BEARISH_TREND && is_bearish_awake)
-      still_awake = true;
-      
-   if (!still_awake)
+   // Exit Rule 1: IMMEDIATE - Opposing awake trend (bearish awake when long, bullish awake when short)
+   if (position_direction == BULLISH_TREND && is_bearish_awake)
    {
       should_exit = true;
-      if (lines_are_horizontal)
-         exit_reason = "Alligator went back to sleep";
-      else
-         exit_reason = "Alligator mouth closed - lost alignment or divergence";
+      exit_reason = "Bearish alligator awake - opposing trend detected";
    }
-   // Check if price crossed back through lips (momentum reversal)
+   else if (position_direction == BEARISH_TREND && is_bullish_awake)
+   {
+      should_exit = true;
+      exit_reason = "Bullish alligator awake - opposing trend detected";
+   }
+   // Exit Rule 2: IMMEDIATE - Price crosses lips against position (momentum reversal)
    else if (position_direction == BULLISH_TREND && price < lips)
    {
       should_exit = true;
@@ -480,6 +480,50 @@ void ProcessPositionActiveState()
    {
       should_exit = true;
       exit_reason = "Price closed above lips - bearish momentum lost";
+   }
+   // Exit Rule 3: IMMEDIATE - Alligator completely goes back to sleep (all lines horizontal and close)
+   else if (lines_are_horizontal)
+   {
+      should_exit = true;
+      exit_reason = "Alligator went back to sleep - trend ended";
+   }
+   // Exit Rule 4: TIMEOUT - Lines not diverging properly (using divergence parameters with timeout)
+   else
+   {
+      // Check if lines are currently diverging properly using the same criteria as mouth opening
+      bool currently_diverging_properly = lines_are_diverging && !CheckLinesAreCloseBySpread();
+      
+      // Track divergence state changes
+      if (currently_diverging_properly)
+      {
+         // Lines are diverging properly now
+         if (!lines_were_diverging_properly)
+         {
+            // Lines just started diverging properly again - reset timeout
+            lines_stopped_diverging_time = 0;
+            lines_were_diverging_properly = true;
+         }
+      }
+      else
+      {
+         // Lines are NOT diverging properly now
+         if (lines_were_diverging_properly)
+         {
+            // Lines just stopped diverging properly - start timeout countdown
+            lines_stopped_diverging_time = TimeCurrent();
+            lines_were_diverging_properly = false;
+         }
+         else if (lines_stopped_diverging_time > 0)
+         {
+            // Lines have been not diverging for some time - check timeout
+            double non_diverging_minutes = (TimeCurrent() - lines_stopped_diverging_time) / 60.0;
+            if (non_diverging_minutes >= MAX_MOUTH_OPENING_MINUTES)
+            {
+               should_exit = true;
+               exit_reason = "Lines stopped diverging for " + DoubleToString(non_diverging_minutes, 1) + " minutes - mouth closing timeout";
+            }
+         }
+      }
    }
    
    if (should_exit)
@@ -663,10 +707,13 @@ void CheckPriceBreakoutFromJaw()
    // Step 2: If price has moved beyond jaw, check all breakout conditions
    if (price_beyond_jaw && current_direction == breakout_direction)
    {
-             // Calculate elapsed time from breakout start
-       double elapsed_seconds = (double)(TimeCurrent() - breakout_start_time);
-       
-       if (elapsed_seconds >= PeriodSeconds()) // Need at least 1 bar worth of time
+      // Calculate elapsed time from breakout start
+      double elapsed_seconds = (double)(TimeCurrent() - breakout_start_time);
+      
+      // Only wait for bar time if trend consistency is enabled
+      bool time_requirement_met = (BREAKOUT_TREND_CONSISTENCY_BARS == 0) || (elapsed_seconds >= PeriodSeconds());
+      
+      if (time_requirement_met)
       {
          double actual_slope_angle = CalculateSlopeAngleFromSeconds(breakout_start_price, price, elapsed_seconds);
          
@@ -903,6 +950,10 @@ void ExecuteBuyTrade()
       current_position_ticket = result.order;
       position_direction = BULLISH_TREND;
       daily_trade_count++;
+      
+      // Initialize exit tracking for new position
+      lines_were_diverging_properly = (lines_are_diverging && !CheckLinesAreCloseBySpread());
+      lines_stopped_diverging_time = 0;
 
       if (DEBUG_LEVEL >= 1)
       {
@@ -961,6 +1012,10 @@ void ExecuteSellTrade()
       current_position_ticket = result.order;
       position_direction = BEARISH_TREND;
       daily_trade_count++;
+      
+      // Initialize exit tracking for new position
+      lines_were_diverging_properly = (lines_are_diverging && !CheckLinesAreCloseBySpread());
+      lines_stopped_diverging_time = 0;
 
       if (DEBUG_LEVEL >= 1)
       {
@@ -991,6 +1046,10 @@ void ResetPositionTracking()
 {
    current_position_ticket = 0;
    position_direction = NO_TREND;
+   
+   // Reset exit tracking variables
+   lines_stopped_diverging_time = 0;
+   lines_were_diverging_properly = false;
 }
 
 void ClosePosition(string reason)
@@ -1250,7 +1309,22 @@ void ShowInfoPanel()
       }
       else if (current_state == STATE_POSITION_ACTIVE)
       {
-         position_status += " | Mouth OPEN";
+         // Show divergence status and timeout info
+         bool currently_diverging = (lines_are_diverging && !CheckLinesAreCloseBySpread());
+         if (currently_diverging)
+         {
+            position_status += " | Mouth OPEN";
+         }
+         else if (lines_stopped_diverging_time > 0)
+         {
+            double non_diverging_minutes = (TimeCurrent() - lines_stopped_diverging_time) / 60.0;
+            position_status += " | Mouth CLOSING (" + DoubleToString(non_diverging_minutes, 1) + "/" + 
+                              DoubleToString(MAX_MOUTH_OPENING_MINUTES, 1) + "min)";
+         }
+         else
+         {
+            position_status += " | Mouth CLOSED";
+         }
       }
    }
 
