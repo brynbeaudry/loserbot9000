@@ -12,9 +12,19 @@
 //+------------------------------------------------------------------+
 // Based on "upslidedown" Pine Script %R Trend Exhaustion strategy
 // Uses dual Williams %R periods (Fast: 21, Slow: 112) to detect trend exhaustion
-// Signals generated when price exits overbought/oversold zones
-// Arrow Down = Bearish signal (exit from overbought)
-// Arrow Up = Bullish signal (exit from oversold)
+// 
+// SIGNAL LOGIC:
+// - Overbought Zone: When both %R values >= -20 (near 0)
+// - Oversold Zone: When both %R values <= -80 (near -100)
+// - BEARISH Signal (▼): When price EXITS overbought zone (was OB, now not OB)
+// - BULLISH Signal (▲): When price EXITS oversold zone (was OS, now not OS)
+//
+// The strategy trades reversals when trends are exhausted:
+// - Long trades: Enter when oversold trend exhausts (bullish reversal)
+// - Short trades: Enter when overbought trend exhausts (bearish reversal)
+//
+// Williams %R ranges from -100 (oversold) to 0 (overbought)
+// This is opposite to RSI which uses 0-100 scale
 
 //============================================================================
 //                           USER SETTINGS
@@ -43,10 +53,14 @@ input int DEBUG_LEVEL = 1;             // DEBUG_LEVEL: Debug verbosity level (0=
 //                         GLOBAL VARIABLES
 //============================================================================
 
+// Indicator handles
+int atr_handle = INVALID_HANDLE;
+
 // Current market data
 double price = 0;                    // Current price
 double fast_r = 0, slow_r = 0;       // Williams %R values
 double avg_r = 0;                    // Average %R (when using average formula)
+double atr_value = 0;                // Current ATR value for arrow placement
 
 // Strategy state
 bool is_overbought = false;          // Current overbought state
@@ -59,6 +73,11 @@ ulong current_position_ticket = 0;
 int daily_trade_count = 0;
 datetime last_trade_date = 0;
 datetime last_signal_time = 0;
+
+// Visual elements tracking
+datetime last_ob_zone_start = 0;     // Track overbought zone start
+datetime last_os_zone_start = 0;     // Track oversold zone start
+int signal_counter = 0;              // Counter for unique object names
 
 // Trading direction enum
 enum TrendDirection
@@ -82,8 +101,28 @@ int OnInit()
    if (StringFind(_Symbol, "BTC") < 0)
       Print("WARNING: Designed for BTCUSD, running on: ", _Symbol);
 
+   // Initialize ATR for visual arrow placement
+   atr_handle = iATR(_Symbol, _Period, 14);
+   if (atr_handle == INVALID_HANDLE)
+   {
+      Print("WARNING: Failed to create ATR indicator - arrow placement may be suboptimal");
+   }
+
    // Reset counters
    ResetDailyTrades();
+
+   // Initialize market data and set initial states
+   if (UpdateMarketData())
+   {
+      AnalyzeRConditions();
+      // Set initial states to prevent false signals on startup
+      was_overbought = is_overbought;
+      was_oversold = is_oversold;
+      Print("Initial %R states - Overbought: ", is_overbought, ", Oversold: ", is_oversold);
+   }
+
+   // Clean up any existing visual objects from previous runs
+   CleanupVisualObjects();
 
    Print("=== %R Trend Exhaustion Strategy INITIALIZED ===");
    Print("Timeframe: ", TimeframeToString(_Period));
@@ -100,6 +139,11 @@ int OnInit()
    Print("--- Strategy Controls ---");
    Print("Use average formula: ", USE_AVERAGE_FORMULA ? "YES" : "NO");
    Print("Minimum signal cooldown: ", MIN_SIGNAL_COOLDOWN_MINUTES, " minutes");
+   Print("--- Visual Elements ---");
+   Print("Overbought zones: Red rectangles");
+   Print("Oversold zones: Blue rectangles");
+   Print("Sell signals: Red down arrows");
+   Print("Buy signals: Blue up arrows");
    Print("==============================================");
 
    return INIT_SUCCEEDED;
@@ -107,6 +151,13 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   // Clean up visual objects
+   CleanupVisualObjects();
+   
+   // Release indicator handles
+   if (atr_handle != INVALID_HANDLE)
+      IndicatorRelease(atr_handle);
+   
    Comment("");
    Print("%R Trend Exhaustion Strategy stopped");
 }
@@ -136,6 +187,19 @@ void OnTick()
       return;
    }
 
+   // Check if position still exists (could have been closed by SL/TP)
+   if (current_position_ticket != 0)
+   {
+      if (!PositionSelectByTicket(current_position_ticket))
+      {
+         // Position was closed
+         current_position_ticket = 0;
+         position_direction = NO_TREND;
+         if (DEBUG_LEVEL >= 1)
+            Print("Position closed by SL/TP");
+      }
+   }
+
    // Store previous states
    was_overbought = is_overbought;
    was_oversold = is_oversold;
@@ -145,6 +209,9 @@ void OnTick()
 
    // Check for trend exhaustion signals
    CheckTrendExhaustionSignals();
+
+   // Update visual elements (zones and arrows)
+   UpdateVisualElements();
 
    // Update display
    if (SHOW_INFO_PANEL)
@@ -159,6 +226,16 @@ bool UpdateMarketData()
 {
    // Get current price
    price = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
+
+   // Get ATR value for arrow placement
+   if (atr_handle != INVALID_HANDLE)
+   {
+      double atr_buffer[1];
+      if (CopyBuffer(atr_handle, 0, 0, 1, atr_buffer) > 0)
+         atr_value = atr_buffer[0];
+      else
+         atr_value = 0; // Fallback if ATR not available
+   }
 
    // Calculate Williams %R values
    if (!CalculateWilliamsR())
@@ -265,6 +342,24 @@ void AnalyzeRConditions()
       is_overbought = (fast_r >= -THRESHOLD && slow_r >= -THRESHOLD);
       is_oversold = (fast_r <= (-100 + THRESHOLD) && slow_r <= (-100 + THRESHOLD));
    }
+   
+   // Debug output for %R analysis
+   if (DEBUG_LEVEL >= 2)
+   {
+      static datetime last_debug_time = 0;
+      if (TimeCurrent() - last_debug_time >= 60) // Print every 60 seconds
+      {
+         Print("=== %R ANALYSIS ===");
+         Print("Fast %R: ", DoubleToString(fast_r, 2), " | Slow %R: ", DoubleToString(slow_r, 2));
+         if (USE_AVERAGE_FORMULA)
+            Print("Average %R: ", DoubleToString(avg_r, 2));
+         Print("Threshold: ", THRESHOLD, " (OB >= -", THRESHOLD, ", OS <= -", (100-THRESHOLD), ")");
+         Print("Is Overbought: ", is_overbought ? "YES" : "NO");
+         Print("Is Oversold: ", is_oversold ? "YES" : "NO");
+         Print("==================");
+         last_debug_time = TimeCurrent();
+      }
+   }
 }
 
 //============================================================================
@@ -277,13 +372,36 @@ void CheckTrendExhaustionSignals()
    bool ob_reversal = (!is_overbought && was_overbought); // Exit from overbought = bearish signal
    bool os_reversal = (!is_oversold && was_oversold);     // Exit from oversold = bullish signal
 
+   // Debug signal detection
+   if (DEBUG_LEVEL >= 2)
+   {
+      if (was_overbought && !is_overbought)
+         Print("📊 OVERBOUGHT EXIT DETECTED: was_overbought=true, is_overbought=false");
+      if (was_oversold && !is_oversold)
+         Print("📊 OVERSOLD EXIT DETECTED: was_oversold=true, is_oversold=false");
+   }
+
    // Execute trades based on signals
    if (ob_reversal)
    {
+      if (DEBUG_LEVEL >= 1)
+         Print("🔴 BEARISH SIGNAL: Overbought trend exhausted (exit from OB zone)");
+      
+      // Draw sell signal arrow above the current bar
+      double arrow_price = price + (atr_value > 0 ? atr_value * 0.5 : price * 0.001);
+      DrawSignalArrow(TimeCurrent(), arrow_price, false);
+      
       ExecuteTrendExhaustionTrade(BEARISH_TREND, "Overbought Trend Exhausted ▼");
    }
    else if (os_reversal)
    {
+      if (DEBUG_LEVEL >= 1)
+         Print("🟢 BULLISH SIGNAL: Oversold trend exhausted (exit from OS zone)");
+      
+      // Draw buy signal arrow below the current bar
+      double arrow_price = price - (atr_value > 0 ? atr_value * 0.5 : price * 0.001);
+      DrawSignalArrow(TimeCurrent(), arrow_price, true);
+      
       ExecuteTrendExhaustionTrade(BULLISH_TREND, "Oversold Trend Exhausted ▲");
    }
 }
@@ -355,7 +473,7 @@ void ExecuteBuyTrade()
    request.deviation = GetOptimalSlippage();
    request.magic = 12345;
    request.comment = "R_Exhaustion_Buy";
-   request.type_filling = ORDER_FILLING_FOK;
+   request.type_filling = ORDER_FILLING_IOC;
 
    // Execute trade
    if (OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
@@ -413,7 +531,7 @@ void ExecuteSellTrade()
    request.deviation = GetOptimalSlippage();
    request.magic = 12345;
    request.comment = "R_Exhaustion_Sell";
-   request.type_filling = ORDER_FILLING_FOK;
+   request.type_filling = ORDER_FILLING_IOC;
 
    // Execute trade
    if (OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
@@ -436,6 +554,194 @@ void ExecuteSellTrade()
    {
       Print("❌ SELL ORDER FAILED: ", result.retcode, " - ", GetErrorDescription(result.retcode));
    }
+}
+
+//============================================================================
+//                           VISUAL FUNCTIONS
+//============================================================================
+
+void DrawSignalArrow(datetime time, double price, bool is_buy_signal)
+{
+   signal_counter++;
+   string obj_name = "R_Signal_" + IntegerToString(signal_counter);
+   
+   // Create arrow object
+   if (ObjectCreate(0, obj_name, OBJ_ARROW, 0, time, price))
+   {
+      if (is_buy_signal)
+      {
+         // Blue up arrow for buy signal
+         ObjectSetInteger(0, obj_name, OBJPROP_ARROWCODE, 233); // Up arrow
+         ObjectSetInteger(0, obj_name, OBJPROP_COLOR, clrDodgerBlue);
+         ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, 3);
+      }
+      else
+      {
+         // Red down arrow for sell signal
+         ObjectSetInteger(0, obj_name, OBJPROP_ARROWCODE, 234); // Down arrow
+         ObjectSetInteger(0, obj_name, OBJPROP_COLOR, clrCrimson);
+         ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, 3);
+      }
+      
+      ObjectSetInteger(0, obj_name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, obj_name, OBJPROP_SELECTED, false);
+   }
+}
+
+void DrawZoneRectangle(datetime start_time, datetime end_time, bool is_overbought_zone)
+{
+   signal_counter++;
+   string obj_name = "R_Zone_" + IntegerToString(signal_counter);
+   
+   // Get high and low prices for the rectangle
+   double high_array[], low_array[];
+   int bars_count = iBarShift(_Symbol, _Period, start_time) - iBarShift(_Symbol, _Period, end_time) + 1;
+   
+   if (bars_count > 0)
+   {
+      int start_shift = iBarShift(_Symbol, _Period, end_time);
+      
+      if (CopyHigh(_Symbol, _Period, start_shift, bars_count, high_array) > 0 &&
+          CopyLow(_Symbol, _Period, start_shift, bars_count, low_array) > 0)
+      {
+         double zone_high = high_array[ArrayMaximum(high_array)];
+         double zone_low = low_array[ArrayMinimum(low_array)];
+         
+         // Create rectangle
+         if (ObjectCreate(0, obj_name, OBJ_RECTANGLE, 0, start_time, zone_high, end_time, zone_low))
+         {
+            if (is_overbought_zone)
+            {
+               // Red zone for overbought
+               ObjectSetInteger(0, obj_name, OBJPROP_COLOR, clrCrimson);
+               ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+               ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+               ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, 0);
+               ObjectSetInteger(0, obj_name, OBJPROP_STYLE, STYLE_SOLID);
+               // Set transparency (0-255, where 255 is fully transparent)
+               ObjectSetInteger(0, obj_name, OBJPROP_COLOR, ColorToARGB(clrCrimson, 230)); // ~90% transparent
+            }
+            else
+            {
+               // Blue zone for oversold
+               ObjectSetInteger(0, obj_name, OBJPROP_COLOR, clrDodgerBlue);
+               ObjectSetInteger(0, obj_name, OBJPROP_FILL, true);
+               ObjectSetInteger(0, obj_name, OBJPROP_BACK, true);
+               ObjectSetInteger(0, obj_name, OBJPROP_WIDTH, 0);
+               ObjectSetInteger(0, obj_name, OBJPROP_STYLE, STYLE_SOLID);
+               // Set transparency
+               ObjectSetInteger(0, obj_name, OBJPROP_COLOR, ColorToARGB(clrDodgerBlue, 230)); // ~90% transparent
+            }
+            
+            ObjectSetInteger(0, obj_name, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, obj_name, OBJPROP_SELECTED, false);
+         }
+      }
+   }
+}
+
+// Helper function to convert color with transparency
+color ColorToARGB(color clr, uchar alpha)
+{
+   return (color)((alpha << 24) | (clr & 0xFFFFFF));
+}
+
+void UpdateVisualElements()
+{
+   datetime current_time = TimeCurrent();
+   
+   // Handle overbought zone visualization
+   if (is_overbought && !was_overbought)
+   {
+      // Started overbought zone
+      last_ob_zone_start = current_time;
+   }
+   else if (!is_overbought && was_overbought && last_ob_zone_start > 0)
+   {
+      // Ended overbought zone - draw the zone rectangle
+      DrawZoneRectangle(last_ob_zone_start, current_time, true);
+      last_ob_zone_start = 0;
+   }
+   
+   // Handle oversold zone visualization
+   if (is_oversold && !was_oversold)
+   {
+      // Started oversold zone
+      last_os_zone_start = current_time;
+   }
+   else if (!is_oversold && was_oversold && last_os_zone_start > 0)
+   {
+      // Ended oversold zone - draw the zone rectangle
+      DrawZoneRectangle(last_os_zone_start, current_time, false);
+      last_os_zone_start = 0;
+   }
+   
+   // Draw current active zones (temporary visualization)
+   DrawCurrentActiveZones();
+}
+
+void DrawCurrentActiveZones()
+{
+   // Remove previous temporary zone objects
+   ObjectDelete(0, "R_ActiveZone_OB");
+   ObjectDelete(0, "R_ActiveZone_OS");
+   
+   datetime current_time = TimeCurrent();
+   
+   // Draw current overbought zone if active
+   if (is_overbought && last_ob_zone_start > 0)
+   {
+      double high = iHigh(_Symbol, _Period, 0);
+      double low = iLow(_Symbol, _Period, 0);
+      
+      if (ObjectCreate(0, "R_ActiveZone_OB", OBJ_RECTANGLE, 0, last_ob_zone_start, high * 1.001, current_time, low * 0.999))
+      {
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_COLOR, ColorToARGB(clrCrimson, 240));
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_FILL, true);
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_BACK, true);
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_WIDTH, 0);
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, "R_ActiveZone_OB", OBJPROP_SELECTED, false);
+      }
+   }
+   
+   // Draw current oversold zone if active
+   if (is_oversold && last_os_zone_start > 0)
+   {
+      double high = iHigh(_Symbol, _Period, 0);
+      double low = iLow(_Symbol, _Period, 0);
+      
+      if (ObjectCreate(0, "R_ActiveZone_OS", OBJ_RECTANGLE, 0, last_os_zone_start, high * 1.001, current_time, low * 0.999))
+      {
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_COLOR, ColorToARGB(clrDodgerBlue, 240));
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_FILL, true);
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_BACK, true);
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_WIDTH, 0);
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, "R_ActiveZone_OS", OBJPROP_SELECTED, false);
+      }
+   }
+}
+
+void CleanupVisualObjects()
+{
+   // Remove all visual objects created by this EA
+   for (int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string obj_name = ObjectName(0, i);
+      if (StringFind(obj_name, "R_Signal_") >= 0 || 
+          StringFind(obj_name, "R_Zone_") >= 0 ||
+          StringFind(obj_name, "R_ActiveZone_") >= 0)
+      {
+         ObjectDelete(0, obj_name);
+      }
+   }
+   
+   // Explicitly remove active zone objects
+   ObjectDelete(0, "R_ActiveZone_OB");
+   ObjectDelete(0, "R_ActiveZone_OS");
 }
 
 //============================================================================
@@ -548,27 +854,61 @@ void ShowInfoPanel()
       }
    }
 
-   // %R status
+   // %R status with zone duration
    string r_status = "";
+   string zone_info = "";
+   
    if (is_overbought)
+   {
       r_status = "🔴 OVERBOUGHT (Bearish Zone)";
+      if (last_ob_zone_start > 0)
+      {
+         int zone_bars = iBarShift(_Symbol, _Period, last_ob_zone_start);
+         double zone_minutes = (TimeCurrent() - last_ob_zone_start) / 60.0;
+         zone_info = "Zone Duration: " + IntegerToString(zone_bars) + " bars (" + 
+                     DoubleToString(zone_minutes, 1) + " min)";
+      }
+   }
    else if (is_oversold)
+   {
       r_status = "🟢 OVERSOLD (Bullish Zone)";
+      if (last_os_zone_start > 0)
+      {
+         int zone_bars = iBarShift(_Symbol, _Period, last_os_zone_start);
+         double zone_minutes = (TimeCurrent() - last_os_zone_start) / 60.0;
+         zone_info = "Zone Duration: " + IntegerToString(zone_bars) + " bars (" + 
+                     DoubleToString(zone_minutes, 1) + " min)";
+      }
+   }
    else
       r_status = "😐 NEUTRAL";
+
+   // Visual elements count
+   int signal_count = 0;
+   int zone_count = 0;
+   for (int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string obj_name = ObjectName(0, i);
+      if (StringFind(obj_name, "R_Signal_") >= 0) signal_count++;
+      else if (StringFind(obj_name, "R_Zone_") >= 0) zone_count++;
+   }
 
    string info = StringFormat(
        "📊 %R TREND EXHAUSTION | Trades: %d/%d\n" +
            "Fast %R: %.1f | Slow %R: %.1f | Avg: %.1f\n" +
            "Status: %s\n" +
+           "%s\n" +
            "Position: %s\n" +
-           "Price: $%s | Threshold: %d",
+           "Price: $%s | Threshold: %d\n" +
+           "Visual: %d signals, %d zones",
        daily_trade_count, MAX_DAILY_TRADES,
        fast_r, slow_r, avg_r,
        r_status,
+       zone_info,
        position_status,
        DoubleToString(price, 2),
-       THRESHOLD);
+       THRESHOLD,
+       signal_count, zone_count);
 
    Comment(info);
 }

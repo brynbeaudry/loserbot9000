@@ -9,23 +9,34 @@
 
 #include <Trade\Trade.mqh>
 
-// Input parameters
-input int      MagicNumber = 20250128;     // Magic number for this EA
-// input double   AccountBalance = 5000.0;    // Fixed account balance for position sizing (REMOVED)
-input double   RiskPercent = 100.0;        // Risk percentage (100% = risk to zero)
-input int      EntryHour = 23;             // Entry hour (0-23, broker time GMT+2)
-input int      EntryMinute = 0;            // Entry minute (0-59)
-input int      ExitHour = 1;               // Exit hour (0-23, broker time GMT+2)
-input int      ExitMinute = 0;             // Exit minute (0-59)
-input bool     EnableLogging = true;       // Enable detailed logging
-input bool     UseSound = false;           // Use sound alerts
-input string   SoundFile = "alert.wav";    // Sound file for alerts
-input bool     EnableVolatilityFilter = true; // Enable volatility filter (trade only on high vol days)
-input int      VolCalcHour = 0;            // Hour to calculate volatility (0-23, GMT+2)
-input int      VolCalcMinute = 0;          // Minute to calculate volatility (0-59)
-input bool     SkipFridayToSaturdayTrades = true; // Skip trades that would close on Saturday
-input bool     UseCustomSpread = false;    // Use custom spread instead of broker spread
-input double   CustomSpreadPoints = 1600;  // Custom spread in points (1600 = $16 for BTC)
+//============================================================================
+//                           USER SETTINGS
+//============================================================================
+
+// Trade Configuration
+input int MAGIC_NUMBER = 20250128;                                    // MAGIC_NUMBER: Magic number for this EA
+input double RISK_PERCENT = 100.0;                                    // RISK_PERCENT: Risk percentage (100% = risk to zero)
+
+// Trading Schedule
+input int ENTRY_HOUR = 1;                                             // ENTRY_HOUR: Entry hour (0-23, broker time GMT+2)
+input int ENTRY_MINUTE = 5;                                           // ENTRY_MINUTE: Entry minute (0-59)
+input int EXIT_HOUR = 23;                                             // EXIT_HOUR: Exit hour (0-23, broker time GMT+2)
+input int EXIT_MINUTE = 50;                                           // EXIT_MINUTE: Exit minute (0-59)
+
+// Logging and Alerts
+input bool ENABLE_LOGGING = false;                                    // ENABLE_LOGGING: Enable detailed logging
+input bool USE_SOUND = false;                                         // USE_SOUND: Use sound alerts
+input string SOUND_FILE = "alert.wav";                               // SOUND_FILE: Sound file for alerts
+
+// Volatility Filter
+input bool ENABLE_VOLATILITY_FILTER = false;                         // ENABLE_VOLATILITY_FILTER: Enable volatility filter (trade only on high vol days)
+input int VOL_CALC_HOUR = 0;                                          // VOL_CALC_HOUR: Hour to calculate volatility (0-23, GMT+2)
+input int VOL_CALC_MINUTE = 0;                                        // VOL_CALC_MINUTE: Minute to calculate volatility (0-59)
+
+// Trading Rules
+input bool SKIP_FRIDAY_TO_SATURDAY_TRADES = false;                   // SKIP_FRIDAY_TO_SATURDAY_TRADES: Skip trades that would close on Saturday
+input bool USE_CUSTOM_SPREAD = false;                                // USE_CUSTOM_SPREAD: Use custom spread instead of broker spread
+input double CUSTOM_SPREAD_POINTS = 1600.0;                          // CUSTOM_SPREAD_POINTS: Custom spread in points (1600 = $16 for BTC)
 
 // Global variables
 datetime lastTradeDate;                    // Date of the last trade (actual trade execution)
@@ -77,49 +88,49 @@ int hvValuesCount;                  // Number of HV values stored
 int OnInit()
 {
    // Validate input parameters
-   if(EntryHour < 0 || EntryHour > 23)
+   if(ENTRY_HOUR < 0 || ENTRY_HOUR > 23)
    {
-      Print("ERROR: EntryHour must be between 0-23. Current value: ", EntryHour);
+      Print("ERROR: ENTRY_HOUR must be between 0-23. Current value: ", ENTRY_HOUR);
       Print("Use 0 for midnight, not 24");
       return(INIT_PARAMETERS_INCORRECT);
    }
 
-   if(ExitHour < 0 || ExitHour > 23)
+   if(EXIT_HOUR < 0 || EXIT_HOUR > 23)
    {
-      Print("ERROR: ExitHour must be between 0-23. Current value: ", ExitHour);
+      Print("ERROR: EXIT_HOUR must be between 0-23. Current value: ", EXIT_HOUR);
       Print("Use 0 for midnight, not 24");
       return(INIT_PARAMETERS_INCORRECT);
    }
 
-   if(EntryMinute < 0 || EntryMinute > 59)
+   if(ENTRY_MINUTE < 0 || ENTRY_MINUTE > 59)
    {
-      Print("ERROR: EntryMinute must be between 0-59. Current value: ", EntryMinute);
+      Print("ERROR: ENTRY_MINUTE must be between 0-59. Current value: ", ENTRY_MINUTE);
       return(INIT_PARAMETERS_INCORRECT);
    }
 
-   if(ExitMinute < 0 || ExitMinute > 59)
+   if(EXIT_MINUTE < 0 || EXIT_MINUTE > 59)
    {
-      Print("ERROR: ExitMinute must be between 0-59. Current value: ", ExitMinute);
+      Print("ERROR: EXIT_MINUTE must be between 0-59. Current value: ", EXIT_MINUTE);
       return(INIT_PARAMETERS_INCORRECT);
    }
 
-   if(EnableVolatilityFilter)
+   if(ENABLE_VOLATILITY_FILTER)
    {
-      if(VolCalcHour < 0 || VolCalcHour > 23)
+      if(VOL_CALC_HOUR < 0 || VOL_CALC_HOUR > 23)
       {
-         Print("ERROR: VolCalcHour must be between 0-23. Current value: ", VolCalcHour);
+         Print("ERROR: VOL_CALC_HOUR must be between 0-23. Current value: ", VOL_CALC_HOUR);
          return(INIT_PARAMETERS_INCORRECT);
       }
 
-      if(VolCalcMinute < 0 || VolCalcMinute > 59)
+      if(VOL_CALC_MINUTE < 0 || VOL_CALC_MINUTE > 59)
       {
-         Print("ERROR: VolCalcMinute must be between 0-59. Current value: ", VolCalcMinute);
+         Print("ERROR: VOL_CALC_MINUTE must be between 0-59. Current value: ", VOL_CALC_MINUTE);
          return(INIT_PARAMETERS_INCORRECT);
       }
    }
 
    // Set trade parameters
-   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetExpertMagicNumber(MAGIC_NUMBER);
    trade.SetDeviationInPoints(10);
 
    // Initialize variables
@@ -160,9 +171,9 @@ int OnInit()
    Print("GoLongBTC EA initialized successfully");
    Print("Symbol: ", _Symbol);
    Print("Using current account balance for calculations: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
-   Print("Risk percentage: ", DoubleToString(RiskPercent, 1), "%");
-   Print("Entry time: ", StringFormat("%02d:%02d GMT+2 (broker server time)", EntryHour, EntryMinute));
-   Print("Exit time: ", StringFormat("%02d:%02d GMT+2 (broker server time)", ExitHour, ExitMinute));
+   Print("Risk percentage: ", DoubleToString(RISK_PERCENT, 1), "%");
+   Print("Entry time: ", StringFormat("%02d:%02d GMT+2 (broker server time)", ENTRY_HOUR, ENTRY_MINUTE));
+   Print("Exit time: ", StringFormat("%02d:%02d GMT+2 (broker server time)", EXIT_HOUR, EXIT_MINUTE));
 
    // Print symbol trading session info
    datetime sessionFrom, sessionTo;
@@ -187,16 +198,16 @@ int OnInit()
    }
 
    // Check if exit time is next day
-   if(ExitHour < EntryHour || (ExitHour == EntryHour && ExitMinute <= EntryMinute))
+   if(EXIT_HOUR < ENTRY_HOUR || (EXIT_HOUR == ENTRY_HOUR && EXIT_MINUTE <= ENTRY_MINUTE))
    {
       Print("Exit time is on the NEXT DAY after entry");
    }
 
    // Display volatility filter settings
-   if(EnableVolatilityFilter)
+   if(ENABLE_VOLATILITY_FILTER)
    {
       Print("Volatility filter: ENABLED");
-      Print("Volatility calculation time: ", StringFormat("%02d:%02d GMT+2", VolCalcHour, VolCalcMinute));
+      Print("Volatility calculation time: ", StringFormat("%02d:%02d GMT+2", VOL_CALC_HOUR, VOL_CALC_MINUTE));
       Print("Filter logic: Trade only when 30-day HV > 365-day median HV");
    }
    else
@@ -205,11 +216,11 @@ int OnInit()
    }
 
    // Display spread settings
-   if(UseCustomSpread)
+   if(USE_CUSTOM_SPREAD)
    {
-      double spreadInPrice = CustomSpreadPoints * _Point;
+      double spreadInPrice = CUSTOM_SPREAD_POINTS * _Point;
       Print("Custom spread: ENABLED");
-      Print("Spread: ", CustomSpreadPoints, " points ($", DoubleToString(spreadInPrice, 2), ")");
+      Print("Spread: ", CUSTOM_SPREAD_POINTS, " points ($", DoubleToString(spreadInPrice, 2), ")");
    }
    else
    {
@@ -225,7 +236,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    // Print volatility filter statistics on exit
-   if(EnableVolatilityFilter && hvValuesCount > 0)
+   if(ENABLE_VOLATILITY_FILTER && hvValuesCount > 0)
    {
       Print("=== VOLATILITY FILTER FINAL STATISTICS ===");
       Print("Total days processed: ", hvValuesCount);
@@ -283,11 +294,11 @@ void OnTick()
 
    // Debug logging for first tick of each minute
    static int lastLoggedMinute = -1;
-   if(timeStruct.min != lastLoggedMinute && EnableLogging)
+   if(timeStruct.min != lastLoggedMinute && ENABLE_LOGGING)
    {
       lastLoggedMinute = timeStruct.min;
       Print("Current time: ", StringFormat("%02d:%02d", timeStruct.hour, timeStruct.min),
-            " | Entry time: ", StringFormat("%02d:%02d", EntryHour, EntryMinute),
+            " | Entry time: ", StringFormat("%02d:%02d", ENTRY_HOUR, ENTRY_MINUTE),
             " | TradeTaken: ", tradeTakenToday ? "Yes" : "No",
             " | Position: ", positionTicket > 0 ? "Open" : "None");
    }
@@ -296,12 +307,12 @@ void OnTick()
    CheckNewTradingDay();
 
    // Check if it's time to calculate volatility
-   if(EnableVolatilityFilter)
+   if(ENABLE_VOLATILITY_FILTER)
    {
       bool shouldCalcVolatility = false;
 
       // Check if we're at the volatility calculation time
-      if(timeStruct.hour == VolCalcHour && timeStruct.min >= VolCalcMinute && timeStruct.min < VolCalcMinute + 5)
+      if(timeStruct.hour == VOL_CALC_HOUR && timeStruct.min >= VOL_CALC_MINUTE && timeStruct.min < VOL_CALC_MINUTE + 5)
       {
          // Check if we haven't calculated today
          MqlDateTime lastCalcStruct;
@@ -318,7 +329,7 @@ void OnTick()
 
       if(shouldCalcVolatility)
       {
-         if(EnableLogging)
+         if(ENABLE_LOGGING)
             Print("Calculating daily volatility at ", TimeToString(currentTime));
          CalculateDailyVolatility();
       }
@@ -329,7 +340,7 @@ void OnTick()
    {
       // Debug logging
       static datetime lastDebugTime = 0;
-      if(EnableLogging && currentTime - lastDebugTime >= 60) // Log once per minute
+      if(ENABLE_LOGGING && currentTime - lastDebugTime >= 60) // Log once per minute
       {
          lastDebugTime = currentTime;
          Print("DEBUG: Checking position ", positionTicket, " at ", TimeToString(currentTime));
@@ -357,7 +368,7 @@ void OnTick()
          if(hoursInPosition >= 2.0)
          {
             shouldClose = true;
-            if(EnableLogging)
+            if(ENABLE_LOGGING)
             {
                Print("=== TIME TO CLOSE ===");
                Print("Entry time: ", TimeToString(entryTime));
@@ -367,7 +378,7 @@ void OnTick()
          }
 
          // Alternative: Check specific exit time
-         if(!shouldClose && timeStruct.hour == ExitHour && timeStruct.min >= ExitMinute)
+         if(!shouldClose && timeStruct.hour == EXIT_HOUR && timeStruct.min >= EXIT_MINUTE)
          {
             // Check if we entered before midnight and it's now past midnight
             MqlDateTime entryTimeStruct;
@@ -377,7 +388,7 @@ void OnTick()
             if(entryTimeStruct.hour == 23 && timeStruct.hour < 3)
             {
                shouldClose = true;
-               if(EnableLogging)
+               if(ENABLE_LOGGING)
                   Print("Exit time reached (crossed midnight)");
             }
          }
@@ -398,9 +409,9 @@ void OnTick()
       }
 
       // No open position, check if it's time to open
-      bool isEntryTime = (timeStruct.hour == EntryHour && timeStruct.min >= EntryMinute && timeStruct.min < EntryMinute + 5);
+      bool isEntryTime = (timeStruct.hour == ENTRY_HOUR && timeStruct.min >= ENTRY_MINUTE && timeStruct.min < ENTRY_MINUTE + 5);
 
-      if(isEntryTime && EnableLogging)
+      if(isEntryTime && ENABLE_LOGGING)
       {
          Print("Entry time window reached! TradeTakenToday=", tradeTakenToday);
       }
@@ -431,7 +442,7 @@ void CheckNewTradingDay()
    // Check if it's a new day
    if(currentDate != currentTradingDate)
    {
-      if(currentTradingDate > 0 && EnableLogging)
+      if(currentTradingDate > 0 && ENABLE_LOGGING)
          Print("New trading day: ", TimeToString(currentDate, TIME_DATE));
 
       currentTradingDate = currentDate;
@@ -462,7 +473,7 @@ void CheckNewTradingDay()
       {
          // We already traded today
          tradeTakenToday = true;
-         if(EnableLogging)
+         if(ENABLE_LOGGING)
             Print("Already traded on this date");
       }
    }
@@ -476,13 +487,13 @@ void OpenPosition()
    // Double-check we haven't already traded today
    if(tradeTakenToday)
    {
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
          Print("Trade already taken today, skipping");
       return;
    }
 
    // Check if trade would close on Saturday
-   if(SkipFridayToSaturdayTrades)
+   if(SKIP_FRIDAY_TO_SATURDAY_TRADES)
    {
       datetime currentTime = TimeCurrent();
       MqlDateTime currentDT;
@@ -492,12 +503,12 @@ void OpenPosition()
       datetime exitTime = currentTime;
       MqlDateTime exitDT;
       TimeToStruct(exitTime, exitDT);
-      exitDT.hour = ExitHour;
-      exitDT.min = ExitMinute;
+      exitDT.hour = EXIT_HOUR;
+      exitDT.min = EXIT_MINUTE;
       exitDT.sec = 0;
 
       // Check if exit is next day
-      bool exitIsNextDay = (ExitHour < EntryHour || (ExitHour == EntryHour && ExitMinute <= EntryMinute));
+      bool exitIsNextDay = (EXIT_HOUR < ENTRY_HOUR || (EXIT_HOUR == ENTRY_HOUR && EXIT_MINUTE <= ENTRY_MINUTE));
       if(exitIsNextDay)
       {
          exitTime = StructToTime(exitDT);
@@ -514,7 +525,7 @@ void OpenPosition()
       {
          if(exitDT.day_of_week == SATURDAY)
          {
-            if(EnableLogging)
+            if(ENABLE_LOGGING)
                Print("Trade skipped - Would close on Saturday");
             tradeTakenToday = true; // Mark as taken to prevent multiple attempts
             return;
@@ -523,7 +534,7 @@ void OpenPosition()
    }
 
    // Check volatility filter if enabled
-   if(EnableVolatilityFilter && !volatilityFilterPassed)
+   if(ENABLE_VOLATILITY_FILTER && !volatilityFilterPassed)
    {
       // Track this check only once per day
       if(TimeCurrent() - lastVolFilterCheck > 86400) // More than 24 hours
@@ -532,7 +543,7 @@ void OpenPosition()
          lastVolFilterCheck = TimeCurrent();
       }
 
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
       {
          Print("Trade skipped - Volatility filter not passed");
          Print("Current 30-day HV: ", DoubleToString(current30DayHV * 100, 2), "%",
@@ -543,7 +554,7 @@ void OpenPosition()
       tradeTakenToday = true;
       return;
    }
-   else if(EnableVolatilityFilter && volatilityFilterPassed)
+   else if(ENABLE_VOLATILITY_FILTER && volatilityFilterPassed)
    {
       // Track allowed trades
       if(TimeCurrent() - lastVolFilterCheck > 86400) // More than 24 hours
@@ -551,7 +562,7 @@ void OpenPosition()
          tradesAllowedByVolFilter++;
          lastVolFilterCheck = TimeCurrent();
 
-         if(EnableLogging)
+         if(ENABLE_LOGGING)
          {
             Print("Volatility filter PASSED - Trade allowed");
             Print("Current 30-day HV: ", DoubleToString(current30DayHV * 100, 2), "%",
@@ -609,7 +620,7 @@ void OpenPosition()
 
             Print("Position ", i, ": Ticket=", posTicket, ", Symbol=", posSymbol, ", Magic=", posMagic);
 
-            if(posMagic == MagicNumber && posSymbol == _Symbol)
+            if(posMagic == MAGIC_NUMBER && posSymbol == _Symbol)
             {
                positionTicket = posTicket;
                Print("Found matching position!");
@@ -635,7 +646,7 @@ void OpenPosition()
          actualEntryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       }
 
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
       {
          Print("=== POSITION OPENED ===");
          Print("Order Ticket: ", orderTicket);
@@ -648,12 +659,12 @@ void OpenPosition()
          // Calculate and display exit time
          MqlDateTime exitTimeStruct;
          TimeToStruct(entryTime, exitTimeStruct);
-         exitTimeStruct.hour = ExitHour;
-         exitTimeStruct.min = ExitMinute;
+         exitTimeStruct.hour = EXIT_HOUR;
+         exitTimeStruct.min = EXIT_MINUTE;
          exitTimeStruct.sec = 0;
 
          // Check if exit is next day
-         bool exitIsNextDay = (ExitHour < EntryHour || (ExitHour == EntryHour && ExitMinute <= EntryMinute));
+         bool exitIsNextDay = (EXIT_HOUR < ENTRY_HOUR || (EXIT_HOUR == ENTRY_HOUR && EXIT_MINUTE <= ENTRY_MINUTE));
          if(exitIsNextDay)
          {
             datetime tempExitTime = StructToTime(exitTimeStruct);
@@ -668,8 +679,8 @@ void OpenPosition()
                DoubleToString(hoursUntilExit, 1), " hours after entry)");
       }
 
-      if(UseSound)
-         PlaySound(SoundFile);
+      if(USE_SOUND)
+         PlaySound(SOUND_FILE);
    }
    else
    {
@@ -691,7 +702,7 @@ void ClosePosition()
       double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
 
       // Debug: Check trading session
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
       {
          datetime from, to;
          if(SymbolInfoSessionTrade(_Symbol, MONDAY, 0, from, to))
@@ -714,13 +725,13 @@ void ClosePosition()
       MqlTick tick;
       if(!SymbolInfoTick(_Symbol, tick))
       {
-         if(EnableLogging)
+         if(ENABLE_LOGGING)
             Print("WARNING: Cannot get tick data");
          return;
       }
 
       // Log current prices
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
       {
          Print("Current Bid: ", DoubleToString(tick.bid, symbolCache.digits),
                ", Ask: ", DoubleToString(tick.ask, symbolCache.digits));
@@ -729,7 +740,7 @@ void ClosePosition()
       // Try to close position using PositionClose
       if(trade.PositionClose(positionTicket))
       {
-         if(EnableLogging)
+         if(ENABLE_LOGGING)
          {
             Print("=== POSITION CLOSED ===");
             Print("Exit time: ", TimeToString(TimeCurrent()));
@@ -737,22 +748,22 @@ void ClosePosition()
             Print("Exit price: ", DoubleToString(currentPrice, symbolCache.digits));
             Print("Broker Reported Profit: $", DoubleToString(positionProfit, 2));
 
-            if(UseCustomSpread)
+            if(USE_CUSTOM_SPREAD)
             {
                // Simple calculation: subtract the custom spread cost from profit
-               double customSpreadCost = (CustomSpreadPoints * _Point) * positionVolume;
+               double customSpreadCost = (CUSTOM_SPREAD_POINTS * _Point) * positionVolume;
                double adjustedProfit = positionProfit - customSpreadCost;
 
                Print("=== CUSTOM SPREAD ADJUSTMENT ===");
                Print("Position volume: ", DoubleToString(positionVolume, 2), " lots");
-               Print("Custom spread: ", CustomSpreadPoints, " points ($", DoubleToString(CustomSpreadPoints * _Point, 2), "/lot)");
+               Print("Custom spread: ", CUSTOM_SPREAD_POINTS, " points ($", DoubleToString(CUSTOM_SPREAD_POINTS * _Point, 2), "/lot)");
                Print("Total spread cost: -$", DoubleToString(customSpreadCost, 2));
                Print("Adjusted Profit: $", DoubleToString(adjustedProfit, 2));
             }
          }
 
-         if(UseSound)
-            PlaySound(SoundFile);
+         if(USE_SOUND)
+            PlaySound(SOUND_FILE);
 
          // Reset position tracking
          positionTicket = 0;
@@ -805,7 +816,7 @@ double CalculateLotSize()
    if(price <= 0) return 0;
 
    // Calculate risk amount
-   double riskAmount = accountBalance * RiskPercent / 100.0;
+   double riskAmount = accountBalance * RISK_PERCENT / 100.0;
 
    // Since we have no stop loss, we risk the entire price (risk to zero)
    double stopLossDistance = price;
@@ -831,11 +842,11 @@ double CalculateLotSize()
    volume = MathMin(maxLot, volume);
    volume = MathRound(volume / stepLot) * stepLot;
 
-   if(EnableLogging)
+   if(ENABLE_LOGGING)
    {
       Print("=== LOT SIZE CALCULATION ===");
       Print("Account balance: $", DoubleToString(accountBalance, 2));
-      Print("Risk percent: ", DoubleToString(RiskPercent, 1), "%");
+      Print("Risk percent: ", DoubleToString(RISK_PERCENT, 1), "%");
       Print("Risk amount: $", DoubleToString(riskAmount, 2));
       Print("Current price: ", DoubleToString(price, symbolCache.digits));
       Print("Stop loss distance (risk to zero): ", DoubleToString(stopLossDistance, symbolCache.digits));
@@ -862,14 +873,14 @@ double CalculateLotSize()
 //+------------------------------------------------------------------+
 void CalculateDailyVolatility()
 {
-   if(!EnableVolatilityFilter)
+   if(!ENABLE_VOLATILITY_FILTER)
       return;
 
    // Get current close price
    double currentClose = iClose(_Symbol, PERIOD_D1, 0);
    if(currentClose <= 0)
    {
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
          Print("WARNING: Invalid close price for volatility calculation");
       return;
    }
@@ -892,7 +903,7 @@ void CalculateDailyVolatility()
    // Need at least 2 closes for log returns
    if(dailyClosesCount < 2)
    {
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
          Print("Not enough data for volatility calculation. Need at least 2 daily closes.");
       return;
    }
@@ -903,7 +914,7 @@ void CalculateDailyVolatility()
    // Need at least 30 log returns for HV calculation
    if(dailyClosesCount < VOLATILITY_LOOKBACK + 1)
    {
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
          Print("Not enough data for HV calculation. Have ", dailyClosesCount, " closes, need ", VOLATILITY_LOOKBACK + 1);
       return;
    }
@@ -932,7 +943,7 @@ void CalculateDailyVolatility()
       median365DayHV = CalculateMedian(rollingHVValues, MEDIAN_LOOKBACK);
       volatilityFilterPassed = (current30DayHV > median365DayHV);
 
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
       {
          Print("=== VOLATILITY FILTER UPDATE ===");
          Print("Calculation Time: ", TimeToString(TimeCurrent()));
@@ -958,7 +969,7 @@ void CalculateDailyVolatility()
    {
       // Not enough data for median, default to allowing trades
       volatilityFilterPassed = true;
-      if(EnableLogging)
+      if(ENABLE_LOGGING)
          Print("Not enough HV data for median. Have ", hvValuesCount, " values, need ", MEDIAN_LOOKBACK);
    }
 
